@@ -2,10 +2,12 @@ import { defaultDesktops, defaultStatus } from "./defaults.js";
 import type {
   ApiClient,
   Desktop,
+  GvtProfile,
   HostStatus,
   LoginRequest,
   LogSummary,
   ModeRequest,
+  ResourceRequest,
   ServerConfig,
   Session
 } from "./models.js";
@@ -18,6 +20,20 @@ function clone<T>(value: T): T {
 export class MockApiClient implements ApiClient {
   private items = defaultDesktops();
   private host = defaultStatus();
+  private profiles: GvtProfile[] = [
+    {
+      id: "i915-GVTg_V5_4",
+      resolution: { width: 1920, height: 1200 },
+      availableInstances: 1,
+      description: "resolution: 1920x1200"
+    },
+    {
+      id: "i915-GVTg_V5_8",
+      resolution: { width: 1024, height: 768 },
+      availableInstances: 2,
+      description: "resolution: 1024x768"
+    }
+  ];
 
   async login(config: ServerConfig, request: LoginRequest): Promise<Session> {
     return {
@@ -35,6 +51,10 @@ export class MockApiClient implements ApiClient {
 
   async desktops(): Promise<Desktop[]> {
     return clone(this.items);
+  }
+
+  async gvtProfiles(): Promise<GvtProfile[]> {
+    return clone(this.profiles);
   }
 
   async desktop(id: string): Promise<Desktop> {
@@ -69,6 +89,27 @@ export class MockApiClient implements ApiClient {
       desktop.physicalConnector = this.host.connector;
       this.host.activeSource = desktop.id;
     }
+    return clone(desktop);
+  }
+
+  async setDesktopProfile(id: string, profile: string): Promise<Desktop> {
+    const desktop = this.requireDesktop(id);
+    const selected = this.profiles.find((item) => item.id === profile);
+    if (!selected) {
+      throw new Error(`GVT-g profile not found: ${profile}`);
+    }
+    desktop.gvtProfile = profile;
+    desktop.resolution = selected.resolution;
+    return clone(desktop);
+  }
+
+  async setDesktopResources(id: string, request: ResourceRequest): Promise<Desktop> {
+    const desktop = this.requireDesktop(id);
+    if (desktop.status === "running") {
+      throw new Error("stop the desktop before changing CPU or memory");
+    }
+    desktop.resources = { vcpus: request.vcpus, memoryMiB: request.memoryMiB };
+    desktop.qemuCommand = { args: [], line: "" };
     return clone(desktop);
   }
 

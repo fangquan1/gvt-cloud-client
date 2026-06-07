@@ -9,10 +9,13 @@ integration.
 
 ```powershell
 npm install
-npm run build
+npm run serve
 ```
 
-Open `dist/index.html` in a browser.
+Open `http://127.0.0.1:5177/` in a browser. The local launcher service serves
+the console and exposes `/launch-viewer`, which starts the existing
+`direct-stream/client/gvt_spice_viewer.exe` with the selected desktop ports and
+resolution.
 
 ## Test
 
@@ -26,7 +29,8 @@ npm test
 - Mock/real API switch for the required `/api/*` endpoints.
 - Desktop list, search, status filters, details panel, mode switching, start,
   stop, restart, physical-output selection, and safe log summaries.
-- Viewer launch plan generation for the existing `gvt_spice_viewer` path.
+- Direct launch of the existing `gvt_spice_viewer` path through the local
+  launcher helper, with the old viewer plan modal kept as a failure fallback.
 - Default video settings remain on the known-good path: 15 ms latency, no FEC,
   no `drop-on-latency`, native input enabled, and `--invert-case` retained.
 

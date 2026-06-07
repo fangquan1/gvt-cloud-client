@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/copy-static.mjs",
+    "serve": "npm run build && node scripts/launcher-server.mjs",
     "test": "npm run build && node --test dist/test/*.test.js",
     "clean": "node -e \"const fs=require('fs'); fs.rmSync('dist',{recursive:true,force:true});\""
   },

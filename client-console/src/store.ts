@@ -1,11 +1,12 @@
 import { DEFAULT_SERVER } from "./defaults.js";
-import type { Desktop, FilterKey, HostStatus, ServerConfig, Session, ViewerLaunchPlan } from "./models.js";
+import type { Desktop, FilterKey, GvtProfile, HostStatus, ServerConfig, Session, ViewerLaunchPlan } from "./models.js";
 
 export interface AppState {
   server: ServerConfig;
   session?: Session;
   status?: HostStatus;
   desktops: Desktop[];
+  gvtProfiles: GvtProfile[];
   selectedDesktopId?: string;
   filter: FilterKey;
   query: string;
@@ -20,9 +21,10 @@ export class Store {
   private state: AppState = {
     server: { ...DEFAULT_SERVER },
     desktops: [],
+    gvtProfiles: [],
     filter: "all",
     query: "",
-    apiMode: "mock"
+    apiMode: "real"
   };
   private listeners = new Set<Listener>();
 

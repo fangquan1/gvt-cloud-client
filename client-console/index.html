@@ -3,11 +3,38 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Cache-Control" content="no-store" />
+    <meta http-equiv="Pragma" content="no-cache" />
     <title>GVT 云桌面控制台</title>
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
     <div id="app"></div>
-    <script type="module" src="./src/main.js"></script>
+    <script>
+      (() => {
+        let userEditedSearch = false;
+        const markUserEdit = (event) => {
+          if (event.target && event.target.id === "searchInput") {
+            userEditedSearch = true;
+          }
+        };
+        const clearSearchAutofill = () => {
+          const input = document.getElementById("searchInput");
+          if (!input || userEditedSearch) {
+            return;
+          }
+          if ((input.value || "").trim().toLowerCase() === "root") {
+            input.value = "";
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+          }
+        };
+        document.addEventListener("keydown", markUserEdit, true);
+        document.addEventListener("paste", markUserEdit, true);
+        [0, 50, 250, 1000, 2000, 4000].forEach((delay) => {
+          window.setTimeout(clearSearchAutofill, delay);
+        });
+      })();
+    </script>
+    <script type="module" src="./src/main.js?v=20260607-vm-resources-qemu"></script>
   </body>
 </html>

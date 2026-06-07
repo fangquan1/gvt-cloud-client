@@ -57,17 +57,37 @@ export interface DesktopRuntime {
   encodeFailures?: number;
 }
 
+export interface DesktopResources {
+  vcpus: number;
+  memoryMiB: number;
+}
+
+export interface QemuCommand {
+  args: string[];
+  line: string;
+}
+
+export interface GvtProfile {
+  id: string;
+  resolution: DesktopResolution;
+  availableInstances: number;
+  description: string;
+}
+
 export interface Desktop {
   id: string;
   name: string;
   address: string;
   status: DesktopStatus;
   mode: DesktopMode;
+  gvtProfile: string;
+  resources: DesktopResources;
   resolution: DesktopResolution;
   ports: DesktopPorts;
   runtime: DesktopRuntime;
   thumbnailUrl?: string;
   qemuSummary: string;
+  qemuCommand: QemuCommand;
   physicalConnector?: string;
   keyboardSource: OutputSource;
   audioSource: OutputSource;
@@ -75,6 +95,11 @@ export interface Desktop {
 
 export interface ModeRequest {
   mode: DesktopMode;
+}
+
+export interface ResourceRequest {
+  vcpus: number;
+  memoryMiB: number;
 }
 
 export interface LogSummary {
@@ -117,11 +142,14 @@ export interface ApiClient {
   login(config: ServerConfig, request: LoginRequest): Promise<Session>;
   status(): Promise<HostStatus>;
   desktops(): Promise<Desktop[]>;
+  gvtProfiles(): Promise<GvtProfile[]>;
   desktop(id: string): Promise<Desktop>;
   startDesktop(id: string): Promise<Desktop>;
   stopDesktop(id: string): Promise<Desktop>;
   restartDesktop(id: string): Promise<Desktop>;
   setDesktopMode(id: string, request: ModeRequest): Promise<Desktop>;
+  setDesktopProfile(id: string, profile: string): Promise<Desktop>;
+  setDesktopResources(id: string, request: ResourceRequest): Promise<Desktop>;
   selectOutput(id: string): Promise<HostStatus>;
   logs(id: string): Promise<LogSummary>;
 }

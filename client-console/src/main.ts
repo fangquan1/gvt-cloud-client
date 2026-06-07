@@ -1,14 +1,19 @@
-import { HttpApiClient } from "./api.js";
+import { ApiError, HttpApiClient } from "./api.js";
 import { CLIENT_DEFAULTS, DEFAULT_SERVER } from "./defaults.js";
 import { filterDesktops, formatUptime, modeLabel, statusLabel } from "./filters.js";
 import { buildLaunchPlan, modePayload } from "./launcher.js";
 import { MockApiClient } from "./mockApi.js";
-import type { ApiClient, Desktop, DesktopMode, FilterKey, ServerConfig } from "./models.js";
+import type { ApiClient, Desktop, DesktopMode, FilterKey, GvtProfile, ServerConfig } from "./models.js";
 import { Store } from "./store.js";
 
 const CONFIG_KEY = "gvt-cloud-client.server";
+const API_MODE_KEY = "gvt-cloud-client.apiMode";
+const SESSION_KEY = "gvt-cloud-client.session";
 const store = new Store();
-let api: ApiClient = new MockApiClient();
+let api: ApiClient = new HttpApiClient(
+  DEFAULT_SERVER,
+  typeof sessionStorage === "undefined" ? "" : sessionStorage.getItem(SESSION_KEY) || ""
+);
 
 function icon(label: string): string {
   return `<span class="icon" aria-hidden="true">${label}</span>`;
@@ -26,33 +31,60 @@ function escapeHtml(value: string): string {
 
 function loadConfig(): void {
   const raw = localStorage.getItem(CONFIG_KEY);
-  if (!raw) {
-    return;
-  }
+  let config = store.get().server;
   try {
-    const parsed = JSON.parse(raw) as Partial<ServerConfig>;
-    store.set({ server: { ...DEFAULT_SERVER, ...parsed } });
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<ServerConfig>;
+      config = { ...DEFAULT_SERVER, ...parsed };
+      store.set({ server: config });
+    }
   } catch {
     localStorage.removeItem(CONFIG_KEY);
   }
+  const savedApiMode = localStorage.getItem(API_MODE_KEY);
+  const search = typeof window === "undefined" ? "" : window.location.search;
+  const mockAllowed = new URLSearchParams(search).has("mock");
+  const apiMode = savedApiMode === "mock" && !mockAllowed ? "real" : savedApiMode;
+  if (apiMode === "mock" || apiMode === "real") {
+    store.set({ apiMode });
+    useApi(config, apiMode);
+  }
 }
 
-function saveConfig(config: ServerConfig): void {
+function saveConfig(config: ServerConfig, apiMode: "mock" | "real"): void {
   localStorage.setItem(CONFIG_KEY, JSON.stringify(config));
+  localStorage.setItem(API_MODE_KEY, apiMode === "mock" ? "real" : apiMode);
 }
 
 function useApi(config: ServerConfig, mode: "mock" | "real"): void {
-  api = mode === "mock" ? new MockApiClient() : new HttpApiClient(config);
+  const sessionToken = sessionStorage.getItem(SESSION_KEY) || "";
+  api = mode === "mock" ? new MockApiClient() : new HttpApiClient(config, sessionToken);
   store.set({ apiMode: mode, server: config });
 }
 
 async function refreshAll(): Promise<void> {
   try {
-    const [status, desktops] = await Promise.all([api.status(), api.desktops()]);
-    store.set({ status, desktops, error: undefined });
+    const [status, desktops, gvtProfiles] = await Promise.all([api.status(), api.desktops(), api.gvtProfiles()]);
+    store.set({ status, desktops, gvtProfiles, error: undefined });
   } catch (error) {
-    store.set({ error: error instanceof Error ? error.message : String(error) });
+    handleApiError(error, true);
   }
+}
+
+function handleApiError(error: unknown, clearRuntime = false): void {
+  const message = error instanceof Error ? error.message : String(error);
+  if (error instanceof ApiError && error.status === 401) {
+    sessionStorage.removeItem(SESSION_KEY);
+    store.set({
+      ...(clearRuntime ? { status: undefined, desktops: [], gvtProfiles: [] } : {}),
+      error: "登录已失效，请重新登录"
+    });
+    return;
+  }
+  store.set({
+    ...(clearRuntime ? { status: undefined, desktops: [], gvtProfiles: [] } : {}),
+    error: message
+  });
 }
 
 async function loginFromModal(): Promise<void> {
@@ -66,21 +98,24 @@ async function loginFromModal(): Promise<void> {
     authMethod: valueOf("authMethod") as ServerConfig["authMethod"]
   };
   const apiMode = (valueOf("apiMode") as "mock" | "real") || "mock";
+  const password = server.authMethod === "password" ? valueOf("serverPassword") || undefined : undefined;
+  const token = server.authMethod === "token" ? valueOf("serverToken") || undefined : undefined;
+  store.set({ error: undefined });
   useApi(server, apiMode);
-  saveConfig(server);
+  saveConfig(server, apiMode);
 
   try {
     const session = await api.login(server, {
       username: server.username,
-      password: valueOf("serverPassword") || undefined,
-      token: valueOf("serverToken") || undefined
+      password,
+      token
     });
-    sessionStorage.setItem("gvt-cloud-client.session", session.token);
+    sessionStorage.setItem(SESSION_KEY, session.token);
     store.set({ session, error: undefined });
     hide("settingsBackdrop");
     await refreshAll();
   } catch (error) {
-    store.set({ error: error instanceof Error ? error.message : String(error) });
+    handleApiError(error);
   }
 }
 
@@ -111,7 +146,31 @@ async function setMode(id: string, mode: DesktopMode): Promise<void> {
       await refreshAll();
     }
   } catch (error) {
-    store.set({ error: error instanceof Error ? error.message : String(error) });
+    handleApiError(error);
+  }
+}
+
+async function setProfile(id: string, profile: string): Promise<void> {
+  try {
+    const updated = await api.setDesktopProfile(id, profile);
+    const desktops = store.get().desktops.map((item) => item.id === id ? updated : item);
+    store.set({ desktops, selectedDesktopId: id, error: undefined });
+    await refreshAll();
+  } catch (error) {
+    handleApiError(error);
+  }
+}
+
+async function setResources(id: string): Promise<void> {
+  try {
+    const vcpus = Number(valueOf("desktopVcpus"));
+    const memoryMiB = Number(valueOf("desktopMemoryMiB"));
+    const updated = await api.setDesktopResources(id, { vcpus, memoryMiB });
+    const desktops = store.get().desktops.map((item) => item.id === id ? updated : item);
+    store.set({ desktops, selectedDesktopId: id, error: undefined });
+    await refreshAll();
+  } catch (error) {
+    handleApiError(error);
   }
 }
 
@@ -126,8 +185,9 @@ async function power(id: string): Promise<void> {
       : await api.startDesktop(id);
     const desktops = store.get().desktops.map((item) => item.id === id ? updated : item);
     store.set({ desktops, selectedDesktopId: id });
+    await refreshAll();
   } catch (error) {
-    store.set({ error: error instanceof Error ? error.message : String(error) });
+    handleApiError(error);
   }
 }
 
@@ -136,8 +196,9 @@ async function restart(id: string): Promise<void> {
     const updated = await api.restartDesktop(id);
     const desktops = store.get().desktops.map((item) => item.id === id ? updated : item);
     store.set({ desktops, selectedDesktopId: id });
+    await refreshAll();
   } catch (error) {
-    store.set({ error: error instanceof Error ? error.message : String(error) });
+    handleApiError(error);
   }
 }
 
@@ -149,15 +210,29 @@ async function loadLogs(id: string): Promise<void> {
   }
 }
 
-function openViewer(id: string): void {
+async function openViewer(id: string): Promise<void> {
   const desktop = desktopById(id);
   if (!desktop) {
     return;
   }
   const state = store.get();
   const plan = buildLaunchPlan(desktop, state.server, CLIENT_DEFAULTS);
-  store.set({ viewer: plan });
-  show("viewerBackdrop");
+  store.set({ viewer: plan, error: undefined });
+
+  try {
+    const response = await fetch("/launch-viewer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(plan)
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({ error: "本地客户端启动失败" })) as { error?: string };
+      throw new Error(payload.error || "本地客户端启动失败");
+    }
+  } catch (error) {
+    store.set({ error: error instanceof Error ? error.message : String(error) });
+    show("viewerBackdrop");
+  }
 }
 
 function render(): void {
@@ -207,7 +282,7 @@ function render(): void {
             ${filterButton("stopped", "已关机", state.filter)}
             ${filterButton("physical", "物理屏", state.filter)}
           </div>
-          <label class="search">${icon("⌕")}<input id="searchInput" type="search" placeholder="搜索桌面、地址或端口" value="${escapeHtml(state.query)}" /></label>
+          <label class="search">${icon("⌕")}<input id="searchInput" name="gvtDesktopSearch" type="search" autocomplete="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" readonly placeholder="搜索桌面、地址或端口" value="${escapeHtml(state.query)}" /></label>
         </section>
         <section class="desktop-grid">
           ${filtered.map(cardHtml).join("") || `<p class="muted">没有匹配的桌面。</p>`}
@@ -244,6 +319,8 @@ function cardHtml(item: Desktop): string {
         </div>
         <div class="meta">
           <span>${item.resolution.width}x${item.resolution.height}</span>
+          <span>${item.resources.vcpus} vCPU</span>
+          <span>${item.resources.memoryMiB} MiB</span>
           <span>视频 ${item.ports.video}</span>
           <span>输入 ${item.ports.input}</span>
           <span>音频 ${item.ports.spice}</span>
@@ -261,6 +338,9 @@ function cardHtml(item: Desktop): string {
 
 function detailHtml(item: Desktop): string {
   const payload = modePayload(item.mode);
+  const profiles = store.get().gvtProfiles;
+  const canEditResources = item.status !== "running";
+  const qemuCommand = item.qemuCommand.line || "虚拟机未运行，暂无 QEMU 命令行。";
   return `
     <div class="details-inner">
       <div class="detail-section">
@@ -271,9 +351,22 @@ function detailHtml(item: Desktop): string {
         <span>视频端口</span><strong>${item.ports.video}</strong>
         <span>输入端口</span><strong>${item.ports.input}</strong>
         <span>SPICE 音频</span><strong>${item.ports.spice}</strong>
+        <span>vCPU</span><strong>${item.resources.vcpus}</strong>
+        <span>内存</span><strong>${item.resources.memoryMiB} MiB</strong>
         <span>键鼠来源</span><strong>${item.keyboardSource === "client" ? "客户端" : "盒子外接"}</strong>
         <span>音频来源</span><strong>${item.audioSource === "client" ? "客户端" : "盒子外接"}</strong>
         <span>QEMU 摘要</span><strong>${escapeHtml(item.qemuSummary)}</strong>
+      </div>
+      <div class="detail-section">
+        <h3>虚拟机配置</h3>
+        <div class="form-grid compact">
+          <label>CPU 核数<input id="desktopVcpus" type="number" min="1" max="16" step="1" value="${item.resources.vcpus}" ${canEditResources ? "" : "disabled"} /></label>
+          <label>内存 MiB<input id="desktopMemoryMiB" type="number" min="1024" max="32768" step="256" value="${item.resources.memoryMiB}" ${canEditResources ? "" : "disabled"} /></label>
+        </div>
+        <div class="actions">
+          <button class="button" data-resources="${item.id}" ${canEditResources ? "" : "disabled"}>${icon("✓")}保存配置</button>
+        </div>
+        <small>${canEditResources ? "配置会在下次开机时生效。" : "运行中的虚拟机请先关机，再修改 CPU 和内存。"}</small>
       </div>
       <div class="detail-section">
         <h3>模式</h3>
@@ -282,8 +375,13 @@ function detailHtml(item: Desktop): string {
           ${modeButton(item, "realtime30")}
           ${modeButton(item, "powersave")}
           ${modeButton(item, "physical")}
+          ${profiles.map((profile) => profileButton(item, profile)).join("")}
         </div>
         <small>当前模式参数: ${escapeHtml(JSON.stringify(payload))}</small>
+      </div>
+      <div class="detail-section">
+        <h3>QEMU 命令行</h3>
+        <pre class="logs">${escapeHtml(qemuCommand)}</pre>
       </div>
       <div class="detail-section">
         <h3>操作</h3>
@@ -303,6 +401,12 @@ function modeButton(item: Desktop, mode: DesktopMode): string {
   return `<button class="button ${item.mode === mode ? "primary" : ""}" data-mode="${item.id}:${mode}">${modeLabel(mode)}</button>`;
 }
 
+function profileButton(item: Desktop, profile: GvtProfile): string {
+  const active = item.gvtProfile === profile.id ? "primary" : "";
+  const label = `${profile.id} ${profile.resolution.width}x${profile.resolution.height} free=${profile.availableInstances}`;
+  return `<button class="button ${active}" data-profile="${item.id}:${profile.id}">${escapeHtml(label)}</button>`;
+}
+
 function settingsHtml(server: ServerConfig, apiMode: "mock" | "real"): string {
   return `
     <div class="modal-backdrop hidden" id="settingsBackdrop">
@@ -316,7 +420,7 @@ function settingsHtml(server: ServerConfig, apiMode: "mock" | "real"): string {
           <label>显示名称<input id="serverNameInput" value="${escapeHtml(server.name)}" /></label>
           <label>服务器地址<input id="serverHost" value="${escapeHtml(server.host)}" /></label>
           <label>管理端口<input id="serverPort" type="number" value="${server.managementPort}" /></label>
-          <label>用户名<input id="serverUser" value="${escapeHtml(server.username || "")}" /></label>
+          <label>用户名<input id="serverUser" name="gvtServerUser" autocomplete="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" value="${escapeHtml(server.username || "")}" /></label>
           <label>登录方式
             <select id="authMethod">
               <option value="none" ${server.authMethod === "none" ? "selected" : ""}>无认证</option>
@@ -324,8 +428,8 @@ function settingsHtml(server: ServerConfig, apiMode: "mock" | "real"): string {
               <option value="token" ${server.authMethod === "token" ? "selected" : ""}>令牌</option>
             </select>
           </label>
-          <label>密码<input id="serverPassword" type="password" autocomplete="current-password" placeholder="仅本次登录使用" /></label>
-          <label>令牌<input id="serverToken" type="password" autocomplete="off" placeholder="仅本次登录使用" /></label>
+          <label>密码<input id="serverPassword" name="gvtServerPassword" type="password" autocomplete="off" data-lpignore="true" data-1p-ignore="true" placeholder="仅本次登录使用" /></label>
+          <label>令牌<input id="serverToken" name="gvtServerToken" type="password" autocomplete="off" data-lpignore="true" data-1p-ignore="true" placeholder="仅本次登录使用" /></label>
           <label>API 模式
             <select id="apiMode">
               <option value="mock" ${apiMode === "mock" ? "selected" : ""}>Mock 数据</option>
@@ -384,7 +488,7 @@ function bindEvents(): void {
   document.querySelectorAll("[data-detail]").forEach((button) => button.addEventListener("click", () => {
     store.set({ selectedDesktopId: (button as HTMLElement).dataset.detail });
   }));
-  document.querySelectorAll("[data-connect]").forEach((button) => button.addEventListener("click", () => openViewer((button as HTMLElement).dataset.connect || "")));
+  document.querySelectorAll("[data-connect]").forEach((button) => button.addEventListener("click", () => void openViewer((button as HTMLElement).dataset.connect || "")));
   document.querySelectorAll("[data-power]").forEach((button) => button.addEventListener("click", () => void power((button as HTMLElement).dataset.power || "")));
   document.querySelectorAll("[data-restart]").forEach((button) => button.addEventListener("click", () => void restart((button as HTMLElement).dataset.restart || "")));
   document.querySelectorAll("[data-logs]").forEach((button) => button.addEventListener("click", () => void loadLogs((button as HTMLElement).dataset.logs || "")));
@@ -392,14 +496,61 @@ function bindEvents(): void {
     const [id, mode] = ((button as HTMLElement).dataset.mode || "").split(":") as [string, DesktopMode];
     void setMode(id, mode);
   }));
+  document.querySelectorAll("[data-profile]").forEach((button) => button.addEventListener("click", () => {
+    const [id, profile] = ((button as HTMLElement).dataset.profile || "").split(":") as [string, string];
+    void setProfile(id, profile);
+  }));
+  document.querySelectorAll("[data-resources]").forEach((button) => button.addEventListener("click", () => {
+    void setResources((button as HTMLElement).dataset.resources || "");
+  }));
   document.querySelectorAll("[data-close-viewer]").forEach((button) => button.addEventListener("click", () => hide("viewerBackdrop")));
   document.querySelectorAll("[data-auto-viewer]").forEach((button) => button.addEventListener("click", () => {
     const stage = document.querySelector(".viewer-stage");
     stage?.scrollIntoView({ block: "center", behavior: "smooth" });
   }));
-  document.getElementById("searchInput")?.addEventListener("input", (event) => {
-    store.set({ query: (event.target as HTMLInputElement).value });
-  });
+  const searchInput = document.getElementById("searchInput") as HTMLInputElement | null;
+  if (searchInput) {
+    let userEditedSearch = false;
+    const unlockSearch = () => {
+      searchInput.readOnly = false;
+    };
+    const markUserEdit = () => {
+      userEditedSearch = true;
+      unlockSearch();
+    };
+    const isLikelyAutofill = (value: string) => {
+      const normalized = value.trim().toLowerCase();
+      const username = (store.get().server.username || "").trim().toLowerCase();
+      return !!normalized && (normalized === username || normalized === "root");
+    };
+    const clearAutofill = () => {
+      const state = store.get();
+      if (userEditedSearch) {
+        return;
+      }
+      if (!state.query || isLikelyAutofill(state.query) || isLikelyAutofill(searchInput.value)) {
+        searchInput.value = "";
+        if (state.query && isLikelyAutofill(state.query)) {
+          store.set({ query: "" });
+        }
+      }
+    };
+    searchInput.addEventListener("pointerdown", unlockSearch);
+    searchInput.addEventListener("focus", unlockSearch);
+    searchInput.addEventListener("keydown", markUserEdit);
+    searchInput.addEventListener("paste", markUserEdit);
+    searchInput.addEventListener("search", markUserEdit);
+    searchInput.addEventListener("input", (event) => {
+      const value = (event.target as HTMLInputElement).value;
+      if (!userEditedSearch && isLikelyAutofill(value)) {
+        clearAutofill();
+        return;
+      }
+      store.set({ query: value });
+    });
+    clearAutofill();
+    [50, 250, 1000, 2000].forEach((delay) => window.setTimeout(clearAutofill, delay));
+  }
 }
 
 loadConfig();

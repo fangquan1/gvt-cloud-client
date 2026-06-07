@@ -17,7 +17,7 @@ export const DEFAULT_SERVER: ServerConfig = {
   id: "openeuler111",
   name: "openeuler111",
   host: "192.168.0.188",
-  managementPort: 8090,
+  managementPort: 8098,
   authMethod: "password",
   username: "root"
 };
@@ -45,11 +45,17 @@ export function defaultDesktops(): Desktop[] {
       address: "192.168.0.188",
       status: "running",
       mode: "realtime60",
+      gvtProfile: "i915-GVTg_V5_8",
+      resources: { vcpus: 4, memoryMiB: 4096 },
       resolution: { width: 1024, height: 768 },
       ports: { video: 5004, input: 5905, spice: 5900 },
       runtime: { uptimeSeconds: 7360, fps: 60, latencyMs: 15, droppedPackets: 0, encodeFailures: 0 },
       thumbnailUrl: "assets/desktop-win10.png",
       qemuSummary: "gvt-stream h264 rtp + spice audio + native input",
+      qemuCommand: {
+        args: ["/usr/local/src/project/qemu/build/qemu-system-x86_64", "--nodefaults", "-enable-kvm", "-cpu", "host", "-m", "4096", "-smp", "4", "-name", "vm1"],
+        line: "/usr/local/src/project/qemu/build/qemu-system-x86_64 --nodefaults -enable-kvm -cpu host -m 4096 -smp 4 -name vm1"
+      },
       physicalConnector: "DP-1",
       keyboardSource: "client",
       audioSource: "client"
@@ -60,11 +66,17 @@ export function defaultDesktops(): Desktop[] {
       address: "192.168.0.188",
       status: "running",
       mode: "physical",
+      gvtProfile: "i915-GVTg_V5_8",
+      resources: { vcpus: 4, memoryMiB: 4096 },
       resolution: { width: 1024, height: 768 },
       ports: { video: 5006, input: 5906, spice: 5901 },
       runtime: { uptimeSeconds: 4120, fps: 60, latencyMs: 15, droppedPackets: 0, encodeFailures: 0 },
       thumbnailUrl: "assets/desktop-win10.png",
       qemuSummary: "published dmabuf -> gvt-outputd -> DP/HDMI",
+      qemuCommand: {
+        args: ["/usr/local/src/project/qemu/build/qemu-system-x86_64", "--nodefaults", "-enable-kvm", "-cpu", "host", "-m", "4096", "-smp", "4", "-name", "vm2"],
+        line: "/usr/local/src/project/qemu/build/qemu-system-x86_64 --nodefaults -enable-kvm -cpu host -m 4096 -smp 4 -name vm2"
+      },
       physicalConnector: "DP-1",
       keyboardSource: "client",
       audioSource: "client"
@@ -75,11 +87,14 @@ export function defaultDesktops(): Desktop[] {
       address: "192.168.0.188",
       status: "stopped",
       mode: "powersave",
+      gvtProfile: "i915-GVTg_V5_4",
+      resources: { vcpus: 4, memoryMiB: 4096 },
       resolution: { width: 1920, height: 1200 },
       ports: { video: 5010, input: 5910, spice: 5902 },
       runtime: { uptimeSeconds: 0 },
       thumbnailUrl: "assets/desktop-win10.png",
       qemuSummary: "overlay ready, vm stopped",
+      qemuCommand: { args: [], line: "" },
       keyboardSource: "client",
       audioSource: "client"
     }
