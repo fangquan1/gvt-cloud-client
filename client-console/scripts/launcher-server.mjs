@@ -10,6 +10,7 @@ const consoleRoot = path.resolve(scriptDir, "..");
 const distRoot = path.join(consoleRoot, "dist");
 const workspaceRoot = path.resolve(consoleRoot, "..", "..", "..");
 const viewerExe = process.env.GVT_VIEWER_EXE || path.join(workspaceRoot, "direct-stream", "client", "gvt_spice_viewer.exe");
+const remoteViewerExe = process.env.GVT_REMOTE_VIEWER_EXE || "C:\\Program Files\\VirtViewer v11.0-256\\bin\\remote-viewer.exe";
 const port = Number(process.env.GVT_CONSOLE_PORT || 5177);
 const host = process.env.GVT_CONSOLE_HOST || "127.0.0.1";
 
@@ -76,6 +77,27 @@ function normalizeArgs(args) {
   return normalized;
 }
 
+function normalizeSpiceInstallPayload(payload) {
+  const title = String(payload.title || "GVT Install Console").slice(0, 80);
+  const args = normalizeArgs(payload.args);
+  const spiceHostIndex = args.indexOf("--spice-host");
+  const spicePortIndex = args.indexOf("--spice-port");
+  if (spiceHostIndex < 0 || spicePortIndex < 0) {
+    throw new Error("SPICE 安装控制台缺少服务器或端口");
+  }
+  const spiceHost = args[spiceHostIndex + 1];
+  const spicePort = args[spicePortIndex + 1];
+  if (!/^[A-Za-z0-9.:-]+$/.test(spiceHost) || !/^[0-9]+$/.test(spicePort)) {
+    throw new Error("SPICE 安装控制台地址无效");
+  }
+  return [
+    "--title",
+    `${title} 安装控制台`,
+    "--spice-disable-usbredir",
+    `spice://${spiceHost}:${spicePort}`
+  ];
+}
+
 async function readBody(request) {
   const chunks = [];
   let size = 0;
@@ -94,17 +116,20 @@ async function launchViewer(request, response) {
     sendJson(response, 403, { error: "本地启动器只接受本机请求" });
     return;
   }
-  if (!existsSync(viewerExe)) {
-    sendJson(response, 500, { error: `找不到本地客户端: ${viewerExe}` });
-    return;
-  }
-
   try {
     const body = await readBody(request);
     const payload = JSON.parse(body);
-    const args = normalizeArgs(payload.args);
-    const child = spawn(viewerExe, args, {
-      cwd: path.dirname(viewerExe),
+    const viewerKind = String(payload.viewerKind || "gvt-stream");
+    const exe = viewerKind === "spice-install" ? remoteViewerExe : viewerExe;
+    if (!existsSync(exe)) {
+      sendJson(response, 500, { error: `找不到本地客户端: ${exe}` });
+      return;
+    }
+    const args = viewerKind === "spice-install"
+      ? normalizeSpiceInstallPayload(payload)
+      : normalizeArgs(payload.args);
+    const child = spawn(exe, args, {
+      cwd: path.dirname(exe),
       detached: true,
       stdio: "ignore",
       windowsHide: false

@@ -151,6 +151,7 @@ export interface LinkStatus {
 export interface ViewerLaunchPlan {
   desktopId: string;
   title: string;
+  viewerKind: "gvt-stream" | "spice-install" | "physical";
   physical: boolean;
   videoEnabled: boolean;
   resolution: DesktopResolution;

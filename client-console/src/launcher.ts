@@ -37,6 +37,7 @@ export function buildLaunchPlan(
   defaults: ClientDefaults = CLIENT_DEFAULTS
 ): ViewerLaunchPlan {
   const physical = desktop.mode === "physical";
+  const installConsole = !physical && Boolean(desktop.installIso);
   const links: LinkStatus = {
     video: physical ? "disabled" : "connecting",
     input: desktop.keyboardSource === "client" ? "connecting" : "idle",
@@ -46,6 +47,7 @@ export function buildLaunchPlan(
   return {
     desktopId: desktop.id,
     title: desktop.name,
+    viewerKind: physical ? "physical" : installConsole ? "spice-install" : "gvt-stream",
     physical,
     videoEnabled: !physical,
     resolution: desktop.resolution,
@@ -53,6 +55,8 @@ export function buildLaunchPlan(
     args,
     summary: physical
       ? `${desktop.name} uses ${desktop.physicalConnector || "physical output"}; client keeps input/audio focus.`
+      : installConsole
+        ? `${desktop.name} uses SPICE install console ${desktop.ports.spice}; detach ISO after Intel driver install to return to H.264 gvt-stream.`
       : `${desktop.name} uses H.264 RTP ${desktop.ports.video}, native input ${desktop.ports.input}, SPICE audio ${desktop.ports.spice}.`
   };
 }
