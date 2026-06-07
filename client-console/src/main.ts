@@ -196,12 +196,61 @@ async function createDesktopFromModal(): Promise<void> {
   }
 }
 
+async function uploadCreateFile(kind: "iso" | "qcow2"): Promise<void> {
+  const inputId = kind === "iso" ? "newDesktopIsoFile" : "newDesktopQcow2File";
+  const pathId = kind === "iso" ? "newDesktopIsoPath" : "newDesktopQcow2Path";
+  const input = document.getElementById(inputId) as HTMLInputElement | null;
+  const file = input?.files?.[0];
+  if (!file) {
+    return;
+  }
+  setUploadMessage(`正在上传 ${file.name} ...`);
+  try {
+    const uploaded = await api.uploadFile(kind, file);
+    const target = document.getElementById(pathId) as HTMLInputElement | null;
+    if (target) {
+      target.value = uploaded.path;
+    }
+    setUploadMessage(`已上传到 ${uploaded.path}`);
+  } catch (error) {
+    setUploadMessage("");
+    handleApiError(error);
+  }
+}
+
+function setUploadMessage(message: string): void {
+  const target = document.getElementById("createUploadMessage");
+  if (target) {
+    target.textContent = message;
+  }
+}
+
 async function setIso(id: string): Promise<void> {
   try {
     const updated = await api.setDesktopIso(id, { isoPath: valueOf("desktopIsoPath") });
     const desktops = store.get().desktops.map((item) => item.id === id ? updated : item);
     store.set({ desktops, selectedDesktopId: id, error: undefined });
     await refreshAll();
+  } catch (error) {
+    handleApiError(error);
+  }
+}
+
+async function uploadDetailIso(id: string): Promise<void> {
+  const input = document.getElementById("desktopIsoFile") as HTMLInputElement | null;
+  const file = input?.files?.[0];
+  if (!file) {
+    return;
+  }
+  try {
+    const uploaded = await api.uploadFile("iso", file);
+    const target = document.getElementById("desktopIsoPath") as HTMLInputElement | null;
+    if (target) {
+      target.value = uploaded.path;
+    }
+    const updated = await api.setDesktopIso(id, { isoPath: uploaded.path });
+    const desktops = store.get().desktops.map((item) => item.id === id ? updated : item);
+    store.set({ desktops, selectedDesktopId: id, error: undefined });
   } catch (error) {
     handleApiError(error);
   }
@@ -408,6 +457,7 @@ function detailHtml(item: Desktop): string {
       <div class="detail-section">
         <h3>安装 ISO</h3>
         <label>ISO 路径<input id="desktopIsoPath" value="${escapeHtml(item.installIso || "")}" placeholder="/root/iso/windows.iso" ${canEditResources ? "" : "disabled"} /></label>
+        <label>从本地上传 ISO<input id="desktopIsoFile" type="file" accept=".iso" data-detail-upload-iso="${item.id}" ${canEditResources ? "" : "disabled"} /></label>
         <div class="actions">
           <button class="button" data-iso="${item.id}" ${canEditResources ? "" : "disabled"}>挂载 ISO</button>
           <button class="button" data-detach-iso="${item.id}" ${canEditResources ? "" : "disabled"}>卸载 ISO</button>
@@ -518,10 +568,12 @@ function createDesktopHtml(profiles: GvtProfile[]): string {
             </select>
           </label>
           <label class="wide">已有 qcow2 路径<input id="newDesktopQcow2Path" placeholder="/root/qemu_cmd/multivm/disks/win10.qcow2" /></label>
+          <label class="wide">从本地上传 qcow2<input id="newDesktopQcow2File" type="file" accept=".qcow2" data-upload-kind="qcow2" /></label>
           <label class="wide">Windows ISO 路径<input id="newDesktopIsoPath" placeholder="/root/iso/windows.iso" /></label>
+          <label class="wide">从本地上传 Windows ISO<input id="newDesktopIsoFile" type="file" accept=".iso" data-upload-kind="iso" /></label>
         </div>
         <footer class="modal-footer">
-          <span class="muted">不填 qcow2 时会在默认磁盘目录创建新的 80G 系统盘；填写 ISO 后首次开机会从 ISO 启动安装。</span>
+          <span class="muted" id="createUploadMessage">不填 qcow2 时会在默认磁盘目录创建新的 80G 系统盘；填写 ISO 后首次开机会从 ISO 启动安装。</span>
           <button class="button primary" data-create-submit>${icon("+")}创建</button>
         </footer>
       </section>
@@ -565,6 +617,9 @@ function bindEvents(): void {
   document.querySelectorAll("[data-create]").forEach((button) => button.addEventListener("click", () => show("createBackdrop")));
   document.querySelectorAll("[data-close-create]").forEach((button) => button.addEventListener("click", () => hide("createBackdrop")));
   document.querySelectorAll("[data-create-submit]").forEach((button) => button.addEventListener("click", () => void createDesktopFromModal()));
+  document.querySelectorAll("[data-upload-kind]").forEach((input) => input.addEventListener("change", () => {
+    void uploadCreateFile(((input as HTMLElement).dataset.uploadKind || "iso") as "iso" | "qcow2");
+  }));
   document.querySelectorAll("[data-close-settings]").forEach((button) => button.addEventListener("click", () => hide("settingsBackdrop")));
   document.querySelectorAll("[data-login]").forEach((button) => button.addEventListener("click", () => void loginFromModal()));
   document.querySelectorAll("[data-refresh]").forEach((button) => button.addEventListener("click", () => void refreshAll()));
@@ -601,6 +656,9 @@ function bindEvents(): void {
       input.value = "";
     }
     void setIso((button as HTMLElement).dataset.detachIso || "");
+  }));
+  document.querySelectorAll("[data-detail-upload-iso]").forEach((input) => input.addEventListener("change", () => {
+    void uploadDetailIso((input as HTMLElement).dataset.detailUploadIso || "");
   }));
   document.querySelectorAll("[data-close-viewer]").forEach((button) => button.addEventListener("click", () => hide("viewerBackdrop")));
   document.querySelectorAll("[data-auto-viewer]").forEach((button) => button.addEventListener("click", () => {

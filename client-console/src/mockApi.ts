@@ -90,6 +90,15 @@ export class MockApiClient implements ApiClient {
     return clone(desktop);
   }
 
+  async uploadFile(kind: "iso" | "qcow2", file: File): Promise<{ path: string; kind: "iso" | "qcow2"; filename: string }> {
+    const subdir = kind === "iso" ? "iso" : "disks";
+    return {
+      path: `/root/qemu_cmd/multivm/uploads/${subdir}/${file.name}`,
+      kind,
+      filename: file.name
+    };
+  }
+
   async startDesktop(id: string): Promise<Desktop> {
     const desktop = this.requireDesktop(id);
     desktop.status = "running";

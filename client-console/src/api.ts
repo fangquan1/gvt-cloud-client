@@ -11,7 +11,8 @@ import type {
   ModeRequest,
   ResourceRequest,
   ServerConfig,
-  Session
+  Session,
+  UploadResult
 } from "./models.js";
 import { trimLogLines } from "./security.js";
 
@@ -156,6 +157,13 @@ export class HttpApiClient implements ApiClient {
     );
   }
 
+  async uploadFile(kind: "iso" | "qcow2", file: File): Promise<UploadResult> {
+    const body = new FormData();
+    body.append("kind", kind);
+    body.append("file", file);
+    return await this.request<UploadResult>("POST", "/api/uploads", body);
+  }
+
   async startDesktop(id: string): Promise<Desktop> {
     return normalizeDesktop(await this.post<ServerDesktop>(`/api/desktops/${encodeURIComponent(id)}/start`, {}), this.config);
   }
@@ -224,7 +232,7 @@ export class HttpApiClient implements ApiClient {
 
   private async request<T>(method: string, path: string, body?: unknown, withAuth = true): Promise<T> {
     const headers: Record<string, string> = { "Accept": "application/json" };
-    if (body !== undefined) {
+    if (body !== undefined && !(body instanceof FormData)) {
       headers["Content-Type"] = "application/json";
     }
     if (withAuth && this.sessionToken) {
@@ -234,7 +242,7 @@ export class HttpApiClient implements ApiClient {
     const response = await fetch(this.url(path), {
       method,
       headers,
-      body: body === undefined ? undefined : JSON.stringify(body)
+      body: body === undefined ? undefined : body instanceof FormData ? body : JSON.stringify(body)
     });
     if (!response.ok) {
       const payload = await response.json().catch(() => ({ error: "" })) as { error?: string };
