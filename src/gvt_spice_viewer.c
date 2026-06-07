@@ -25,6 +25,7 @@
 #define SPICE_CHANNEL_PLAYBACK 5
 #define SPICE_CHANNEL_RECORD 6
 #define SPICE_CHANNEL_OPENED 10
+#define SPICE_CHANNEL_CLOSED 12
 
 #define SPICE_MOUSE_BUTTON_LEFT 1
 #define SPICE_MOUSE_BUTTON_MIDDLE 2
@@ -68,6 +69,7 @@ static void (*p_spice_inputs_channel_key_release)(void *channel, guint scancode)
 
 static void (*p_g_object_set)(gpointer object, const char *first_property_name, ...);
 static void (*p_g_object_get)(gpointer object, const char *first_property_name, ...);
+static void (*p_g_object_unref)(gpointer object);
 static unsigned long (*p_g_signal_connect_data)(gpointer instance,
                                                 const char *detailed_signal,
                                                 GCallback c_handler,
@@ -77,6 +79,7 @@ static unsigned long (*p_g_signal_connect_data)(gpointer instance,
 static void *(*p_g_main_loop_new)(void *context, gboolean is_running);
 static void (*p_g_main_loop_run)(void *loop);
 static void (*p_g_main_loop_quit)(void *loop);
+static void (*p_g_main_loop_unref)(void *loop);
 static guint (*p_g_idle_add)(gboolean (*function)(gpointer), gpointer data);
 static guint (*p_g_idle_add_full)(gint priority, gboolean (*function)(gpointer),
                                   gpointer data, GDestroyNotify notify);
@@ -114,6 +117,7 @@ static void *main_loop;
 static void *inputs_channel;
 static void *spice_audio_obj;
 static bool inputs_ready;
+static volatile LONG shutting_down;
 static LONG button_state;
 static FILE *log_fp;
 static CRITICAL_SECTION input_lock;
@@ -245,10 +249,12 @@ static void load_spice_runtime(void)
 
     p_g_object_set = sym(gobject, "g_object_set");
     p_g_object_get = sym(gobject, "g_object_get");
+    p_g_object_unref = sym(gobject, "g_object_unref");
     p_g_signal_connect_data = sym(gobject, "g_signal_connect_data");
     p_g_main_loop_new = sym(glib, "g_main_loop_new");
     p_g_main_loop_run = sym(glib, "g_main_loop_run");
     p_g_main_loop_quit = sym(glib, "g_main_loop_quit");
+    p_g_main_loop_unref = sym(glib, "g_main_loop_unref");
     p_g_idle_add = sym(glib, "g_idle_add");
     p_g_idle_add_full = sym(glib, "g_idle_add_full");
 }
@@ -671,6 +677,15 @@ static void channel_event(void *channel, gint event, void *opaque)
         inputs_channel = channel;
         inputs_ready = true;
         SetWindowTextA(main_hwnd, "GVT SPICE Viewer - inputs ready");
+    } else if (event >= SPICE_CHANNEL_CLOSED) {
+        if (type == SPICE_CHANNEL_INPUTS) {
+            inputs_channel = NULL;
+            inputs_ready = false;
+        }
+        if (main_loop && InterlockedCompareExchange(&shutting_down, 0, 0) == 0) {
+            log_line("SPICE channel closed, scheduling reconnect");
+            p_g_main_loop_quit(main_loop);
+        }
     }
 }
 
@@ -744,26 +759,55 @@ static void channel_new(void *session, void *channel, void *opaque)
 
 static DWORD WINAPI spice_thread(LPVOID opaque)
 {
-    void *session;
     (void)opaque;
 
     if (!spice) {
         load_spice_runtime();
     }
     log_line("spice thread start host=%s port=%s", spice_host, spice_port);
-    session = p_spice_session_new();
-    p_g_object_set(session, "host", spice_host, "port", spice_port, NULL);
-    p_g_signal_connect_data(session, "channel-new", (GCallback)channel_new,
-                            NULL, NULL, 0);
-    spice_audio_obj = p_spice_audio_get(session, NULL);
-    log_line("spice_audio_get returned %p", spice_audio_obj);
-    main_loop = p_g_main_loop_new(NULL, 0);
-    if (!p_spice_session_connect(session)) {
-        log_line("spice_session_connect failed");
-        return 3;
+
+    while (InterlockedCompareExchange(&shutting_down, 0, 0) == 0) {
+        void *session;
+        void *loop;
+
+        inputs_channel = NULL;
+        inputs_ready = false;
+        spice_audio_obj = NULL;
+
+        session = p_spice_session_new();
+        p_g_object_set(session, "host", spice_host, "port", spice_port, NULL);
+        p_g_signal_connect_data(session, "channel-new", (GCallback)channel_new,
+                                NULL, NULL, 0);
+        spice_audio_obj = p_spice_audio_get(session, NULL);
+        log_line("spice_audio_get returned %p", spice_audio_obj);
+        loop = p_g_main_loop_new(NULL, 0);
+        main_loop = loop;
+        if (!p_spice_session_connect(session)) {
+            log_line("spice_session_connect failed; retrying");
+        } else {
+            log_line("spice_session_connect ok, entering main loop");
+            p_g_main_loop_run(loop);
+        }
+
+        if (main_loop == loop) {
+            main_loop = NULL;
+        }
+        inputs_channel = NULL;
+        inputs_ready = false;
+        spice_audio_obj = NULL;
+
+        if (p_g_main_loop_unref) {
+            p_g_main_loop_unref(loop);
+        }
+        if (p_g_object_unref) {
+            p_g_object_unref(session);
+        }
+
+        if (InterlockedCompareExchange(&shutting_down, 0, 0) == 0) {
+            log_line("SPICE reconnect in 1000 ms");
+            Sleep(1000);
+        }
     }
-    log_line("spice_session_connect ok, entering main loop");
-    p_g_main_loop_run(main_loop);
     return 0;
 }
 
@@ -1234,6 +1278,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
         }
         return 0;
     case WM_DESTROY:
+        InterlockedExchange(&shutting_down, 1);
         if (main_loop) {
             p_g_main_loop_quit(main_loop);
         }
