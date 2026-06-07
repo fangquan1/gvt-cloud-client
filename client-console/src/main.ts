@@ -372,11 +372,28 @@ async function loadLogs(id: string): Promise<void> {
 }
 
 async function openViewer(id: string): Promise<void> {
-  const desktop = desktopById(id);
+  let desktop = desktopById(id);
   if (!desktop) {
     return;
   }
   const state = store.get();
+  if (desktop.mode !== "physical") {
+    try {
+      desktop = await api.startDesktop(id);
+      const desktops = store.get().desktops.map((item) => item.id === id ? desktop as Desktop : item);
+      store.set({ desktops, selectedDesktopId: id, error: undefined });
+    } catch (error) {
+      handleApiError(error);
+      return;
+    }
+  } else {
+    try {
+      await api.selectOutput(id);
+    } catch (error) {
+      handleApiError(error);
+      return;
+    }
+  }
   const plan = buildLaunchPlan(desktop, state.server, CLIENT_DEFAULTS);
   store.set({ viewer: plan, error: undefined });
 
