@@ -3,7 +3,7 @@ import { CLIENT_DEFAULTS, DEFAULT_SERVER } from "./defaults.js";
 import { filterDesktops, formatUptime, modeLabel, statusLabel } from "./filters.js";
 import { buildLaunchPlan, modePayload } from "./launcher.js";
 import { MockApiClient } from "./mockApi.js";
-import type { ApiClient, Desktop, DesktopMode, FilterKey, GvtProfile, ServerConfig } from "./models.js";
+import type { ApiClient, Desktop, DesktopMode, FilterKey, GvtProfile, ServerConfig, UploadProgress } from "./models.js";
 import { Store } from "./store.js";
 
 const CONFIG_KEY = "gvt-cloud-client.server";
@@ -27,6 +27,25 @@ function escapeHtml(value: string): string {
     "\"": "&quot;",
     "'": "&#39;"
   }[char] || char));
+}
+
+function formatBytes(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) {
+    return "0 B";
+  }
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let current = value;
+  let index = 0;
+  while (current >= 1024 && index < units.length - 1) {
+    current /= 1024;
+    index += 1;
+  }
+  const digits = current >= 100 || index === 0 ? 0 : current >= 10 ? 1 : 2;
+  return `${current.toFixed(digits)} ${units[index]}`;
+}
+
+function uploadProgressText(file: File, progress: UploadProgress): string {
+  return `正在上传 ${file.name} ${progress.percent}% (${formatBytes(progress.loaded)} / ${formatBytes(progress.total)})`;
 }
 
 function loadConfig(): void {
@@ -204,16 +223,18 @@ async function uploadCreateFile(kind: "iso" | "qcow2"): Promise<void> {
   if (!file) {
     return;
   }
-  setUploadMessage(`正在上传 ${file.name} ...`);
+  setUploadProgress(0, `正在上传 ${file.name} ...`);
   try {
-    const uploaded = await api.uploadFile(kind, file);
+    const uploaded = await api.uploadFile(kind, file, (progress) => {
+      setUploadProgress(progress.percent, uploadProgressText(file, progress));
+    });
     const target = document.getElementById(pathId) as HTMLInputElement | null;
     if (target) {
       target.value = uploaded.path;
     }
-    setUploadMessage(`已上传到 ${uploaded.path}`);
+    setUploadProgress(100, `已上传到 ${uploaded.path}`);
   } catch (error) {
-    setUploadMessage("");
+    setUploadProgress(undefined, "");
     handleApiError(error);
   }
 }
@@ -223,6 +244,21 @@ function setUploadMessage(message: string): void {
   if (target) {
     target.textContent = message;
   }
+}
+
+function setUploadProgress(percent: number | undefined, message: string): void {
+  setUploadMessage(message);
+  const bar = document.getElementById("createUploadProgress") as HTMLProgressElement | null;
+  if (!bar) {
+    return;
+  }
+  if (percent === undefined) {
+    bar.classList.add("hidden");
+    bar.removeAttribute("value");
+    return;
+  }
+  bar.classList.remove("hidden");
+  bar.value = Math.max(0, Math.min(100, percent));
 }
 
 async function setIso(id: string): Promise<void> {
@@ -242,8 +278,11 @@ async function uploadDetailIso(id: string): Promise<void> {
   if (!file) {
     return;
   }
+  setDetailIsoProgress(0, `正在上传 ${file.name} ...`);
   try {
-    const uploaded = await api.uploadFile("iso", file);
+    const uploaded = await api.uploadFile("iso", file, (progress) => {
+      setDetailIsoProgress(progress.percent, uploadProgressText(file, progress));
+    });
     const target = document.getElementById("desktopIsoPath") as HTMLInputElement | null;
     if (target) {
       target.value = uploaded.path;
@@ -251,9 +290,29 @@ async function uploadDetailIso(id: string): Promise<void> {
     const updated = await api.setDesktopIso(id, { isoPath: uploaded.path });
     const desktops = store.get().desktops.map((item) => item.id === id ? updated : item);
     store.set({ desktops, selectedDesktopId: id, error: undefined });
+    setDetailIsoProgress(100, `已上传并挂载 ${uploaded.path}`);
   } catch (error) {
+    setDetailIsoProgress(undefined, "");
     handleApiError(error);
   }
+}
+
+function setDetailIsoProgress(percent: number | undefined, message: string): void {
+  const target = document.getElementById("desktopIsoUploadMessage");
+  if (target) {
+    target.textContent = message;
+  }
+  const bar = document.getElementById("desktopIsoUploadProgress") as HTMLProgressElement | null;
+  if (!bar) {
+    return;
+  }
+  if (percent === undefined) {
+    bar.classList.add("hidden");
+    bar.removeAttribute("value");
+    return;
+  }
+  bar.classList.remove("hidden");
+  bar.value = Math.max(0, Math.min(100, percent));
 }
 
 async function power(id: string): Promise<void> {
@@ -478,6 +537,8 @@ function detailHtml(item: Desktop): string {
         <h3>安装 ISO</h3>
         <label>ISO 路径<input id="desktopIsoPath" value="${escapeHtml(item.installIso || "")}" placeholder="/root/iso/windows.iso" ${canEditResources ? "" : "disabled"} /></label>
         <label>从本地上传 ISO<input id="desktopIsoFile" type="file" accept=".iso" data-detail-upload-iso="${item.id}" ${canEditResources ? "" : "disabled"} /></label>
+        <progress id="desktopIsoUploadProgress" class="upload-progress hidden" value="0" max="100"></progress>
+        <small id="desktopIsoUploadMessage"></small>
         <div class="actions">
           <button class="button" data-iso="${item.id}" ${canEditResources ? "" : "disabled"}>挂载 ISO</button>
           <button class="button" data-detach-iso="${item.id}" ${canEditResources ? "" : "disabled"}>卸载 ISO</button>
@@ -599,7 +660,10 @@ function createDesktopHtml(profiles: GvtProfile[]): string {
           <label class="wide">从本地上传 Windows ISO<input id="newDesktopIsoFile" type="file" accept=".iso" data-upload-kind="iso" /></label>
         </div>
         <footer class="modal-footer">
-          <span class="muted" id="createUploadMessage">不填 qcow2 时会在默认磁盘目录创建新的 80G 系统盘；填写 ISO 后首次开机会从 ISO 启动安装。</span>
+          <div class="upload-status">
+            <span class="muted" id="createUploadMessage">不填 qcow2 时会在默认磁盘目录创建新的 80G 系统盘；填写 ISO 后首次开机会从 ISO 启动安装。</span>
+            <progress id="createUploadProgress" class="upload-progress hidden" value="0" max="100"></progress>
+          </div>
           <button class="button primary" data-create-submit>${icon("+")}创建</button>
         </footer>
       </section>

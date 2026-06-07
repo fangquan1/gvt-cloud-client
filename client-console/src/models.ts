@@ -130,6 +130,12 @@ export interface UploadResult {
   filename: string;
 }
 
+export interface UploadProgress {
+  loaded: number;
+  total: number;
+  percent: number;
+}
+
 export interface LogSummary {
   desktopId: string;
   lines: string[];
@@ -173,7 +179,7 @@ export interface ApiClient {
   gvtProfiles(): Promise<GvtProfile[]>;
   desktop(id: string): Promise<Desktop>;
   createDesktop(request: CreateDesktopRequest): Promise<Desktop>;
-  uploadFile(kind: "iso" | "qcow2", file: File): Promise<UploadResult>;
+  uploadFile(kind: "iso" | "qcow2", file: File, onProgress?: (progress: UploadProgress) => void): Promise<UploadResult>;
   startDesktop(id: string): Promise<Desktop>;
   stopDesktop(id: string): Promise<Desktop>;
   restartDesktop(id: string): Promise<Desktop>;

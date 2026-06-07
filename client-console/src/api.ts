@@ -13,6 +13,7 @@ import type {
   ResourceRequest,
   ServerConfig,
   Session,
+  UploadProgress,
   UploadResult
 } from "./models.js";
 import { trimLogLines } from "./security.js";
@@ -158,11 +159,11 @@ export class HttpApiClient implements ApiClient {
     );
   }
 
-  async uploadFile(kind: "iso" | "qcow2", file: File): Promise<UploadResult> {
+  async uploadFile(kind: "iso" | "qcow2", file: File, onProgress?: (progress: UploadProgress) => void): Promise<UploadResult> {
     const body = new FormData();
     body.append("kind", kind);
     body.append("file", file);
-    return await this.request<UploadResult>("POST", "/api/uploads", body);
+    return await this.upload<UploadResult>("/api/uploads", body, onProgress);
   }
 
   async startDesktop(id: string): Promise<Desktop> {
@@ -258,6 +259,50 @@ export class HttpApiClient implements ApiClient {
       throw new ApiError(payload.error || `${method} ${path} failed`, response.status);
     }
     return await response.json() as T;
+  }
+
+  private upload<T>(path: string, body: FormData, onProgress?: (progress: UploadProgress) => void): Promise<T> {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", this.url(path), true);
+      xhr.setRequestHeader("Accept", "application/json");
+      if (this.sessionToken) {
+        xhr.setRequestHeader("Authorization", `Bearer ${this.sessionToken}`);
+      }
+      xhr.upload.onprogress = (event) => {
+        if (!onProgress || !event.lengthComputable) {
+          return;
+        }
+        const total = event.total || 0;
+        const loaded = Math.min(event.loaded, total || event.loaded);
+        onProgress({
+          loaded,
+          total,
+          percent: total > 0 ? Math.round((loaded / total) * 100) : 0
+        });
+      };
+      xhr.onload = () => {
+        const payload = parseJson(xhr.responseText);
+        if (xhr.status < 200 || xhr.status >= 300) {
+          const error = typeof payload?.error === "string" ? payload.error : `POST ${path} failed`;
+          reject(new ApiError(error, xhr.status));
+          return;
+        }
+        onProgress?.({ loaded: 1, total: 1, percent: 100 });
+        resolve(payload as T);
+      };
+      xhr.onerror = () => reject(new ApiError(`POST ${path} network error`, 0));
+      xhr.onabort = () => reject(new ApiError(`POST ${path} aborted`, 0));
+      xhr.send(body);
+    });
+  }
+}
+
+function parseJson(text: string): Record<string, unknown> {
+  try {
+    return JSON.parse(text || "{}") as Record<string, unknown>;
+  } catch {
+    return {};
   }
 }
 

@@ -10,7 +10,8 @@ import type {
   ModeRequest,
   ResourceRequest,
   ServerConfig,
-  Session
+  Session,
+  UploadProgress
 } from "./models.js";
 import { trimLogLines } from "./security.js";
 
@@ -90,8 +91,13 @@ export class MockApiClient implements ApiClient {
     return clone(desktop);
   }
 
-  async uploadFile(kind: "iso" | "qcow2", file: File): Promise<{ path: string; kind: "iso" | "qcow2"; filename: string }> {
+  async uploadFile(
+    kind: "iso" | "qcow2",
+    file: File,
+    onProgress?: (progress: UploadProgress) => void
+  ): Promise<{ path: string; kind: "iso" | "qcow2"; filename: string }> {
     const subdir = kind === "iso" ? "iso" : "disks";
+    onProgress?.({ loaded: file.size, total: file.size, percent: 100 });
     return {
       path: `/root/qemu_cmd/multivm/uploads/${subdir}/${file.name}`,
       kind,
