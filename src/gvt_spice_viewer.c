@@ -21,7 +21,9 @@
 #include <stdarg.h>
 
 #define SPICE_CHANNEL_MAIN 1
+#define SPICE_CHANNEL_DISPLAY 2
 #define SPICE_CHANNEL_INPUTS 3
+#define SPICE_CHANNEL_CURSOR 4
 #define SPICE_CHANNEL_PLAYBACK 5
 #define SPICE_CHANNEL_RECORD 6
 #define SPICE_CHANNEL_OPENED 10
@@ -790,6 +792,29 @@ static void channel_new(void *session, void *channel, void *opaque)
     }
 }
 
+static void display_channel_new(void *session, void *channel, void *opaque)
+{
+    gint type = 0;
+    gint id = 0;
+    const char *name;
+    (void)session;
+    (void)opaque;
+
+    p_g_object_get(channel, "channel-type", &type, "channel-id", &id, NULL);
+    name = p_spice_channel_type_to_string(type);
+    log_line("SPICE display-mode channel-new type=%d(%s) id=%d",
+             type, name ? name : "?", id);
+    p_g_signal_connect_data(channel, "channel-event", (GCallback)channel_event,
+                            NULL, NULL, 0);
+    if (type == SPICE_CHANNEL_INPUTS ||
+        type == SPICE_CHANNEL_DISPLAY ||
+        type == SPICE_CHANNEL_CURSOR ||
+        type == SPICE_CHANNEL_PLAYBACK ||
+        type == SPICE_CHANNEL_RECORD) {
+        p_spice_channel_connect(channel);
+    }
+}
+
 static DWORD WINAPI spice_thread(LPVOID opaque)
 {
     (void)opaque;
@@ -866,6 +891,9 @@ static int run_spice_display_mode(int argc, char **argv)
 
     session = p_spice_session_new();
     p_g_object_set(session, "host", spice_host, "port", spice_port, NULL);
+    p_g_signal_connect_data(session, "channel-new",
+                            (GCallback)display_channel_new,
+                            NULL, NULL, 0);
     spice_audio_obj = p_spice_audio_get(session, NULL);
     log_line("spice display audio=%p", spice_audio_obj);
 
