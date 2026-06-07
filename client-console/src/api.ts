@@ -1,5 +1,6 @@
 import type {
   ApiClient,
+  CreateDesktopRequest,
   Desktop,
   DesktopMode,
   DesktopStatus,
@@ -63,6 +64,9 @@ interface ServerDesktop {
   };
   tap?: string;
   mac?: string;
+  overlay?: string;
+  disk_size_gib?: number;
+  install_iso?: string;
   gvt_stream?: {
     fps?: number | null;
     capture_ms?: number | null;
@@ -136,6 +140,22 @@ export class HttpApiClient implements ApiClient {
     return normalizeDesktop(await this.get<ServerDesktop>(`/api/desktops/${encodeURIComponent(id)}`), this.config);
   }
 
+  async createDesktop(request: CreateDesktopRequest): Promise<Desktop> {
+    return normalizeDesktop(
+      await this.post<ServerDesktop>("/api/desktops", {
+        name: request.name,
+        vcpus: request.vcpus,
+        memory_mib: request.memoryMiB,
+        disk_size_gib: request.diskSizeGiB,
+        qcow2_path: request.qcow2Path || "",
+        iso_path: request.isoPath || "",
+        mode: toServerMode(request.mode),
+        gvt_profile: request.gvtProfile
+      }),
+      this.config
+    );
+  }
+
   async startDesktop(id: string): Promise<Desktop> {
     return normalizeDesktop(await this.post<ServerDesktop>(`/api/desktops/${encodeURIComponent(id)}/start`, {}), this.config);
   }
@@ -165,6 +185,15 @@ export class HttpApiClient implements ApiClient {
       await this.post<ServerDesktop>(`/api/desktops/${encodeURIComponent(id)}/resources`, {
         vcpus: request.vcpus,
         memory_mib: request.memoryMiB
+      }),
+      this.config
+    );
+  }
+
+  async setDesktopIso(id: string, request: { isoPath: string }): Promise<Desktop> {
+    return normalizeDesktop(
+      await this.post<ServerDesktop>(`/api/desktops/${encodeURIComponent(id)}/iso`, {
+        iso_path: request.isoPath
       }),
       this.config
     );
@@ -275,6 +304,9 @@ function normalizeDesktop(raw: ServerDesktop, config: ServerConfig): Desktop {
       args: Array.isArray(raw.qemu_command?.args) ? raw.qemu_command.args.map(String) : [],
       line: raw.qemu_command?.line || ""
     },
+    diskPath: raw.overlay || undefined,
+    diskSizeGiB: raw.disk_size_gib ? Number(raw.disk_size_gib) : undefined,
+    installIso: raw.install_iso || undefined,
     physicalConnector: mode === "physical" ? "DP/HDMI" : undefined,
     keyboardSource: "client",
     audioSource: "client"

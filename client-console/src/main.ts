@@ -174,6 +174,39 @@ async function setResources(id: string): Promise<void> {
   }
 }
 
+async function createDesktopFromModal(): Promise<void> {
+  try {
+    const state = store.get();
+    const fallbackProfile = state.gvtProfiles[0]?.id || "i915-GVTg_V5_8";
+    const created = await api.createDesktop({
+      name: valueOf("newDesktopName") || "Windows 10",
+      vcpus: Number(valueOf("newDesktopVcpus") || 4),
+      memoryMiB: Number(valueOf("newDesktopMemoryMiB") || 4096),
+      diskSizeGiB: Number(valueOf("newDesktopDiskSizeGiB") || 80),
+      qcow2Path: valueOf("newDesktopQcow2Path") || undefined,
+      isoPath: valueOf("newDesktopIsoPath") || undefined,
+      mode: (valueOf("newDesktopMode") as DesktopMode) || "realtime60",
+      gvtProfile: valueOf("newDesktopProfile") || fallbackProfile
+    });
+    hide("createBackdrop");
+    await refreshAll();
+    store.set({ selectedDesktopId: created.id, error: undefined });
+  } catch (error) {
+    handleApiError(error);
+  }
+}
+
+async function setIso(id: string): Promise<void> {
+  try {
+    const updated = await api.setDesktopIso(id, { isoPath: valueOf("desktopIsoPath") });
+    const desktops = store.get().desktops.map((item) => item.id === id ? updated : item);
+    store.set({ desktops, selectedDesktopId: id, error: undefined });
+    await refreshAll();
+  } catch (error) {
+    handleApiError(error);
+  }
+}
+
 async function power(id: string): Promise<void> {
   const desktop = desktopById(id);
   if (!desktop) {
@@ -266,7 +299,7 @@ function render(): void {
           <div class="top-actions">
             <button class="icon-btn" data-refresh title="刷新">${icon("↻")}</button>
             <button class="button" data-open-settings>${icon("☰")}连接设置</button>
-            <button class="button primary" data-refresh>${icon("+")}刷新桌面</button>
+            <button class="button primary" data-create>${icon("+")}创建桌面</button>
           </div>
         </header>
         <section class="stats-row" aria-label="运行概览">
@@ -291,6 +324,7 @@ function render(): void {
       ${selected ? `<aside class="details">${detailHtml(selected)}</aside>` : ""}
     </div>
     ${settingsHtml(state.server, state.apiMode)}
+    ${createDesktopHtml(state.gvtProfiles)}
     ${viewerHtml()}
     ${state.error ? `<div class="toast">${escapeHtml(state.error)}</div>` : ""}
   `;
@@ -372,6 +406,15 @@ function detailHtml(item: Desktop): string {
         <small>${canEditResources ? "配置会在下次开机时生效。" : "运行中的虚拟机请先关机，再修改 CPU 和内存。"}</small>
       </div>
       <div class="detail-section">
+        <h3>安装 ISO</h3>
+        <label>ISO 路径<input id="desktopIsoPath" value="${escapeHtml(item.installIso || "")}" placeholder="/root/iso/windows.iso" ${canEditResources ? "" : "disabled"} /></label>
+        <div class="actions">
+          <button class="button" data-iso="${item.id}" ${canEditResources ? "" : "disabled"}>挂载 ISO</button>
+          <button class="button" data-detach-iso="${item.id}" ${canEditResources ? "" : "disabled"}>卸载 ISO</button>
+        </div>
+        <small>${canEditResources ? "ISO 会在下次开机时作为光驱挂载，适合安装 Windows 或驱动。" : "运行中的虚拟机请先关机，再挂载或卸载 ISO。"}</small>
+      </div>
+      <div class="detail-section">
         <h3>模式</h3>
         <div class="mode-grid">
           ${modeButton(item, "realtime60")}
@@ -449,6 +492,43 @@ function settingsHtml(server: ServerConfig, apiMode: "mock" | "real"): string {
   `;
 }
 
+function createDesktopHtml(profiles: GvtProfile[]): string {
+  const profileOptions = profiles.length
+    ? profiles.map((profile) => `<option value="${escapeHtml(profile.id)}">${escapeHtml(profile.id)} ${profile.resolution.width}x${profile.resolution.height} free=${profile.availableInstances}</option>`).join("")
+    : `<option value="i915-GVTg_V5_8">i915-GVTg_V5_8 1024x768</option>`;
+  return `
+    <div class="modal-backdrop hidden" id="createBackdrop">
+      <section class="modal" role="dialog" aria-modal="true" aria-label="创建桌面">
+        <header class="modal-header">
+          <h2>创建桌面</h2>
+          <button class="icon-btn" data-close-create title="关闭">${icon("×")}</button>
+        </header>
+        <div class="form-grid">
+          <label>名称<input id="newDesktopName" value="Windows 10" /></label>
+          <label>GVT-g 方案<select id="newDesktopProfile">${profileOptions}</select></label>
+          <label>CPU 核数<input id="newDesktopVcpus" type="number" min="1" max="16" step="1" value="4" /></label>
+          <label>内存 MiB<input id="newDesktopMemoryMiB" type="number" min="1024" max="32768" step="256" value="4096" /></label>
+          <label>系统盘 GiB<input id="newDesktopDiskSizeGiB" type="number" min="20" max="1024" step="1" value="80" /></label>
+          <label>模式
+            <select id="newDesktopMode">
+              <option value="realtime60">实时 60fps</option>
+              <option value="realtime30">兼容 30fps</option>
+              <option value="powersave">节能 15-60fps</option>
+              <option value="physical">物理屏输出</option>
+            </select>
+          </label>
+          <label class="wide">已有 qcow2 路径<input id="newDesktopQcow2Path" placeholder="/root/qemu_cmd/multivm/disks/win10.qcow2" /></label>
+          <label class="wide">Windows ISO 路径<input id="newDesktopIsoPath" placeholder="/root/iso/windows.iso" /></label>
+        </div>
+        <footer class="modal-footer">
+          <span class="muted">不填 qcow2 时会在默认磁盘目录创建新的 80G 系统盘；填写 ISO 后首次开机会从 ISO 启动安装。</span>
+          <button class="button primary" data-create-submit>${icon("+")}创建</button>
+        </footer>
+      </section>
+    </div>
+  `;
+}
+
 function viewerHtml(): string {
   const plan = store.get().viewer;
   const image = desktopById(plan?.desktopId || "")?.thumbnailUrl || "assets/desktop-win10.png";
@@ -482,6 +562,9 @@ function viewerHtml(): string {
 
 function bindEvents(): void {
   document.querySelectorAll("[data-open-settings]").forEach((button) => button.addEventListener("click", () => show("settingsBackdrop")));
+  document.querySelectorAll("[data-create]").forEach((button) => button.addEventListener("click", () => show("createBackdrop")));
+  document.querySelectorAll("[data-close-create]").forEach((button) => button.addEventListener("click", () => hide("createBackdrop")));
+  document.querySelectorAll("[data-create-submit]").forEach((button) => button.addEventListener("click", () => void createDesktopFromModal()));
   document.querySelectorAll("[data-close-settings]").forEach((button) => button.addEventListener("click", () => hide("settingsBackdrop")));
   document.querySelectorAll("[data-login]").forEach((button) => button.addEventListener("click", () => void loginFromModal()));
   document.querySelectorAll("[data-refresh]").forEach((button) => button.addEventListener("click", () => void refreshAll()));
@@ -508,6 +591,16 @@ function bindEvents(): void {
   }));
   document.querySelectorAll("[data-resources]").forEach((button) => button.addEventListener("click", () => {
     void setResources((button as HTMLElement).dataset.resources || "");
+  }));
+  document.querySelectorAll("[data-iso]").forEach((button) => button.addEventListener("click", () => {
+    void setIso((button as HTMLElement).dataset.iso || "");
+  }));
+  document.querySelectorAll("[data-detach-iso]").forEach((button) => button.addEventListener("click", () => {
+    const input = document.getElementById("desktopIsoPath") as HTMLInputElement | null;
+    if (input) {
+      input.value = "";
+    }
+    void setIso((button as HTMLElement).dataset.detachIso || "");
   }));
   document.querySelectorAll("[data-close-viewer]").forEach((button) => button.addEventListener("click", () => hide("viewerBackdrop")));
   document.querySelectorAll("[data-auto-viewer]").forEach((button) => button.addEventListener("click", () => {

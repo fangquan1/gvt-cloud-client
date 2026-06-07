@@ -486,6 +486,10 @@ h1, h2, h3, p {
   gap: 12px;
 }
 
+.form-grid .wide {
+  grid-column: 1 / -1;
+}
+
 label {
   display: grid;
   gap: 6px;

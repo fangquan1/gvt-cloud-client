@@ -88,6 +88,9 @@ export interface Desktop {
   thumbnailUrl?: string;
   qemuSummary: string;
   qemuCommand: QemuCommand;
+  diskPath?: string;
+  diskSizeGiB?: number;
+  installIso?: string;
   physicalConnector?: string;
   keyboardSource: OutputSource;
   audioSource: OutputSource;
@@ -100,6 +103,21 @@ export interface ModeRequest {
 export interface ResourceRequest {
   vcpus: number;
   memoryMiB: number;
+}
+
+export interface CreateDesktopRequest {
+  name: string;
+  vcpus: number;
+  memoryMiB: number;
+  diskSizeGiB: number;
+  qcow2Path?: string;
+  isoPath?: string;
+  mode: DesktopMode;
+  gvtProfile: string;
+}
+
+export interface IsoRequest {
+  isoPath: string;
 }
 
 export interface LogSummary {
@@ -144,12 +162,14 @@ export interface ApiClient {
   desktops(): Promise<Desktop[]>;
   gvtProfiles(): Promise<GvtProfile[]>;
   desktop(id: string): Promise<Desktop>;
+  createDesktop(request: CreateDesktopRequest): Promise<Desktop>;
   startDesktop(id: string): Promise<Desktop>;
   stopDesktop(id: string): Promise<Desktop>;
   restartDesktop(id: string): Promise<Desktop>;
   setDesktopMode(id: string, request: ModeRequest): Promise<Desktop>;
   setDesktopProfile(id: string, profile: string): Promise<Desktop>;
   setDesktopResources(id: string, request: ResourceRequest): Promise<Desktop>;
+  setDesktopIso(id: string, request: IsoRequest): Promise<Desktop>;
   selectOutput(id: string): Promise<HostStatus>;
   logs(id: string): Promise<LogSummary>;
 }

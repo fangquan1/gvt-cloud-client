@@ -1,6 +1,7 @@
 import { defaultDesktops, defaultStatus } from "./defaults.js";
 import type {
   ApiClient,
+  CreateDesktopRequest,
   Desktop,
   GvtProfile,
   HostStatus,
@@ -61,6 +62,34 @@ export class MockApiClient implements ApiClient {
     return clone(this.requireDesktop(id));
   }
 
+  async createDesktop(request: CreateDesktopRequest): Promise<Desktop> {
+    const id = request.name.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-|-$/g, "") || `vm${this.items.length + 1}`;
+    const selected = this.profiles.find((item) => item.id === request.gvtProfile) || this.profiles[1];
+    const index = this.items.length + 1;
+    const desktop: Desktop = {
+      id,
+      name: request.name || `Windows Desktop ${index}`,
+      address: "192.168.0.188",
+      status: "stopped",
+      mode: request.mode,
+      gvtProfile: selected.id,
+      resources: { vcpus: request.vcpus, memoryMiB: request.memoryMiB },
+      resolution: selected.resolution,
+      ports: { video: 5004 + index * 2, input: 5905 + index, spice: 5900 + index },
+      runtime: { uptimeSeconds: 0 },
+      thumbnailUrl: "assets/desktop-win10.png",
+      qemuSummary: request.qcow2Path ? "existing qcow2 registered" : "blank qcow2 ready for Windows ISO install",
+      qemuCommand: { args: [], line: "" },
+      diskPath: request.qcow2Path || `/root/qemu_cmd/multivm/disks/${id}.qcow2`,
+      diskSizeGiB: request.diskSizeGiB,
+      installIso: request.isoPath,
+      keyboardSource: "client",
+      audioSource: "client"
+    };
+    this.items.push(desktop);
+    return clone(desktop);
+  }
+
   async startDesktop(id: string): Promise<Desktop> {
     const desktop = this.requireDesktop(id);
     desktop.status = "running";
@@ -110,6 +139,15 @@ export class MockApiClient implements ApiClient {
     }
     desktop.resources = { vcpus: request.vcpus, memoryMiB: request.memoryMiB };
     desktop.qemuCommand = { args: [], line: "" };
+    return clone(desktop);
+  }
+
+  async setDesktopIso(id: string, request: { isoPath: string }): Promise<Desktop> {
+    const desktop = this.requireDesktop(id);
+    if (desktop.status === "running") {
+      throw new Error("stop the desktop before changing ISO attachment");
+    }
+    desktop.installIso = request.isoPath || undefined;
     return clone(desktop);
   }
 
