@@ -243,7 +243,7 @@ function render(): void {
   const physical = state.desktops.filter((item) => item.mode === "physical").length;
 
   document.getElementById("app")!.innerHTML = `
-    <div class="shell">
+    <div class="shell ${selected ? "detail-open" : ""}">
       <aside class="rail">
         <div class="brand"><span class="brand-mark">G</span><span>GVT Console</span></div>
         <nav class="nav">
@@ -288,9 +288,7 @@ function render(): void {
           ${filtered.map(cardHtml).join("") || `<p class="muted">没有匹配的桌面。</p>`}
         </section>
       </main>
-      <aside class="details">
-        ${selected ? detailHtml(selected) : `<div class="details-inner"><h2>选择一个桌面</h2><p class="muted">详情、模式、端口和安全日志摘要会显示在这里。</p></div>`}
-      </aside>
+      ${selected ? `<aside class="details">${detailHtml(selected)}</aside>` : ""}
     </div>
     ${settingsHtml(state.server, state.apiMode)}
     ${viewerHtml()}
@@ -327,9 +325,9 @@ function cardHtml(item: Desktop): string {
           <span>${formatUptime(item.runtime.uptimeSeconds)}</span>
         </div>
         <div class="card-actions">
-          <button class="icon-btn" data-power="${item.id}" title="开关机">${icon("⏻")}</button>
-          <button class="icon-btn" data-connect="${item.id}" title="连接">${icon("▶")}</button>
-          <button class="icon-btn" data-detail="${item.id}" title="详情">${icon("›")}</button>
+          <button class="card-action ${item.status === "running" ? "danger" : "primary"}" data-power="${item.id}" title="${item.status === "running" ? "关机" : "开机"}"><span>${item.status === "running" ? "关机" : "开机"}</span></button>
+          <button class="card-action" data-connect="${item.id}" title="连接"><span>连接</span></button>
+          <button class="card-action" data-detail="${item.id}" title="详情"><span>详情</span></button>
         </div>
       </div>
     </article>
@@ -344,8 +342,13 @@ function detailHtml(item: Desktop): string {
   return `
     <div class="details-inner">
       <div class="detail-section">
-        <h2>${escapeHtml(item.name)}</h2>
-        <p class="muted">${statusLabel(item.status)} · ${modeLabel(item.mode)} · ${item.resolution.width}x${item.resolution.height}</p>
+        <div class="details-header">
+          <div>
+            <h2>${escapeHtml(item.name)}</h2>
+            <p class="muted">${statusLabel(item.status)} · ${modeLabel(item.mode)} · ${item.resolution.width}x${item.resolution.height}</p>
+          </div>
+          <button class="icon-btn" data-close-details title="收起详情">${icon("×")}</button>
+        </div>
       </div>
       <div class="detail-section kv">
         <span>视频端口</span><strong>${item.ports.video}</strong>
@@ -487,6 +490,9 @@ function bindEvents(): void {
   }));
   document.querySelectorAll("[data-detail]").forEach((button) => button.addEventListener("click", () => {
     store.set({ selectedDesktopId: (button as HTMLElement).dataset.detail });
+  }));
+  document.querySelectorAll("[data-close-details]").forEach((button) => button.addEventListener("click", () => {
+    store.set({ selectedDesktopId: undefined });
   }));
   document.querySelectorAll("[data-connect]").forEach((button) => button.addEventListener("click", () => void openViewer((button as HTMLElement).dataset.connect || "")));
   document.querySelectorAll("[data-power]").forEach((button) => button.addEventListener("click", () => void power((button as HTMLElement).dataset.power || "")));
