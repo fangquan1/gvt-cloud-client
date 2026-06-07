@@ -120,6 +120,10 @@ export interface IsoRequest {
   isoPath: string;
 }
 
+export interface DeleteDesktopRequest {
+  deleteDisk: boolean;
+}
+
 export interface UploadResult {
   path: string;
   kind: "iso" | "qcow2";
@@ -177,6 +181,7 @@ export interface ApiClient {
   setDesktopProfile(id: string, profile: string): Promise<Desktop>;
   setDesktopResources(id: string, request: ResourceRequest): Promise<Desktop>;
   setDesktopIso(id: string, request: IsoRequest): Promise<Desktop>;
+  deleteDesktop(id: string, request: DeleteDesktopRequest): Promise<{ ok: boolean; id: string; deletedDisk: boolean }>;
   selectOutput(id: string): Promise<HostStatus>;
   logs(id: string): Promise<LogSummary>;
 }

@@ -284,6 +284,26 @@ async function restart(id: string): Promise<void> {
   }
 }
 
+async function deleteDesktop(id: string): Promise<void> {
+  const desktop = desktopById(id);
+  if (!desktop) {
+    return;
+  }
+  const deleteDisk = Boolean((document.getElementById("deleteDesktopDisk") as HTMLInputElement | null)?.checked);
+  const diskText = deleteDisk ? "，并删除服务器上的系统盘文件" : "，保留服务器上的 qcow2 系统盘";
+  if (typeof window !== "undefined" && !window.confirm(`确认删除桌面 ${desktop.name}${diskText}？`)) {
+    return;
+  }
+  try {
+    await api.deleteDesktop(id, { deleteDisk });
+    const desktops = store.get().desktops.filter((item) => item.id !== id);
+    store.set({ desktops, selectedDesktopId: undefined, error: undefined });
+    await refreshAll();
+  } catch (error) {
+    handleApiError(error);
+  }
+}
+
 async function loadLogs(id: string): Promise<void> {
   const logs = await api.logs(id);
   const target = document.getElementById("logBox");
@@ -488,6 +508,12 @@ function detailHtml(item: Desktop): string {
           <button class="button" data-logs="${item.id}">${icon("≡")}日志摘要</button>
         </div>
       </div>
+      <div class="detail-section danger-zone">
+        <h3>删除桌面</h3>
+        <label class="checkbox-line"><input id="deleteDesktopDisk" type="checkbox" ${item.status === "running" ? "disabled" : ""} />同时删除服务器上的 qcow2 系统盘</label>
+        <button class="button danger" data-delete-desktop="${item.id}" ${item.status === "running" ? "disabled" : ""}>删除桌面</button>
+        <small>${item.status === "running" ? "运行中的虚拟机请先关机，再删除。" : "默认只删除桌面配置，不会删除服务器上的 qcow2。"}</small>
+      </div>
       <pre class="logs" id="logBox">点击“日志摘要”读取裁剪和脱敏后的服务端日志。</pre>
     </div>
   `;
@@ -635,6 +661,7 @@ function bindEvents(): void {
   document.querySelectorAll("[data-connect]").forEach((button) => button.addEventListener("click", () => void openViewer((button as HTMLElement).dataset.connect || "")));
   document.querySelectorAll("[data-power]").forEach((button) => button.addEventListener("click", () => void power((button as HTMLElement).dataset.power || "")));
   document.querySelectorAll("[data-restart]").forEach((button) => button.addEventListener("click", () => void restart((button as HTMLElement).dataset.restart || "")));
+  document.querySelectorAll("[data-delete-desktop]").forEach((button) => button.addEventListener("click", () => void deleteDesktop((button as HTMLElement).dataset.deleteDesktop || "")));
   document.querySelectorAll("[data-logs]").forEach((button) => button.addEventListener("click", () => void loadLogs((button as HTMLElement).dataset.logs || "")));
   document.querySelectorAll("[data-mode]").forEach((button) => button.addEventListener("click", () => {
     const [id, mode] = ((button as HTMLElement).dataset.mode || "").split(":") as [string, DesktopMode];

@@ -160,6 +160,15 @@ export class MockApiClient implements ApiClient {
     return clone(desktop);
   }
 
+  async deleteDesktop(id: string, request: { deleteDisk: boolean }): Promise<{ ok: boolean; id: string; deletedDisk: boolean }> {
+    const desktop = this.requireDesktop(id);
+    if (desktop.status === "running") {
+      throw new Error("stop the desktop before deleting it");
+    }
+    this.items = this.items.filter((item) => item.id !== id);
+    return { ok: true, id, deletedDisk: request.deleteDisk };
+  }
+
   async selectOutput(id: string): Promise<HostStatus> {
     this.requireDesktop(id);
     this.host.activeSource = id;

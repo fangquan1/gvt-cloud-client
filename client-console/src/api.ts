@@ -1,6 +1,7 @@
 import type {
   ApiClient,
   CreateDesktopRequest,
+  DeleteDesktopRequest,
   Desktop,
   DesktopMode,
   DesktopStatus,
@@ -205,6 +206,14 @@ export class HttpApiClient implements ApiClient {
       }),
       this.config
     );
+  }
+
+  async deleteDesktop(id: string, request: DeleteDesktopRequest): Promise<{ ok: boolean; id: string; deletedDisk: boolean }> {
+    const result = await this.post<{ ok: boolean; id: string; deleted_disk?: boolean; deletedDisk?: boolean }>(
+      `/api/desktops/${encodeURIComponent(id)}/delete`,
+      { delete_disk: request.deleteDisk }
+    );
+    return { ok: result.ok, id: result.id, deletedDisk: Boolean(result.deletedDisk ?? result.deleted_disk) };
   }
 
   async selectOutput(id: string): Promise<HostStatus> {

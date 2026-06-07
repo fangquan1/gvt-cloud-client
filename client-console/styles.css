@@ -435,6 +435,11 @@ h1, h2, h3, p {
   line-height: 1.2;
 }
 
+.danger-zone {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
 .logs {
   max-height: 180px;
   overflow-y: auto;
@@ -495,6 +500,18 @@ label {
   gap: 6px;
   color: var(--muted);
   font-size: 13px;
+}
+
+.checkbox-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.checkbox-line input {
+  width: 16px;
+  height: 16px;
+  padding: 0;
 }
 
 input, select {
