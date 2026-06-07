@@ -57,6 +57,7 @@ typedef void (*GDestroyNotify)(gpointer data);
 static HMODULE glib, gobject, spice, gtk, spicegtk;
 static void *(*p_spice_session_new)(void);
 static gboolean (*p_spice_session_connect)(void *session);
+static void (*p_spice_session_disconnect)(void *session);
 static gboolean (*p_spice_channel_connect)(void *channel);
 static void *(*p_spice_audio_get)(void *session, void *context);
 static const char *(*p_spice_channel_type_to_string)(gint type);
@@ -118,6 +119,7 @@ static int source_width = 1920;
 static int source_height = 1200;
 static bool auto_size_on_start = true;
 static bool spice_display_mode = false;
+static void *display_mode_session;
 
 static HWND main_hwnd;
 static HWND video_hwnd;
@@ -251,6 +253,7 @@ static void load_spice_runtime(void)
 
     p_spice_session_new = sym(spice, "spice_session_new");
     p_spice_session_connect = sym(spice, "spice_session_connect");
+    p_spice_session_disconnect = sym(spice, "spice_session_disconnect");
     p_spice_channel_connect = sym(spice, "spice_channel_connect");
     p_spice_audio_get = sym(spice, "spice_audio_get");
     p_spice_channel_type_to_string = sym(spice, "spice_channel_type_to_string");
@@ -873,6 +876,10 @@ static void gtk_destroy_cb(void *widget, void *opaque)
 {
     (void)widget;
     (void)opaque;
+    if (display_mode_session && p_spice_session_disconnect) {
+        log_line("spice display disconnect on destroy");
+        p_spice_session_disconnect(display_mode_session);
+    }
     if (p_gtk_main_quit) {
         p_gtk_main_quit();
     }
@@ -890,6 +897,7 @@ static int run_spice_display_mode(int argc, char **argv)
     p_gtk_init(&argc, &argv);
 
     session = p_spice_session_new();
+    display_mode_session = session;
     p_g_object_set(session, "host", spice_host, "port", spice_port, NULL);
     p_g_signal_connect_data(session, "channel-new",
                             (GCallback)display_channel_new,
@@ -922,6 +930,9 @@ static int run_spice_display_mode(int argc, char **argv)
         return 3;
     }
     p_gtk_main();
+    if (display_mode_session == session) {
+        display_mode_session = NULL;
+    }
     if (p_g_object_unref) {
         p_g_object_unref(session);
     }
