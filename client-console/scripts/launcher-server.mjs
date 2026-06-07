@@ -10,7 +10,7 @@ const consoleRoot = path.resolve(scriptDir, "..");
 const distRoot = path.join(consoleRoot, "dist");
 const workspaceRoot = path.resolve(consoleRoot, "..", "..", "..");
 const viewerExe = process.env.GVT_VIEWER_EXE || path.join(workspaceRoot, "direct-stream", "client", "gvt_spice_viewer.exe");
-const remoteViewerExe = process.env.GVT_REMOTE_VIEWER_EXE || "C:\\Program Files\\VirtViewer v11.0-256\\bin\\remote-viewer.exe";
+const spiceInstallViewerExe = process.env.GVT_SPICE_INSTALL_VIEWER_EXE || "C:\\Program Files\\VirtViewer v11.0-256\\bin\\virt-viewer.exe";
 const port = Number(process.env.GVT_CONSOLE_PORT || 5177);
 const host = process.env.GVT_CONSOLE_HOST || "127.0.0.1";
 
@@ -91,9 +91,8 @@ function normalizeSpiceInstallPayload(payload) {
     throw new Error("SPICE 安装控制台地址无效");
   }
   return [
-    "--title",
-    `${title} 安装控制台`,
     "--spice-disable-usbredir",
+    "--connect",
     `spice://${spiceHost}:${spicePort}`
   ];
 }
@@ -120,7 +119,7 @@ async function launchViewer(request, response) {
     const body = await readBody(request);
     const payload = JSON.parse(body);
     const viewerKind = String(payload.viewerKind || "gvt-stream");
-    const exe = viewerKind === "spice-install" ? remoteViewerExe : viewerExe;
+    const exe = viewerKind === "spice-install" ? spiceInstallViewerExe : viewerExe;
     if (!existsSync(exe)) {
       sendJson(response, 500, { error: `找不到本地客户端: ${exe}` });
       return;
