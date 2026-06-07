@@ -52,7 +52,7 @@ typedef void (*GCallback)(void);
 typedef void (*GClosureNotify)(gpointer data, void *closure);
 typedef void (*GDestroyNotify)(gpointer data);
 
-static HMODULE glib, gobject, spice;
+static HMODULE glib, gobject, spice, gtk, spicegtk;
 static void *(*p_spice_session_new)(void);
 static gboolean (*p_spice_session_connect)(void *session);
 static gboolean (*p_spice_channel_connect)(void *channel);
@@ -83,6 +83,15 @@ static void (*p_g_main_loop_unref)(void *loop);
 static guint (*p_g_idle_add)(gboolean (*function)(gpointer), gpointer data);
 static guint (*p_g_idle_add_full)(gint priority, gboolean (*function)(gpointer),
                                   gpointer data, GDestroyNotify notify);
+static void (*p_gtk_init)(int *argc, char ***argv);
+static void (*p_gtk_main)(void);
+static void (*p_gtk_main_quit)(void);
+static void *(*p_gtk_window_new)(gint type);
+static void (*p_gtk_window_set_title)(void *window, const char *title);
+static void (*p_gtk_window_set_default_size)(void *window, gint width, gint height);
+static void (*p_gtk_container_add)(void *container, void *widget);
+static void (*p_gtk_widget_show_all)(void *widget);
+static void *(*p_spice_display_new)(void *session, gint id);
 
 static HMODULE gstlib, gstvideo;
 static void (*p_gst_init)(int *argc, char ***argv);
@@ -106,6 +115,7 @@ static bool video_drop_on_latency = false;
 static int source_width = 1920;
 static int source_height = 1200;
 static bool auto_size_on_start = true;
+static bool spice_display_mode = false;
 
 static HWND main_hwnd;
 static HWND video_hwnd;
@@ -137,6 +147,7 @@ static void set_gst_environment(void);
 static void layout_children(HWND hwnd);
 static void resize_window_to_source(HWND hwnd);
 static void native_input_close(void);
+static int run_spice_display_mode(int argc, char **argv);
 
 typedef enum {
     INPUT_EV_POSITION,
@@ -257,6 +268,28 @@ static void load_spice_runtime(void)
     p_g_main_loop_unref = sym(glib, "g_main_loop_unref");
     p_g_idle_add = sym(glib, "g_idle_add");
     p_g_idle_add_full = sym(glib, "g_idle_add_full");
+}
+
+static void load_spice_gtk_runtime(void)
+{
+    load_spice_runtime();
+    gtk = LoadLibraryA("libgtk-3-0.dll");
+    spicegtk = LoadLibraryA("libspice-client-gtk-3.0-5.dll");
+    if (!gtk || !spicegtk) {
+        MessageBoxA(NULL, "Failed to load VirtViewer spice-client-gtk DLLs",
+                    "GVT SPICE Viewer", MB_ICONERROR);
+        ExitProcess(2);
+    }
+
+    p_gtk_init = sym(gtk, "gtk_init");
+    p_gtk_main = sym(gtk, "gtk_main");
+    p_gtk_main_quit = sym(gtk, "gtk_main_quit");
+    p_gtk_window_new = sym(gtk, "gtk_window_new");
+    p_gtk_window_set_title = sym(gtk, "gtk_window_set_title");
+    p_gtk_window_set_default_size = sym(gtk, "gtk_window_set_default_size");
+    p_gtk_container_add = sym(gtk, "gtk_container_add");
+    p_gtk_widget_show_all = sym(gtk, "gtk_widget_show_all");
+    p_spice_display_new = sym(spicegtk, "spice_display_new");
 }
 
 static bool native_input_connect_locked(void)
@@ -811,6 +844,62 @@ static DWORD WINAPI spice_thread(LPVOID opaque)
     return 0;
 }
 
+static void gtk_destroy_cb(void *widget, void *opaque)
+{
+    (void)widget;
+    (void)opaque;
+    if (p_gtk_main_quit) {
+        p_gtk_main_quit();
+    }
+}
+
+static int run_spice_display_mode(int argc, char **argv)
+{
+    void *session;
+    void *window;
+    void *display;
+    char title[256];
+
+    load_spice_gtk_runtime();
+    log_line("spice display mode host=%s port=%s", spice_host, spice_port);
+    p_gtk_init(&argc, &argv);
+
+    session = p_spice_session_new();
+    p_g_object_set(session, "host", spice_host, "port", spice_port, NULL);
+    spice_audio_obj = p_spice_audio_get(session, NULL);
+    log_line("spice display audio=%p", spice_audio_obj);
+
+    window = p_gtk_window_new(0);
+    snprintf(title, sizeof(title), "GVT SPICE Install Console - %s:%s",
+             spice_host, spice_port);
+    p_gtk_window_set_title(window, title);
+    p_gtk_window_set_default_size(window,
+                                  source_width > 0 ? source_width : 1024,
+                                  source_height > 0 ? source_height : 768);
+    p_g_signal_connect_data(window, "destroy", (GCallback)gtk_destroy_cb,
+                            NULL, NULL, 0);
+
+    display = p_spice_display_new(session, 0);
+    if (!display) {
+        MessageBoxA(NULL, "Failed to create SPICE display widget",
+                    "GVT SPICE Viewer", MB_ICONERROR);
+        return 2;
+    }
+    p_gtk_container_add(window, display);
+    p_gtk_widget_show_all(window);
+
+    if (!p_spice_session_connect(session)) {
+        MessageBoxA(NULL, "Failed to connect SPICE install console",
+                    "GVT SPICE Viewer", MB_ICONERROR);
+        return 3;
+    }
+    p_gtk_main();
+    if (p_g_object_unref) {
+        p_g_object_unref(session);
+    }
+    return 0;
+}
+
 static char *dup_app_dir(void)
 {
     char path[MAX_PATH];
@@ -1339,6 +1428,8 @@ static void parse_args(int argc, char **argv)
             auto_size_on_start = false;
         } else if (!strcmp(argv[i], "--auto-size")) {
             auto_size_on_start = true;
+        } else if (!strcmp(argv[i], "--spice-display")) {
+            spice_display_mode = true;
         }
     }
 }
@@ -1359,6 +1450,9 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
         WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, argv[i], len, NULL, NULL);
     }
     parse_args(argc, argv);
+    if (spice_display_mode) {
+        return run_spice_display_mode(argc, argv);
+    }
 
     wc.lpfnWndProc = wndproc;
     wc.hInstance = hinst;
