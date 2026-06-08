@@ -94,6 +94,8 @@ static void (*p_gtk_window_set_title)(void *window, const char *title);
 static void (*p_gtk_window_set_default_size)(void *window, gint width, gint height);
 static void (*p_gtk_container_add)(void *container, void *widget);
 static void (*p_gtk_widget_show_all)(void *widget);
+static void (*p_gtk_widget_set_size_request)(void *widget, gint width, gint height);
+static void (*p_gtk_widget_queue_draw)(void *widget);
 static void *(*p_spice_display_new)(void *session, gint id);
 
 static HMODULE gstlib, gstvideo;
@@ -294,6 +296,8 @@ static void load_spice_gtk_runtime(void)
     p_gtk_window_set_default_size = sym(gtk, "gtk_window_set_default_size");
     p_gtk_container_add = sym(gtk, "gtk_container_add");
     p_gtk_widget_show_all = sym(gtk, "gtk_widget_show_all");
+    p_gtk_widget_set_size_request = sym(gtk, "gtk_widget_set_size_request");
+    p_gtk_widget_queue_draw = sym(gtk, "gtk_widget_queue_draw");
     p_spice_display_new = sym(spicegtk, "spice_display_new");
 }
 
@@ -885,12 +889,22 @@ static void gtk_destroy_cb(void *widget, void *opaque)
     }
 }
 
+static gboolean gtk_queue_draw_idle(gpointer opaque)
+{
+    if (opaque && p_gtk_widget_queue_draw) {
+        p_gtk_widget_queue_draw(opaque);
+    }
+    return 0;
+}
+
 static int run_spice_display_mode(int argc, char **argv)
 {
     void *session;
     void *window;
     void *display;
     char title[256];
+    int window_w = source_width > 0 ? source_width : 1024;
+    int window_h = source_height > 0 ? source_height : 768;
 
     load_spice_gtk_runtime();
     log_line("spice display mode host=%s port=%s", spice_host, spice_port);
@@ -909,9 +923,19 @@ static int run_spice_display_mode(int argc, char **argv)
     snprintf(title, sizeof(title), "GVT SPICE Install Console - %s:%s",
              spice_host, spice_port);
     p_gtk_window_set_title(window, title);
-    p_gtk_window_set_default_size(window,
-                                  source_width > 0 ? source_width : 1024,
-                                  source_height > 0 ? source_height : 768);
+    if (window_w > 1280) {
+        window_w = 1280;
+    }
+    if (window_h > 900) {
+        window_h = 900;
+    }
+    if (window_w < 640) {
+        window_w = 640;
+    }
+    if (window_h < 480) {
+        window_h = 480;
+    }
+    p_gtk_window_set_default_size(window, window_w, window_h);
     p_g_signal_connect_data(window, "destroy", (GCallback)gtk_destroy_cb,
                             NULL, NULL, 0);
 
@@ -921,6 +945,7 @@ static int run_spice_display_mode(int argc, char **argv)
                     "GVT SPICE Viewer", MB_ICONERROR);
         return 2;
     }
+    p_gtk_widget_set_size_request(display, 640, 480);
     p_gtk_container_add(window, display);
     p_gtk_widget_show_all(window);
 
@@ -929,6 +954,7 @@ static int run_spice_display_mode(int argc, char **argv)
                     "GVT SPICE Viewer", MB_ICONERROR);
         return 3;
     }
+    p_g_idle_add(gtk_queue_draw_idle, display);
     p_gtk_main();
     if (display_mode_session == session) {
         display_mode_session = NULL;

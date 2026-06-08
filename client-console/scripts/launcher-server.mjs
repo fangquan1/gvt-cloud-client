@@ -2,7 +2,8 @@ import { createServer } from "node:http";
 import { createReadStream, existsSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
@@ -17,7 +18,7 @@ const mimeTypes = new Map([
   [".css", "text/css; charset=utf-8"],
   [".html", "text/html; charset=utf-8"],
   [".js", "text/javascript; charset=utf-8"],
-  [".json", "application/json; charset=utf-8"],
+  [".json", "application/json"],
   [".png", "image/png"],
   [".svg", "image/svg+xml"],
   [".webp", "image/webp"]
@@ -53,23 +54,23 @@ function isLoopback(address) {
 
 function normalizeArgs(args) {
   if (!Array.isArray(args)) {
-    throw new Error("启动参数格式不对");
+    throw new Error("Invalid viewer argument format");
   }
   const normalized = [];
   for (let index = 0; index < args.length; index += 1) {
     const flag = String(args[index] ?? "");
     if (!allowedArgs.has(flag)) {
-      throw new Error(`不允许的客户端参数: ${flag}`);
+      throw new Error(`Viewer argument is not allowed: ${flag}`);
     }
     normalized.push(flag);
     if (allowedArgs.get(flag)) {
       index += 1;
       if (index >= args.length) {
-        throw new Error(`客户端参数缺少值: ${flag}`);
+        throw new Error(`Viewer argument is missing a value: ${flag}`);
       }
       const value = String(args[index] ?? "");
       if (!value || value.length > 128 || value.includes("\0")) {
-        throw new Error(`客户端参数值无效: ${flag}`);
+        throw new Error(`Viewer argument has an invalid value: ${flag}`);
       }
       normalized.push(value);
     }
@@ -78,19 +79,62 @@ function normalizeArgs(args) {
 }
 
 function normalizeSpiceInstallPayload(payload) {
-  const title = String(payload.title || "GVT Install Console").slice(0, 80);
   const args = normalizeArgs(payload.args);
   const spiceHostIndex = args.indexOf("--spice-host");
   const spicePortIndex = args.indexOf("--spice-port");
   if (spiceHostIndex < 0 || spicePortIndex < 0) {
-    throw new Error("SPICE 安装控制台缺少服务器或端口");
+    throw new Error("SPICE install console requires host and port");
   }
   const spiceHost = args[spiceHostIndex + 1];
   const spicePort = args[spicePortIndex + 1];
   if (!/^[A-Za-z0-9.:-]+$/.test(spiceHost) || !/^[0-9]+$/.test(spicePort)) {
-    throw new Error("SPICE 安装控制台地址无效");
+    throw new Error("SPICE install console address is invalid");
   }
-  return [...args, "--spice-display", "--spice-input"];
+  if (!args.includes("--spice-display")) {
+    args.push("--spice-display");
+  }
+  if (!args.includes("--spice-input")) {
+    args.push("--spice-input");
+  }
+  return args;
+}
+
+function argValue(args, flag) {
+  const index = args.indexOf(flag);
+  return index >= 0 ? args[index + 1] : "";
+}
+
+function psSingleQuoted(value) {
+  return `'${String(value).replaceAll("'", "''")}'`;
+}
+
+async function closeStaleViewers(exe, args, keepPid = 0) {
+  if (process.platform !== "win32") {
+    return;
+  }
+  const videoPort = argValue(args, "--video-port");
+  const spicePort = argValue(args, "--spice-port");
+  const matchFlag = videoPort ? "--video-port" : "--spice-port";
+  const matchValue = videoPort || spicePort;
+  if (!matchValue || !/^[0-9]+$/.test(matchValue)) {
+    return;
+  }
+  const script = [
+    `$flag = ${psSingleQuoted(matchFlag)}`,
+    `$value = ${psSingleQuoted(matchValue)}`,
+    `$keepPid = ${Number(keepPid || 0)}`,
+    "$needleFlag = ('*' + $flag + '*')",
+    "$needleValue = ('*' + $value + '*')",
+    "Get-CimInstance Win32_Process |",
+    "  Where-Object { $_.ProcessId -ne $keepPid -and $_.Name -eq 'gvt_spice_viewer.exe' -and $_.CommandLine -like $needleFlag -and $_.CommandLine -like $needleValue } |",
+    "  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
+  ].join("\n");
+  spawnSync("powershell.exe", ["-NoProfile", "-Command", script], {
+    cwd: path.dirname(exe),
+    stdio: "ignore",
+    windowsHide: true
+  });
+  await delay(600);
 }
 
 async function readBody(request) {
@@ -99,7 +143,7 @@ async function readBody(request) {
   for await (const chunk of request) {
     size += chunk.length;
     if (size > 16 * 1024) {
-      throw new Error("请求太大");
+      throw new Error("Request body is too large");
     }
     chunks.push(chunk);
   }
@@ -108,7 +152,7 @@ async function readBody(request) {
 
 async function launchViewer(request, response) {
   if (!isLoopback(request.socket.remoteAddress)) {
-    sendJson(response, 403, { error: "本地启动器只接受本机请求" });
+    sendJson(response, 403, { error: "Local launcher only accepts loopback requests" });
     return;
   }
   try {
@@ -117,12 +161,13 @@ async function launchViewer(request, response) {
     const viewerKind = String(payload.viewerKind || "gvt-stream");
     const exe = viewerExe;
     if (!existsSync(exe)) {
-      sendJson(response, 500, { error: `找不到本地客户端: ${exe}` });
+      sendJson(response, 500, { error: `Local viewer was not found: ${exe}` });
       return;
     }
     const args = viewerKind === "spice-install"
       ? normalizeSpiceInstallPayload(payload)
       : normalizeArgs(payload.args);
+    await closeStaleViewers(exe, args);
     const child = spawn(exe, args, {
       cwd: path.dirname(exe),
       detached: true,
@@ -130,6 +175,7 @@ async function launchViewer(request, response) {
       windowsHide: false
     });
     child.unref();
+    void closeStaleViewers(exe, args, child.pid ?? 0);
     sendJson(response, 200, { ok: true, pid: child.pid });
   } catch (error) {
     sendJson(response, 400, { error: error instanceof Error ? error.message : String(error) });
