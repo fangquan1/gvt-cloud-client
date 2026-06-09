@@ -14,7 +14,8 @@ export function buildViewerArgs(
     "--source-width", String(desktop.resolution.width),
     "--source-height", String(desktop.resolution.height),
     "--latency", String(defaults.videoLatencyMs),
-    "--no-drop-on-latency"
+    "--no-drop-on-latency",
+    "--auto-size"
   ];
 
   if (defaults.nativeInput) {

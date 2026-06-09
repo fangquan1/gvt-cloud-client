@@ -37,7 +37,9 @@ const allowedArgs = new Map([
   ["--native-input", false],
   ["--spice-input", false],
   ["--spice-display", false],
-  ["--invert-case", false]
+  ["--invert-case", false],
+  ["--auto-size", false],
+  ["--no-auto-size", false]
 ]);
 
 function sendJson(response, status, payload) {
@@ -137,6 +139,45 @@ async function closeStaleViewers(exe, args, keepPid = 0) {
   await delay(600);
 }
 
+function restoreViewerWindow(pid) {
+  if (process.platform !== "win32" || !pid) {
+    return;
+  }
+  const script = [
+    "Add-Type @'",
+    "using System;",
+    "using System.Text;",
+    "using System.Runtime.InteropServices;",
+    "public class GvtWin {",
+    "  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);",
+    "  [DllImport(\"user32.dll\")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lp);",
+    "  [DllImport(\"user32.dll\")] public static extern bool IsWindowVisible(IntPtr hWnd);",
+    "  [DllImport(\"user32.dll\")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);",
+    "  [DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr hWnd, int cmd);",
+    "  [DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr hWnd);",
+    "}",
+    "'@",
+    `$targetPid = ${Number(pid)}`,
+    "[GvtWin]::EnumWindows({ param($h, $l)",
+    "  if (-not [GvtWin]::IsWindowVisible($h)) { return $true }",
+    "  [uint32]$windowPid = 0",
+    "  [void][GvtWin]::GetWindowThreadProcessId($h, [ref]$windowPid)",
+    "  if ($windowPid -eq $targetPid) {",
+    "    [void][GvtWin]::ShowWindow($h, 9)",
+    "    [void][GvtWin]::SetForegroundWindow($h)",
+    "    return $false",
+    "  }",
+    "  return $true",
+    "}, [IntPtr]::Zero) | Out-Null"
+  ].join("\n");
+  spawn("powershell.exe", ["-NoProfile", "-Command", script], {
+    cwd: path.dirname(viewerExe),
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true
+  }).unref();
+}
+
 async function readBody(request) {
   const chunks = [];
   let size = 0;
@@ -175,6 +216,7 @@ async function launchViewer(request, response) {
       windowsHide: false
     });
     child.unref();
+    setTimeout(() => restoreViewerWindow(child.pid), 700);
     void closeStaleViewers(exe, args, child.pid ?? 0);
     sendJson(response, 200, { ok: true, pid: child.pid });
   } catch (error) {

@@ -1532,7 +1532,9 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
                                 WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                 wr.left, wr.top, wr.right - wr.left,
                                 wr.bottom - wr.top, NULL, NULL, hinst, NULL);
-    ShowWindow(main_hwnd, show);
+    ShowWindow(main_hwnd, (show == SW_SHOWMINIMIZED || show == SW_MINIMIZE ||
+                           show == SW_SHOWMINNOACTIVE) ? SW_SHOWNORMAL : show);
+    SetForegroundWindow(main_hwnd);
     UpdateWindow(main_hwnd);
 
     while (GetMessageA(&msg, NULL, 0, 0)) {
