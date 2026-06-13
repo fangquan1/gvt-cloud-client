@@ -210,6 +210,31 @@ static bool env_is_set(const char *name)
     return GetEnvironmentVariableA(name, NULL, 0) > 0;
 }
 
+static int getenv_int_clamped(const char *name, int defval, int minval, int maxval)
+{
+    char value[64];
+    char *end = NULL;
+    DWORD len;
+    long parsed;
+
+    len = GetEnvironmentVariableA(name, value, sizeof(value));
+    if (!len || len >= sizeof(value)) {
+        return defval;
+    }
+
+    parsed = strtol(value, &end, 10);
+    if (end == value) {
+        return defval;
+    }
+    if (parsed < minval) {
+        return minval;
+    }
+    if (parsed > maxval) {
+        return maxval;
+    }
+    return (int)parsed;
+}
+
 static bool audio_debug(void)
 {
     return env_is_set("GVT_SPICE_VIEWER_AUDIO_DEBUG");
@@ -987,6 +1012,11 @@ static void set_gst_environment(void)
     char registry[MAX_PATH * 2];
     char old_path[32768];
     char new_path[32768];
+    char audio_sink[1024];
+    int audio_buffer_us = getenv_int_clamped("GVT_SPICE_AUDIO_BUFFER_US",
+                                             120000, 20000, 1000000);
+    int audio_latency_us = getenv_int_clamped("GVT_SPICE_AUDIO_LATENCY_US",
+                                              30000, 5000, 500000);
 
     if (!gst_root) {
         snprintf(root, sizeof(root),
@@ -1005,13 +1035,17 @@ static void set_gst_environment(void)
     SetEnvironmentVariableA("GST_PLUGIN_SYSTEM_PATH_1_0", plugins);
     SetEnvironmentVariableA("GST_REGISTRY", registry);
     if (!env_is_set("SPICE_GST_AUDIOSINK")) {
-        SetEnvironmentVariableA(
-            "SPICE_GST_AUDIOSINK",
+        snprintf(audio_sink, sizeof(audio_sink),
             "appsrc is-live=1 do-timestamp=0 format=time "
             "caps=\"audio/x-raw,format=S16LE,channels=2,rate=48000,layout=interleaved\" "
             "name=\"appsrc\" ! queue max-size-time=200000000 max-size-buffers=0 max-size-bytes=0 "
             "! audioconvert ! audioresample "
-            "! directsoundsink name=\"audiosink\" sync=false async=false buffer-time=50000 latency-time=10000");
+            "! directsoundsink name=\"audiosink\" sync=false async=false "
+            "buffer-time=%d latency-time=%d",
+            audio_buffer_us, audio_latency_us);
+        SetEnvironmentVariableA("SPICE_GST_AUDIOSINK", audio_sink);
+        log_line("SPICE audio sink buffer_us=%d latency_us=%d",
+                 audio_buffer_us, audio_latency_us);
     }
     free(app_dir);
 }
