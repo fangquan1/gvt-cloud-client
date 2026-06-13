@@ -117,6 +117,7 @@ static bool native_input_enabled = true;
 static int video_port = 5004;
 static int video_latency = 15;
 static bool video_drop_on_latency = false;
+static const char *video_codec = "h264";
 static int source_width = 1920;
 static int source_height = 1200;
 static bool auto_size_on_start = true;
@@ -1019,19 +1020,30 @@ static bool start_gst_receiver(void)
 {
     char desc[4096];
     void *error = NULL;
+    bool use_h265 = !strcmp(video_codec, "h265") || !strcmp(video_codec, "hevc");
 
     set_gst_environment();
     load_gst_runtime();
     log_line("gst_init");
     p_gst_init(NULL, NULL);
 
-    snprintf(desc, sizeof(desc),
-             "udpsrc port=%d buffer-size=4194304 "
-             "caps=\"application/x-rtp, media=(string)video, clock-rate=(int)90000, encoding-name=(string)H264, payload=(int)96, ssrc=(uint)2222\" "
-             "! rtpjitterbuffer latency=%d drop-on-latency=%s do-lost=true faststart-min-packets=1 max-dropout-time=200 max-misorder-time=50 "
-             "! rtph264depay ! h264parse ! d3d11h264dec "
-             "! d3d11videosink name=vsink sync=false",
-             video_port, video_latency, video_drop_on_latency ? "true" : "false");
+    if (use_h265) {
+        snprintf(desc, sizeof(desc),
+                 "udpsrc port=%d buffer-size=4194304 "
+                 "caps=\"application/x-rtp, media=(string)video, clock-rate=(int)90000, encoding-name=(string)H265, payload=(int)96, ssrc=(uint)2222\" "
+                 "! rtpjitterbuffer latency=%d drop-on-latency=%s do-lost=true faststart-min-packets=1 max-dropout-time=200 max-misorder-time=50 "
+                 "! rtph265depay ! h265parse ! d3d11h265dec "
+                 "! d3d11videosink name=vsink sync=false",
+                 video_port, video_latency, video_drop_on_latency ? "true" : "false");
+    } else {
+        snprintf(desc, sizeof(desc),
+                 "udpsrc port=%d buffer-size=4194304 "
+                 "caps=\"application/x-rtp, media=(string)video, clock-rate=(int)90000, encoding-name=(string)H264, payload=(int)96, ssrc=(uint)2222\" "
+                 "! rtpjitterbuffer latency=%d drop-on-latency=%s do-lost=true faststart-min-packets=1 max-dropout-time=200 max-misorder-time=50 "
+                 "! rtph264depay ! h264parse ! d3d11h264dec "
+                 "! d3d11videosink name=vsink sync=false",
+                 video_port, video_latency, video_drop_on_latency ? "true" : "false");
+    }
 
     gst_pipeline = p_gst_parse_launch(desc, &error);
     if (!gst_pipeline) {
@@ -1461,6 +1473,8 @@ static void parse_args(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--video-port") && i + 1 < argc) {
             video_port = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--video-codec") && i + 1 < argc) {
+            video_codec = argv[++i];
         } else if (!strcmp(argv[i], "--latency") && i + 1 < argc) {
             video_latency = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--drop-on-latency")) {
