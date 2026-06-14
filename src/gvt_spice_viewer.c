@@ -136,6 +136,7 @@ static HWND auto_button;
 static RECT video_rect;
 static void *gst_pipeline;
 static void *gst_sink;
+static void *gst_probe;
 static void *main_loop;
 static void *inputs_channel;
 static void *spice_audio_obj;
@@ -156,12 +157,21 @@ static bool pending_position_valid;
 static int pending_position_x;
 static int pending_position_y;
 static int pending_position_buttons;
+static LONG input_event_seq;
+static LONG pending_position_seq;
+static ULONGLONG pending_position_event_ms;
+static ULONGLONG pending_position_wall_ms;
 static CRITICAL_SECTION native_input_lock;
 static bool native_input_lock_ready;
 static SOCKET native_input_sock = INVALID_SOCKET;
 static SOCKET stream_control_sock = INVALID_SOCKET;
 static bool winsock_ready;
 static ULONGLONG log_start_ms;
+static int audio_channels;
+static int audio_frequency;
+static ULONGLONG audio_last_data_ms;
+static ULONGLONG video_last_handoff_ms;
+static unsigned int video_handoff_count;
 
 static char *dup_app_dir(void);
 static void set_gst_environment(void);
@@ -186,11 +196,25 @@ typedef struct InputEv {
     int button_state;
     bool down;
     guint scancode;
+    LONG seq;
+    ULONGLONG event_ms;
+    ULONGLONG wall_ms;
 } InputEv;
 
 static ULONGLONG viewer_now_ms(void)
 {
     return (ULONGLONG)GetTickCount();
+}
+
+static ULONGLONG viewer_wall_ms(void)
+{
+    FILETIME ft;
+    ULARGE_INTEGER value;
+
+    GetSystemTimeAsFileTime(&ft);
+    value.LowPart = ft.dwLowDateTime;
+    value.HighPart = ft.dwHighDateTime;
+    return value.QuadPart / 10000ULL - 11644473600000ULL;
 }
 
 static void ensure_log_lock(void)
@@ -246,6 +270,18 @@ static bool input_debug(void)
                                           NULL, 0) > 0;
     }
     return enabled != 0;
+}
+
+static bool latency_debug(void)
+{
+    char value[16];
+    DWORD len = GetEnvironmentVariableA("GVT_SPICE_VIEWER_LATENCY_DEBUG",
+                                        value, sizeof(value));
+
+    if (len > 0 && len < sizeof(value) && value[0] == '0') {
+        return false;
+    }
+    return true;
 }
 
 static bool env_is_set(const char *name)
@@ -305,7 +341,7 @@ static int getenv_int_clamped(const char *name, int defval, int minval, int maxv
 
 static bool audio_debug(void)
 {
-    return env_is_set("GVT_SPICE_VIEWER_AUDIO_DEBUG");
+    return latency_debug() || env_is_set("GVT_SPICE_VIEWER_AUDIO_DEBUG");
 }
 
 static bool input_transport_ready(void)
@@ -666,24 +702,92 @@ static DWORD WINAPI stream_control_thread(LPVOID opaque)
     return 0;
 }
 
-static void native_input_send_json(const char *json)
+static void stamp_input_event(InputEv *ev)
+{
+    if (!ev || ev->seq) {
+        return;
+    }
+    ev->seq = InterlockedIncrement(&input_event_seq);
+    ev->event_ms = viewer_now_ms();
+    ev->wall_ms = viewer_wall_ms();
+}
+
+static bool should_log_input_event(const InputEv *ev)
+{
+    if (!latency_debug() || !ev) {
+        return false;
+    }
+    if (ev->type != INPUT_EV_POSITION) {
+        return true;
+    }
+    return ev->seq <= 80 || (ev->seq % 120) == 0;
+}
+
+static const char *input_event_type_name(InputEvType type)
+{
+    switch (type) {
+    case INPUT_EV_POSITION:
+        return "move";
+    case INPUT_EV_BUTTON:
+        return "button";
+    case INPUT_EV_WHEEL:
+        return "wheel";
+    case INPUT_EV_KEY:
+        return "key";
+    default:
+        return "?";
+    }
+}
+
+static void native_input_send_json(const char *json, InputEv *ev)
 {
     int len;
     int ret;
+    int nl_ret;
+    ULONGLONG t0;
+    ULONGLONG lock_ms;
+    ULONGLONG connect_ms;
+    ULONGLONG send_ms;
+    bool log_event;
 
     if (!native_input_enabled || !native_input_lock_ready || !json) {
         return;
     }
 
+    stamp_input_event(ev);
+    log_event = should_log_input_event(ev);
+    t0 = viewer_now_ms();
     EnterCriticalSection(&native_input_lock);
+    lock_ms = viewer_now_ms() - t0;
     if (!native_input_connect_locked()) {
         LeaveCriticalSection(&native_input_lock);
+        if (log_event) {
+            log_line("latency-input-send seq=%ld type=%s dropped=connect-failed queue_ms=%I64u lock_ms=%I64u",
+                     ev ? ev->seq : 0,
+                     ev ? input_event_type_name(ev->type) : "?",
+                     ev ? (unsigned long long)(t0 - ev->event_ms) : 0,
+                     (unsigned long long)lock_ms);
+        }
         return;
     }
+    connect_ms = viewer_now_ms() - t0 - lock_ms;
 
     len = (int)strlen(json);
+    t0 = viewer_now_ms();
     ret = send(native_input_sock, json, len, 0);
-    if (ret != len || send(native_input_sock, "\n", 1, 0) != 1) {
+    nl_ret = send(native_input_sock, "\n", 1, 0);
+    send_ms = viewer_now_ms() - t0;
+    if (log_event) {
+        log_line("latency-input-send seq=%ld type=%s queue_ms=%I64u lock_ms=%I64u connect_ms=%I64u send_ms=%I64u ret=%d/%d nl=%d err=%d",
+                 ev ? ev->seq : 0,
+                 ev ? input_event_type_name(ev->type) : "?",
+                 ev ? (unsigned long long)(t0 - ev->event_ms) : 0,
+                 (unsigned long long)lock_ms,
+                 (unsigned long long)connect_ms,
+                 (unsigned long long)send_ms,
+                 ret, len, nl_ret, WSAGetLastError());
+    }
+    if (ret != len || nl_ret != 1) {
         native_input_close();
     }
     LeaveCriticalSection(&native_input_lock);
@@ -801,30 +905,41 @@ static const char *qcode_from_scancode(guint scancode)
 
 static bool dispatch_native_input_event(InputEv *ev)
 {
-    char json[256];
+    char json[512];
     const char *qcode;
 
     if (!native_input_enabled) {
         return false;
     }
+    stamp_input_event(ev);
 
     switch (ev->type) {
     case INPUT_EV_POSITION:
         snprintf(json, sizeof(json),
-                 "{\"type\":\"move\",\"x\":%d,\"y\":%d}", ev->x, ev->y);
-        native_input_send_json(json);
+                 "{\"type\":\"move\",\"x\":%d,\"y\":%d,\"_seq\":%ld,\"_client_event_ms\":%I64u,\"_client_wall_ms\":%I64u,\"_client_queue_ms\":%I64u}",
+                 ev->x, ev->y, ev->seq,
+                 (unsigned long long)ev->event_ms,
+                 (unsigned long long)ev->wall_ms,
+                 (unsigned long long)(viewer_now_ms() - ev->event_ms));
+        native_input_send_json(json, ev);
         return true;
     case INPUT_EV_BUTTON:
         snprintf(json, sizeof(json),
-                 "{\"type\":\"button\",\"button\":\"%s\",\"down\":%s}",
-                 native_button_name(ev->button), ev->down ? "true" : "false");
-        native_input_send_json(json);
+                 "{\"type\":\"button\",\"button\":\"%s\",\"down\":%s,\"_seq\":%ld,\"_client_event_ms\":%I64u,\"_client_wall_ms\":%I64u,\"_client_queue_ms\":%I64u}",
+                 native_button_name(ev->button), ev->down ? "true" : "false",
+                 ev->seq, (unsigned long long)ev->event_ms,
+                 (unsigned long long)ev->wall_ms,
+                 (unsigned long long)(viewer_now_ms() - ev->event_ms));
+        native_input_send_json(json, ev);
         return true;
     case INPUT_EV_WHEEL:
         snprintf(json, sizeof(json),
-                 "{\"type\":\"wheel\",\"delta\":%d}",
-                 ev->button == SPICE_MOUSE_BUTTON_UP ? 1 : -1);
-        native_input_send_json(json);
+                 "{\"type\":\"wheel\",\"delta\":%d,\"_seq\":%ld,\"_client_event_ms\":%I64u,\"_client_wall_ms\":%I64u,\"_client_queue_ms\":%I64u}",
+                 ev->button == SPICE_MOUSE_BUTTON_UP ? 1 : -1,
+                 ev->seq, (unsigned long long)ev->event_ms,
+                 (unsigned long long)ev->wall_ms,
+                 (unsigned long long)(viewer_now_ms() - ev->event_ms));
+        native_input_send_json(json, ev);
         return true;
     case INPUT_EV_KEY:
         qcode = qcode_from_scancode(ev->scancode);
@@ -832,9 +947,12 @@ static bool dispatch_native_input_event(InputEv *ev)
             return true;
         }
         snprintf(json, sizeof(json),
-                 "{\"type\":\"key\",\"qcode\":\"%s\",\"down\":%s}",
-                 qcode, ev->down ? "true" : "false");
-        native_input_send_json(json);
+                 "{\"type\":\"key\",\"qcode\":\"%s\",\"down\":%s,\"_seq\":%ld,\"_client_event_ms\":%I64u,\"_client_wall_ms\":%I64u,\"_client_queue_ms\":%I64u}",
+                 qcode, ev->down ? "true" : "false",
+                 ev->seq, (unsigned long long)ev->event_ms,
+                 (unsigned long long)ev->wall_ms,
+                 (unsigned long long)(viewer_now_ms() - ev->event_ms));
+        native_input_send_json(json, ev);
         return true;
     }
 
@@ -908,6 +1026,12 @@ static gboolean send_input_on_spice_thread(gpointer opaque)
 {
     InputEv *ev = opaque;
 
+    if (should_log_input_event(ev)) {
+        log_line("latency-input-dispatch seq=%ld type=%s idle_queue_ms=%I64u native=%d",
+                 ev->seq, input_event_type_name(ev->type),
+                 (unsigned long long)(viewer_now_ms() - ev->event_ms),
+                 native_input_enabled ? 1 : 0);
+    }
     dispatch_input_event(ev);
 
     free(ev);
@@ -927,6 +1051,9 @@ static gboolean send_pending_position_on_spice_thread(gpointer opaque)
             ev.x = pending_position_x;
             ev.y = pending_position_y;
             ev.button_state = pending_position_buttons;
+            ev.seq = pending_position_seq;
+            ev.event_ms = pending_position_event_ms;
+            ev.wall_ms = pending_position_wall_ms;
             pending_position_valid = false;
             have_position = true;
         }
@@ -935,6 +1062,12 @@ static gboolean send_pending_position_on_spice_thread(gpointer opaque)
     }
 
     if (have_position) {
+        if (should_log_input_event(&ev)) {
+            log_line("latency-input-dispatch seq=%ld type=%s coalesced=1 idle_queue_ms=%I64u native=%d",
+                     ev.seq, input_event_type_name(ev.type),
+                     (unsigned long long)(viewer_now_ms() - ev.event_ms),
+                     native_input_enabled ? 1 : 0);
+        }
         dispatch_input_event(&ev);
     }
     return 0;
@@ -942,6 +1075,7 @@ static gboolean send_pending_position_on_spice_thread(gpointer opaque)
 
 static void queue_input_event_priority(InputEv *ev, gint priority)
 {
+    stamp_input_event(ev);
     if (!p_g_idle_add || !input_transport_ready()) {
         free(ev);
         return;
@@ -965,6 +1099,9 @@ static void queue_pending_position(int sx, int sy, int buttons)
     pending_position_x = sx;
     pending_position_y = sy;
     pending_position_buttons = buttons;
+    pending_position_seq = InterlockedIncrement(&input_event_seq);
+    pending_position_event_ms = viewer_now_ms();
+    pending_position_wall_ms = viewer_wall_ms();
     pending_position_valid = true;
     if (!pending_position_queued) {
         pending_position_queued = true;
@@ -991,6 +1128,7 @@ static void queue_position_event(int sx, int sy, int buttons, gint priority)
     ev->x = sx;
     ev->y = sy;
     ev->button_state = buttons;
+    stamp_input_event(ev);
     queue_input_event_priority(ev, priority);
 }
 
@@ -1009,6 +1147,9 @@ static void load_gst_runtime(void)
     SetDllDirectoryA(bin);
     gstlib = LoadLibraryA("libgstreamer-1.0-0.dll");
     gstvideo = LoadLibraryA("libgstvideo-1.0-0.dll");
+    if (!gobject) {
+        gobject = LoadLibraryA("libgobject-2.0-0.dll");
+    }
     if (!gstlib || !gstvideo) {
         DWORD err = GetLastError();
         log_line("load_gst_runtime failed gst=%p gstvideo=%p err=%lu",
@@ -1026,7 +1167,30 @@ static void load_gst_runtime(void)
     p_gst_object_unref = sym(gstlib, "gst_object_unref");
     p_gst_video_overlay_set_window_handle =
         sym(gstvideo, "gst_video_overlay_set_window_handle");
+    if (!p_g_signal_connect_data && gobject) {
+        p_g_signal_connect_data = sym(gobject, "g_signal_connect_data");
+    }
     runtime_load_leave();
+}
+
+static void video_handoff_cb(void *identity, void *buffer, void *opaque)
+{
+    ULONGLONG now_ms = viewer_now_ms();
+    ULONGLONG gap_ms = video_last_handoff_ms ? now_ms - video_last_handoff_ms : 0;
+    (void)identity;
+    (void)buffer;
+    (void)opaque;
+
+    video_handoff_count++;
+    if (latency_debug() &&
+        (video_handoff_count <= 20 || (video_handoff_count % 120) == 0 ||
+         gap_ms > 50)) {
+        log_line("latency-video-handoff frames=%u gap_ms=%I64u codec=%s latency_ms=%d drop_on_latency=%d",
+                 video_handoff_count, (unsigned long long)gap_ms,
+                 video_codec ? video_codec : "h264", video_latency,
+                 video_drop_on_latency ? 1 : 0);
+    }
+    video_last_handoff_ms = now_ms;
 }
 
 static void channel_event(void *channel, gint event, void *opaque)
@@ -1061,6 +1225,9 @@ static void playback_start_cb(void *channel, gint format, gint channels,
 {
     (void)channel;
     (void)opaque;
+    audio_channels = channels;
+    audio_frequency = frequency;
+    audio_last_data_ms = 0;
     if (audio_debug()) {
         log_line("SPICE playback-start format=%d channels=%d frequency=%d",
                  format, channels, frequency);
@@ -1072,16 +1239,26 @@ static void playback_data_cb(void *channel, gpointer audio, gint size,
 {
     static unsigned int chunks;
     static unsigned long long bytes;
+    ULONGLONG now_ms = viewer_now_ms();
+    ULONGLONG gap_ms = audio_last_data_ms ? now_ms - audio_last_data_ms : 0;
+    int chunk_ms = 0;
     (void)channel;
     (void)audio;
     (void)opaque;
 
     chunks++;
     bytes += size > 0 ? (unsigned int)size : 0;
-    if (audio_debug() && (chunks <= 5 || (chunks % 200) == 0)) {
-        log_line("SPICE playback-data chunks=%u bytes=%I64u last=%d",
-                 chunks, bytes, size);
+    if (audio_channels > 0 && audio_frequency > 0) {
+        chunk_ms = (int)((int64_t)size * 1000 /
+                         ((int64_t)audio_channels * 2 * audio_frequency));
     }
+    if (audio_debug() && (chunks <= 20 || (chunks % 100) == 0 ||
+                          gap_ms > 80 || chunk_ms > 60)) {
+        log_line("latency-audio-playback chunks=%u total_bytes=%I64u last_bytes=%d chunk_ms=%d gap_ms=%I64u channels=%d freq=%d",
+                 chunks, bytes, size, chunk_ms, (unsigned long long)gap_ms,
+                 audio_channels, audio_frequency);
+    }
+    audio_last_data_ms = now_ms;
 }
 
 static void playback_stop_cb(void *channel, void *opaque)
@@ -1089,8 +1266,11 @@ static void playback_stop_cb(void *channel, void *opaque)
     (void)channel;
     (void)opaque;
     if (audio_debug()) {
-        log_line("SPICE playback-stop");
+        log_line("SPICE playback-stop last_gap_ms=%I64u",
+                 audio_last_data_ms ?
+                 (unsigned long long)(viewer_now_ms() - audio_last_data_ms) : 0);
     }
+    audio_last_data_ms = 0;
 }
 
 static void channel_new(void *session, void *channel, void *opaque)
@@ -1314,9 +1494,9 @@ static void set_gst_environment(void)
     char new_path[32768];
     char audio_sink[1024];
     int audio_buffer_us = getenv_int_clamped("GVT_SPICE_AUDIO_BUFFER_US",
-                                             120000, 20000, 1000000);
+                                             50000, 20000, 1000000);
     int audio_latency_us = getenv_int_clamped("GVT_SPICE_AUDIO_LATENCY_US",
-                                              30000, 5000, 500000);
+                                              10000, 5000, 500000);
 
     if (!gst_root) {
         snprintf(root, sizeof(root),
@@ -1381,6 +1561,7 @@ static bool start_gst_receiver(void)
                  "caps=\"application/x-rtp, media=(string)video, clock-rate=(int)90000, encoding-name=(string)H265, payload=(int)96, ssrc=(uint)2222\" "
                  "! rtpjitterbuffer latency=%d drop-on-latency=%s do-lost=true faststart-min-packets=1 max-dropout-time=200 max-misorder-time=50 "
                  "! rtph265depay ! h265parse ! d3d11h265dec "
+                 "! identity name=vidprobe signal-handoffs=true silent=true "
                  "! d3d11videosink name=vsink sync=false",
                  video_port, video_latency, video_drop_on_latency ? "true" : "false");
     } else {
@@ -1389,6 +1570,7 @@ static bool start_gst_receiver(void)
                  "caps=\"application/x-rtp, media=(string)video, clock-rate=(int)90000, encoding-name=(string)H264, payload=(int)96, ssrc=(uint)2222\" "
                  "! rtpjitterbuffer latency=%d drop-on-latency=%s do-lost=true faststart-min-packets=1 max-dropout-time=200 max-misorder-time=50 "
                  "! rtph264depay ! h264parse ! d3d11h264dec "
+                 "! identity name=vidprobe signal-handoffs=true silent=true "
                  "! d3d11videosink name=vsink sync=false",
                  video_port, video_latency, video_drop_on_latency ? "true" : "false");
     }
@@ -1409,6 +1591,18 @@ static bool start_gst_receiver(void)
         MessageBoxA(main_hwnd, "Failed to find GStreamer video sink",
                     "GVT SPICE Viewer", MB_ICONERROR);
         return false;
+    }
+    gst_probe = p_gst_bin_get_by_name(gst_pipeline, "vidprobe");
+    video_last_handoff_ms = 0;
+    video_handoff_count = 0;
+    if (gst_probe && p_g_signal_connect_data) {
+        p_g_signal_connect_data(gst_probe, "handoff",
+                                (GCallback)video_handoff_cb,
+                                NULL, NULL, 0);
+        log_line("latency-video-probe connected");
+    } else {
+        log_line("latency-video-probe unavailable probe=%p signal=%p",
+                 gst_probe, p_g_signal_connect_data);
     }
     p_gst_video_overlay_set_window_handle(gst_sink, (uintptr_t)video_hwnd);
     log_line("gst set window=%p", video_hwnd);
@@ -1881,8 +2075,14 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
             p_gst_element_set_state(gst_pipeline, 1);
             if (gst_sink) {
                 p_gst_object_unref(gst_sink);
+                gst_sink = NULL;
+            }
+            if (gst_probe) {
+                p_gst_object_unref(gst_probe);
+                gst_probe = NULL;
             }
             p_gst_object_unref(gst_pipeline);
+            gst_pipeline = NULL;
         }
         PostQuitMessage(0);
         return 0;
