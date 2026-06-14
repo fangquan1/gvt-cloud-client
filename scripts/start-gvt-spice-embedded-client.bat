@@ -9,11 +9,11 @@ if "%SOURCE_WIDTH%"=="" set "SOURCE_WIDTH=1920"
 set "SOURCE_HEIGHT=%GVT_SOURCE_HEIGHT%"
 if "%SOURCE_HEIGHT%"=="" set "SOURCE_HEIGHT=1200"
 set "VIDEO_CODEC=%GVT_VIDEO_CODEC%"
-if "%VIDEO_CODEC%"=="" set "VIDEO_CODEC=h265"
+if "%VIDEO_CODEC%"=="" set "VIDEO_CODEC=h264"
 
 "%PYEXE%" ".\direct-stream\client\stop_local_direct.py" >nul 2>nul
 "%PYEXE%" ".\direct-stream\start_input_proxy.py" stop >nul 2>nul
-"%PYEXE%" ".\direct-stream\start_gvt_stream_qemu.py" start --restart --port 5004 --fps 60 --bitrate 12000 --video-codec %VIDEO_CODEC% --capture-ms 16 --idle-capture-ms 16 --idle-after-ms 0 --idle-probe-ms 0 --fec 0 --fec-important 0
+"%PYEXE%" ".\direct-stream\start_gvt_stream_qemu.py" start --restart --port 5004 --fps 60 --bitrate 18000 --video-codec %VIDEO_CODEC% --capture-ms 16 --idle-capture-ms 16 --idle-after-ms 0 --idle-probe-ms 0 --fec 0 --fec-important 0
 if errorlevel 1 (
     set "CLIENT_EXIT=1"
     goto cleanup

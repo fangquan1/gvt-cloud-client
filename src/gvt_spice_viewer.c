@@ -595,7 +595,7 @@ static bool stream_control_start_session(void)
 
     snprintf(hello, sizeof(hello),
              "{\"type\":\"start\",\"video_port\":%d,\"codec\":\"%s\"}\n",
-             video_port, video_codec ? video_codec : "h265");
+             video_port, video_codec ? video_codec : "h264");
     t_stage = viewer_now_ms();
     if (send(stream_control_sock, hello, (int)strlen(hello), 0) <= 0) {
         log_line("stream-control hello send failed: %d", WSAGetLastError());
@@ -607,7 +607,7 @@ static bool stream_control_start_session(void)
              (unsigned)strlen(hello));
     log_line("stream-control connected %s:%d video_port=%d codec=%s",
              host, stream_control_port, video_port,
-             video_codec ? video_codec : "h265");
+             video_codec ? video_codec : "h264");
 
     t_stage = viewer_now_ms();
     if (stream_control_read_line(status, sizeof(status))) {
