@@ -43,6 +43,7 @@
 #define G_PRIORITY_DEFAULT_IDLE 200
 
 #define ID_AUTO_SIZE 1001
+#define WM_STREAM_READY (WM_APP + 1)
 #define TOOLBAR_HEIGHT 32
 #define WINDOW_FIT_PERCENT 94
 
@@ -139,6 +140,7 @@ static void *inputs_channel;
 static void *spice_audio_obj;
 static bool inputs_ready;
 static volatile LONG shutting_down;
+static volatile LONG media_started;
 static LONG button_state;
 static FILE *log_fp;
 static CRITICAL_SECTION input_lock;
@@ -159,6 +161,7 @@ static void set_gst_environment(void);
 static void layout_children(HWND hwnd);
 static void resize_window_to_source(HWND hwnd);
 static void native_input_close(void);
+static void start_media_stack(HWND hwnd);
 static int run_spice_display_mode(int argc, char **argv);
 
 typedef enum {
@@ -529,8 +532,13 @@ static bool stream_control_start_session(void)
 static DWORD WINAPI stream_control_thread(LPVOID opaque)
 {
     char byte;
+    bool connected;
 
     (void)opaque;
+    connected = stream_control_start_session();
+    if (main_hwnd) {
+        PostMessageA(main_hwnd, WM_STREAM_READY, connected ? 1 : 0, 0);
+    }
     if (stream_control_sock == INVALID_SOCKET) {
         return 0;
     }
@@ -1465,6 +1473,25 @@ static void resize_window_to_source(HWND hwnd)
     layout_children(hwnd);
 }
 
+static void start_media_stack(HWND hwnd)
+{
+    if (InterlockedExchange(&media_started, 1) != 0) {
+        return;
+    }
+
+    set_gst_environment();
+    load_spice_runtime();
+    load_gst_runtime();
+    log_line("gst_init pre-audio");
+    p_gst_init(NULL, NULL);
+    CreateThread(NULL, 0, spice_thread, NULL, 0, NULL);
+    start_gst_receiver();
+    SetWindowTextA(hwnd, "GVT SPICE Viewer - video embedded, waiting for inputs");
+    if (auto_size_on_start) {
+        PostMessageA(hwnd, WM_COMMAND, ID_AUTO_SIZE, 0);
+    }
+}
+
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
     switch (msg) {
@@ -1479,13 +1506,6 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
             InitializeCriticalSection(&native_input_lock);
             native_input_lock_ready = true;
         }
-        stream_control_start_session();
-        CreateThread(NULL, 0, stream_control_thread, NULL, 0, NULL);
-        set_gst_environment();
-        load_spice_runtime();
-        load_gst_runtime();
-        log_line("gst_init pre-audio");
-        p_gst_init(NULL, NULL);
         auto_button = CreateWindowExA(0, "BUTTON", "Auto",
                                       WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                       0, 0, 1, 1, hwnd,
@@ -1499,12 +1519,14 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
                                      NULL);
         EnableWindow(video_hwnd, FALSE);
         layout_children(hwnd);
-        CreateThread(NULL, 0, spice_thread, NULL, 0, NULL);
-        start_gst_receiver();
-        SetWindowTextA(hwnd, "GVT SPICE Viewer - video embedded, waiting for inputs");
-        if (auto_size_on_start) {
-            PostMessageA(hwnd, WM_COMMAND, ID_AUTO_SIZE, 0);
+        SetWindowTextA(hwnd, "GVT SPICE Viewer - connecting");
+        CreateThread(NULL, 0, stream_control_thread, NULL, 0, NULL);
+        if (!stream_control_enabled) {
+            PostMessageA(hwnd, WM_STREAM_READY, 0, 0);
         }
+        return 0;
+    case WM_STREAM_READY:
+        start_media_stack(hwnd);
         return 0;
     case WM_SIZE:
         layout_children(hwnd);
