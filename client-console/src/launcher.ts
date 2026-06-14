@@ -7,6 +7,7 @@ export function buildViewerArgs(
   defaults: ClientDefaults = CLIENT_DEFAULTS
 ): string[] {
   const args = [
+    "--video-codec", defaults.videoCodec,
     "--spice-host", server.host,
     "--spice-port", String(desktop.ports.spice),
     "--input-host", desktop.address || server.host,

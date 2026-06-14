@@ -1,5 +1,11 @@
 import { ApiError, HttpApiClient } from "./api.js";
 import { CLIENT_DEFAULTS, DEFAULT_SERVER } from "./defaults.js";
+import {
+  DEFAULT_DIRECT_ENDPOINT,
+  directEndpointToDesktop,
+  endpointToServerConfig,
+  parseDirectEndpoint
+} from "./directConnect.js";
 import { filterDesktops, formatUptime, modeLabel, statusLabel } from "./filters.js";
 import { buildLaunchPlan, modePayload } from "./launcher.js";
 import { MockApiClient } from "./mockApi.js";
@@ -9,6 +15,7 @@ import { Store } from "./store.js";
 const CONFIG_KEY = "gvt-cloud-client.server";
 const API_MODE_KEY = "gvt-cloud-client.apiMode";
 const SESSION_KEY = "gvt-cloud-client.session";
+const DIRECT_HISTORY_KEY = "gvt-cloud-client.directHistory";
 const store = new Store();
 let api: ApiClient = new HttpApiClient(
   DEFAULT_SERVER,
@@ -73,6 +80,24 @@ function loadConfig(): void {
 function saveConfig(config: ServerConfig, apiMode: "mock" | "real"): void {
   localStorage.setItem(CONFIG_KEY, JSON.stringify(config));
   localStorage.setItem(API_MODE_KEY, apiMode === "mock" ? "real" : apiMode);
+}
+
+function loadDirectHistory(): string[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(DIRECT_HISTORY_KEY) || "[]") as unknown;
+    if (Array.isArray(parsed)) {
+      return parsed.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, 8);
+    }
+  } catch {
+    localStorage.removeItem(DIRECT_HISTORY_KEY);
+  }
+  return [DEFAULT_DIRECT_ENDPOINT];
+}
+
+function saveDirectHistory(endpoint: string): void {
+  const normalized = endpoint.trim();
+  const next = [normalized, ...loadDirectHistory().filter((item) => item !== normalized)].slice(0, 8);
+  localStorage.setItem(DIRECT_HISTORY_KEY, JSON.stringify(next));
 }
 
 function useApi(config: ServerConfig, mode: "mock" | "real"): void {
@@ -413,6 +438,30 @@ async function openViewer(id: string): Promise<void> {
   }
 }
 
+async function openDirectViewer(): Promise<void> {
+  try {
+    const endpointValue = valueOf("directEndpoint") || DEFAULT_DIRECT_ENDPOINT;
+    const endpoint = parseDirectEndpoint(endpointValue);
+    const desktop = directEndpointToDesktop(endpoint);
+    const server = endpointToServerConfig(endpoint);
+    const plan = buildLaunchPlan(desktop, server, CLIENT_DEFAULTS);
+    store.set({ viewer: plan, error: undefined });
+    saveDirectHistory(`${endpoint.host}:${endpoint.videoPort}`);
+
+    const response = await fetch("/launch-viewer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(plan)
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({ error: "Local viewer launch failed" })) as { error?: string };
+      throw new Error(payload.error || "Local viewer launch failed");
+    }
+  } catch (error) {
+    store.set({ error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
 function render(): void {
   const state = store.get();
   const selected = state.selectedDesktopId ? desktopById(state.selectedDesktopId) : undefined;
@@ -447,6 +496,7 @@ function render(): void {
             <button class="button primary" data-create>${icon("+")}创建桌面</button>
           </div>
         </header>
+        ${directConnectHtml()}
         <section class="stats-row" aria-label="运行概览">
           <div class="stat"><span>在线桌面</span><strong>${running} / ${state.desktops.length}</strong></div>
           <div class="stat"><span>当前输出</span><strong>${escapeHtml(state.status?.activeSource || "-")}</strong></div>
@@ -474,6 +524,29 @@ function render(): void {
     ${state.error ? `<div class="toast">${escapeHtml(state.error)}</div>` : ""}
   `;
   bindEvents();
+}
+
+function directConnectHtml(): string {
+  const history = loadDirectHistory();
+  const current = history[0] || DEFAULT_DIRECT_ENDPOINT;
+  return `
+    <section class="direct-connect" aria-label="直连桌面">
+      <div class="direct-copy">
+        <strong>连接到云桌面</strong>
+        <span>像 SPICE 或 VNC 一样输入服务端地址，然后点击连接。最近连接会保存在这台电脑上。</span>
+      </div>
+      <form class="direct-form" data-direct-form>
+        <label>
+          <span>服务端</span>
+          <input id="directEndpoint" list="directHistory" value="${escapeHtml(current)}" placeholder="192.168.0.188:5004" autocomplete="off" />
+          <datalist id="directHistory">
+            ${history.map((item) => `<option value="${escapeHtml(item)}"></option>`).join("")}
+          </datalist>
+        </label>
+        <button class="button primary" type="submit">连接</button>
+      </form>
+    </section>
+  `;
 }
 
 function filterButton(key: FilterKey, label: string, active: FilterKey): string {
@@ -729,6 +802,10 @@ function bindEvents(): void {
   }));
   document.querySelectorAll("[data-close-settings]").forEach((button) => button.addEventListener("click", () => hide("settingsBackdrop")));
   document.querySelectorAll("[data-login]").forEach((button) => button.addEventListener("click", () => void loginFromModal()));
+  document.querySelectorAll("[data-direct-form]").forEach((form) => form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void openDirectViewer();
+  }));
   document.querySelectorAll("[data-refresh]").forEach((button) => button.addEventListener("click", () => void refreshAll()));
   document.querySelectorAll("[data-filter]").forEach((button) => button.addEventListener("click", () => {
     store.set({ filter: (button as HTMLElement).dataset.filter as FilterKey });

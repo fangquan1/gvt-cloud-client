@@ -3,6 +3,7 @@ import test from "node:test";
 import { CLIENT_DEFAULTS, defaultDesktops } from "../src/defaults.js";
 
 test("low latency defaults keep the known-good no-FEC path", () => {
+  assert.equal(CLIENT_DEFAULTS.videoCodec, "h265");
   assert.equal(CLIENT_DEFAULTS.videoLatencyMs, 15);
   assert.equal(CLIENT_DEFAULTS.fecEnabled, false);
   assert.equal(CLIENT_DEFAULTS.dropOnLatency, false);

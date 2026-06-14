@@ -26,6 +26,7 @@ const mimeTypes = new Map([
 
 const allowedArgs = new Map([
   ["--spice-host", true],
+  ["--video-codec", true],
   ["--spice-port", true],
   ["--input-host", true],
   ["--input-port", true],

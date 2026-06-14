@@ -204,6 +204,55 @@ h1, h2, h3, p {
   margin: 18px 0;
 }
 
+.direct-connect {
+  margin: 18px 0 14px;
+  padding: 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(320px, 42%);
+  gap: 14px;
+  align-items: end;
+}
+
+.direct-copy {
+  display: grid;
+  gap: 4px;
+}
+
+.direct-copy strong {
+  font-size: 18px;
+}
+
+.direct-copy span,
+.direct-form span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.direct-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.direct-form label {
+  display: grid;
+  gap: 6px;
+}
+
+.direct-form input {
+  width: 100%;
+  height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0 10px;
+  background: #fff;
+  color: var(--text);
+}
+
 .stat,
 .toolbar,
 .details,
@@ -632,6 +681,8 @@ input, select {
     flex-direction: column;
   }
   .stats-row,
+  .direct-connect,
+  .direct-form,
   .form-grid {
     grid-template-columns: 1fr;
   }

@@ -1,6 +1,7 @@
 import type { ClientDefaults, Desktop, HostStatus, ServerConfig } from "./models.js";
 
 export const CLIENT_DEFAULTS: ClientDefaults = {
+  videoCodec: "h265",
   videoLatencyMs: 15,
   fecEnabled: false,
   dropOnLatency: false,

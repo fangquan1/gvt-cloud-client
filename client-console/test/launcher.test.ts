@@ -6,6 +6,7 @@ import { buildLaunchPlan, buildViewerArgs, modePayload } from "../src/launcher.j
 test("viewer args disable drop-on-latency and keep native input", () => {
   const desktop = defaultDesktops()[0];
   const args = buildViewerArgs(desktop, DEFAULT_SERVER);
+  assert.equal(args[args.indexOf("--video-codec") + 1], "h265");
   assert.equal(args.includes("--latency"), true);
   assert.equal(args[args.indexOf("--latency") + 1], "15");
   assert.equal(args.includes("--no-drop-on-latency"), true);

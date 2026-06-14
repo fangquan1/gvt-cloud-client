@@ -161,6 +161,7 @@ export interface ViewerLaunchPlan {
 }
 
 export interface ClientDefaults {
+  videoCodec: "h264" | "h265";
   videoLatencyMs: number;
   fecEnabled: boolean;
   dropOnLatency: boolean;
