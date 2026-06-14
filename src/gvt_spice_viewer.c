@@ -145,8 +145,12 @@ static volatile LONG media_started;
 static volatile LONG gst_started;
 static LONG button_state;
 static FILE *log_fp;
+static CRITICAL_SECTION log_lock;
+static volatile LONG log_lock_state;
 static CRITICAL_SECTION input_lock;
 static bool input_lock_ready;
+static CRITICAL_SECTION runtime_load_lock;
+static volatile LONG runtime_load_lock_state;
 static bool pending_position_queued;
 static bool pending_position_valid;
 static int pending_position_x;
@@ -189,11 +193,27 @@ static ULONGLONG viewer_now_ms(void)
     return (ULONGLONG)GetTickCount();
 }
 
+static void ensure_log_lock(void)
+{
+    LONG state = InterlockedCompareExchange(&log_lock_state, 1, 0);
+
+    if (state == 0) {
+        InitializeCriticalSection(&log_lock);
+        InterlockedExchange(&log_lock_state, 2);
+        return;
+    }
+    while (InterlockedCompareExchange(&log_lock_state, 2, 2) != 2) {
+        Sleep(0);
+    }
+}
+
 static void log_line(const char *fmt, ...)
 {
     va_list ap;
     ULONGLONG now_ms = viewer_now_ms();
 
+    ensure_log_lock();
+    EnterCriticalSection(&log_lock);
     if (!log_start_ms) {
         log_start_ms = now_ms;
     }
@@ -205,6 +225,7 @@ static void log_line(const char *fmt, ...)
         log_fp = fopen(path, "a");
     }
     if (!log_fp) {
+        LeaveCriticalSection(&log_lock);
         return;
     }
     fprintf(log_fp, "+%I64ums ", (unsigned long long)(now_ms - log_start_ms));
@@ -213,6 +234,7 @@ static void log_line(const char *fmt, ...)
     va_end(ap);
     fputc('\n', log_fp);
     fflush(log_fp);
+    LeaveCriticalSection(&log_lock);
 }
 
 static bool input_debug(void)
@@ -229,6 +251,31 @@ static bool input_debug(void)
 static bool env_is_set(const char *name)
 {
     return GetEnvironmentVariableA(name, NULL, 0) > 0;
+}
+
+static void ensure_runtime_load_lock(void)
+{
+    LONG state = InterlockedCompareExchange(&runtime_load_lock_state, 1, 0);
+
+    if (state == 0) {
+        InitializeCriticalSection(&runtime_load_lock);
+        InterlockedExchange(&runtime_load_lock_state, 2);
+        return;
+    }
+    while (InterlockedCompareExchange(&runtime_load_lock_state, 2, 2) != 2) {
+        Sleep(0);
+    }
+}
+
+static void runtime_load_enter(void)
+{
+    ensure_runtime_load_lock();
+    EnterCriticalSection(&runtime_load_lock);
+}
+
+static void runtime_load_leave(void)
+{
+    LeaveCriticalSection(&runtime_load_lock);
 }
 
 static int getenv_int_clamped(const char *name, int defval, int minval, int maxval)
@@ -290,11 +337,20 @@ static void *sym(HMODULE module, const char *name)
 static void load_spice_runtime(void)
 {
     log_line("load_spice_runtime %s", spice_runtime);
+    runtime_load_enter();
+    if (glib && gobject && spice) {
+        runtime_load_leave();
+        return;
+    }
     SetDllDirectoryA(spice_runtime);
     glib = LoadLibraryA("libglib-2.0-0.dll");
     gobject = LoadLibraryA("libgobject-2.0-0.dll");
     spice = LoadLibraryA("libspice-client-glib-2.0-8.dll");
     if (!glib || !gobject || !spice) {
+        DWORD err = GetLastError();
+        log_line("load_spice_runtime failed glib=%p gobject=%p spice=%p err=%lu",
+                 glib, gobject, spice, err);
+        runtime_load_leave();
         MessageBoxA(NULL, "Failed to load VirtViewer SPICE runtime DLLs",
                     "GVT SPICE Viewer", MB_ICONERROR);
         ExitProcess(2);
@@ -322,6 +378,7 @@ static void load_spice_runtime(void)
     p_g_main_loop_unref = sym(glib, "g_main_loop_unref");
     p_g_idle_add = sym(glib, "g_idle_add");
     p_g_idle_add_full = sym(glib, "g_idle_add_full");
+    runtime_load_leave();
 }
 
 static void load_spice_gtk_runtime(void)
@@ -933,7 +990,9 @@ static void load_gst_runtime(void)
 {
     char bin[MAX_PATH * 2];
 
+    runtime_load_enter();
     if (gstlib && gstvideo) {
+        runtime_load_leave();
         return;
     }
 
@@ -943,6 +1002,10 @@ static void load_gst_runtime(void)
     gstlib = LoadLibraryA("libgstreamer-1.0-0.dll");
     gstvideo = LoadLibraryA("libgstvideo-1.0-0.dll");
     if (!gstlib || !gstvideo) {
+        DWORD err = GetLastError();
+        log_line("load_gst_runtime failed gst=%p gstvideo=%p err=%lu",
+                 gstlib, gstvideo, err);
+        runtime_load_leave();
         MessageBoxA(main_hwnd, "Failed to load GStreamer runtime DLLs",
                     "GVT SPICE Viewer", MB_ICONERROR);
         ExitProcess(2);
@@ -955,6 +1018,7 @@ static void load_gst_runtime(void)
     p_gst_object_unref = sym(gstlib, "gst_object_unref");
     p_gst_video_overlay_set_window_handle =
         sym(gstvideo, "gst_video_overlay_set_window_handle");
+    runtime_load_leave();
 }
 
 static void channel_event(void *channel, gint event, void *opaque)
