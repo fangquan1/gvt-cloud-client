@@ -12,6 +12,8 @@ export function buildViewerArgs(
     "--spice-port", String(desktop.ports.spice),
     "--input-host", desktop.address || server.host,
     "--input-port", String(desktop.ports.input),
+    "--stream-control-host", server.host,
+    "--stream-control-port", String(desktop.ports.video),
     "--source-width", String(desktop.resolution.width),
     "--source-height", String(desktop.resolution.height),
     "--latency", String(defaults.videoLatencyMs),

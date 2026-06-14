@@ -326,6 +326,8 @@ static void connect_now(void)
     append_flag_int(cmd, 8192, L"--spice-port", spice_port);
     append_flag_value(cmd, 8192, L"--input-host", host);
     append_flag_int(cmd, 8192, L"--input-port", input_port);
+    append_flag_value(cmd, 8192, L"--stream-control-host", host);
+    append_flag_int(cmd, 8192, L"--stream-control-port", video_port);
     append_flag_int(cmd, 8192, L"--source-width", width);
     append_flag_int(cmd, 8192, L"--source-height", height);
     wcsncat(cmd, L" --native-input --invert-case --no-drop-on-latency --auto-size", 8192 - wcslen(cmd) - 1);

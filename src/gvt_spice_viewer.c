@@ -118,6 +118,9 @@ static int video_port = 5004;
 static int video_latency = 15;
 static bool video_drop_on_latency = false;
 static const char *video_codec = "h264";
+static const char *stream_control_host = NULL;
+static int stream_control_port = 5004;
+static bool stream_control_enabled = true;
 static int source_width = 1920;
 static int source_height = 1200;
 static bool auto_size_on_start = true;
@@ -147,6 +150,7 @@ static int pending_position_buttons;
 static CRITICAL_SECTION native_input_lock;
 static bool native_input_lock_ready;
 static SOCKET native_input_sock = INVALID_SOCKET;
+static SOCKET stream_control_sock = INVALID_SOCKET;
 static bool winsock_ready;
 
 static char *dup_app_dir(void);
@@ -372,6 +376,85 @@ static void native_input_close(void)
         closesocket(native_input_sock);
         native_input_sock = INVALID_SOCKET;
     }
+}
+
+static void stream_control_close(void)
+{
+    if (stream_control_sock != INVALID_SOCKET) {
+        shutdown(stream_control_sock, SD_BOTH);
+        closesocket(stream_control_sock);
+        stream_control_sock = INVALID_SOCKET;
+    }
+}
+
+static DWORD WINAPI stream_control_thread(LPVOID opaque)
+{
+    struct sockaddr_in addr;
+    const char *host = stream_control_host ? stream_control_host : spice_host;
+    char hello[256];
+    char byte;
+    int one = 1;
+
+    (void)opaque;
+    if (!stream_control_enabled || !host || !*host || stream_control_port <= 0) {
+        return 0;
+    }
+
+    ensure_winsock();
+    if (!winsock_ready) {
+        log_line("stream-control disabled: WSAStartup failed");
+        return 0;
+    }
+
+    stream_control_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (stream_control_sock == INVALID_SOCKET) {
+        log_line("stream-control socket failed: %d", WSAGetLastError());
+        return 0;
+    }
+
+    setsockopt(stream_control_sock, IPPROTO_TCP, TCP_NODELAY,
+               (const char *)&one, sizeof(one));
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((u_short)stream_control_port);
+    addr.sin_addr.s_addr = inet_addr(host);
+    if (addr.sin_addr.s_addr == INADDR_NONE ||
+        connect(stream_control_sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        log_line("stream-control connect %s:%d failed: %d",
+                 host, stream_control_port, WSAGetLastError());
+        stream_control_close();
+        return 0;
+    }
+
+    snprintf(hello, sizeof(hello),
+             "{\"type\":\"start\",\"video_port\":%d,\"codec\":\"%s\"}\n",
+             video_port, video_codec ? video_codec : "h265");
+    if (send(stream_control_sock, hello, (int)strlen(hello), 0) <= 0) {
+        log_line("stream-control hello send failed: %d", WSAGetLastError());
+        stream_control_close();
+        return 0;
+    }
+    log_line("stream-control connected %s:%d video_port=%d codec=%s",
+             host, stream_control_port, video_port,
+             video_codec ? video_codec : "h265");
+
+    while (InterlockedCompareExchange(&shutting_down, 0, 0) == 0) {
+        int ret = recv(stream_control_sock, &byte, 1, 0);
+        if (ret == 0) {
+            log_line("stream-control server closed session");
+            break;
+        }
+        if (ret < 0) {
+            int err = WSAGetLastError();
+            if (err == WSAEINTR) {
+                continue;
+            }
+            log_line("stream-control recv failed: %d", err);
+            break;
+        }
+    }
+    stream_control_close();
+    return 0;
 }
 
 static void native_input_send_json(const char *json)
@@ -1299,6 +1382,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
             InitializeCriticalSection(&native_input_lock);
             native_input_lock_ready = true;
         }
+        CreateThread(NULL, 0, stream_control_thread, NULL, 0, NULL);
         set_gst_environment();
         load_spice_runtime();
         load_gst_runtime();
@@ -1483,6 +1567,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
             p_g_main_loop_quit(main_loop);
         }
         native_input_close();
+        stream_control_close();
         if (winsock_ready) {
             WSACleanup();
             winsock_ready = false;
@@ -1509,6 +1594,12 @@ static void parse_args(int argc, char **argv)
             video_port = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--video-codec") && i + 1 < argc) {
             video_codec = argv[++i];
+        } else if (!strcmp(argv[i], "--stream-control-host") && i + 1 < argc) {
+            stream_control_host = argv[++i];
+        } else if (!strcmp(argv[i], "--stream-control-port") && i + 1 < argc) {
+            stream_control_port = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--no-stream-control")) {
+            stream_control_enabled = false;
         } else if (!strcmp(argv[i], "--latency") && i + 1 < argc) {
             video_latency = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--drop-on-latency")) {

@@ -13,6 +13,7 @@ test("viewer args disable drop-on-latency and keep native input", () => {
   assert.equal(args.includes("--drop-on-latency"), false);
   assert.equal(args.includes("--native-input"), true);
   assert.equal(args.includes("--invert-case"), true);
+  assert.equal(args[args.indexOf("--stream-control-host") + 1], DEFAULT_SERVER.host);
 });
 
 test("physical output launch plan disables local video but keeps input and audio focus", () => {

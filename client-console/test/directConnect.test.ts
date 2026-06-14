@@ -23,4 +23,5 @@ test("direct connection launch args include codec and low latency defaults", () 
   assert.equal(args.includes("--no-drop-on-latency"), true);
   assert.equal(args[args.indexOf("--spice-port") + 1], "5900");
   assert.equal(args[args.indexOf("--input-port") + 1], "5905");
+  assert.equal(args[args.indexOf("--stream-control-port") + 1], "5004");
 });

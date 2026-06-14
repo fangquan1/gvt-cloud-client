@@ -42,7 +42,9 @@ mkdirSync(path.join(outRoot, "app", "scripts"), { recursive: true });
 cpSync(distRoot, path.join(outRoot, "app", "dist"), { recursive: true });
 copyFileSync(path.join(scriptDir, "launcher-server.mjs"), path.join(outRoot, "app", "scripts", "launcher-server.mjs"));
 
-const viewerExe = process.env.GVT_VIEWER_EXE || path.join(workspaceRoot, "direct-stream", "client", "gvt_spice_viewer.exe");
+const builtViewerExe = path.join(repoRoot, "src", "gvt_spice_viewer.exe");
+const legacyViewerExe = path.join(workspaceRoot, "direct-stream", "client", "gvt_spice_viewer.exe");
+const viewerExe = process.env.GVT_VIEWER_EXE || (existsSync(builtViewerExe) ? builtViewerExe : legacyViewerExe);
 copyIfExists(viewerExe, path.join(outRoot, "app", "viewer", "gvt_spice_viewer.exe"));
 
 copyFileSync(
