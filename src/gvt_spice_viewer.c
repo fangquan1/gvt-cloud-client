@@ -643,6 +643,10 @@ static DWORD WINAPI stream_control_thread(LPVOID opaque)
         int ret = recv(stream_control_sock, &byte, 1, 0);
         if (ret == 0) {
             log_line("stream-control server closed session");
+            if (main_hwnd && InterlockedCompareExchange(&shutting_down, 0, 0) == 0) {
+                log_line("stream-control lost, closing viewer");
+                PostMessageA(main_hwnd, WM_CLOSE, 0, 0);
+            }
             break;
         }
         if (ret < 0) {
@@ -651,6 +655,10 @@ static DWORD WINAPI stream_control_thread(LPVOID opaque)
                 continue;
             }
             log_line("stream-control recv failed: %d", err);
+            if (main_hwnd && InterlockedCompareExchange(&shutting_down, 0, 0) == 0) {
+                log_line("stream-control lost, closing viewer");
+                PostMessageA(main_hwnd, WM_CLOSE, 0, 0);
+            }
             break;
         }
     }
