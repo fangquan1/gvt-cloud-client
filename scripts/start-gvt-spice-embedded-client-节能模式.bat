@@ -14,4 +14,16 @@ if "%VIDEO_CODEC%"=="" set "VIDEO_CODEC=h265"
 "%PYEXE%" ".\direct-stream\client\stop_local_direct.py" >nul 2>nul
 "%PYEXE%" ".\direct-stream\start_input_proxy.py" stop >nul 2>nul
 "%PYEXE%" ".\direct-stream\start_gvt_stream_qemu.py" start --restart --port 5004 --fps 60 --bitrate 12000 --video-codec %VIDEO_CODEC% --capture-ms 16 --idle-capture-ms 66 --idle-after-ms 1500 --idle-probe-ms 500 --idle-changed-ppm 3000 --idle-pixel-delta 8 --fec 0 --fec-important 0
-start "GVT SPICE Embedded Client - Power Save" ".\direct-stream\client\gvt_spice_viewer.exe" --video-codec %VIDEO_CODEC% --video-port 5004 --latency %VIDEO_LATENCY% --spice-host 192.168.0.188 --spice-port 5900 --native-input --invert-case --input-host 192.168.0.188 --input-port 5905 --source-width %SOURCE_WIDTH% --source-height %SOURCE_HEIGHT% --auto-size
+if errorlevel 1 (
+    set "CLIENT_EXIT=1"
+    goto cleanup
+)
+
+start "GVT SPICE Embedded Client - Power Save" /wait /b ".\direct-stream\client\gvt_spice_viewer.exe" --video-codec %VIDEO_CODEC% --video-port 5004 --latency %VIDEO_LATENCY% --spice-host 192.168.0.188 --spice-port 5900 --native-input --invert-case --input-host 192.168.0.188 --input-port 5905 --source-width %SOURCE_WIDTH% --source-height %SOURCE_HEIGHT% --auto-size
+set "CLIENT_EXIT=%ERRORLEVEL%"
+
+:cleanup
+"%PYEXE%" ".\direct-stream\start_gvt_stream_qemu.py" stop
+"%PYEXE%" ".\direct-stream\start_input_proxy.py" stop
+"%PYEXE%" ".\direct-stream\client\stop_local_direct.py" >nul 2>nul
+exit /b %CLIENT_EXIT%
