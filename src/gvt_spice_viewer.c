@@ -111,6 +111,7 @@ static const char *spice_runtime = "C:\\Program Files\\VirtViewer v11.0-256\\bin
 static const char *gst_root = NULL;
 static const char *spice_host = "192.168.0.188";
 static const char *spice_port = "5900";
+static char spice_port_storage[16];
 static const char *native_input_host = "192.168.0.188";
 static int native_input_port = 5905;
 static bool native_input_enabled = true;
@@ -387,33 +388,110 @@ static void stream_control_close(void)
     }
 }
 
-static DWORD WINAPI stream_control_thread(LPVOID opaque)
+static int json_get_int_field(const char *json, const char *key, int defval)
+{
+    char pattern[64];
+    const char *p;
+
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    p = strstr(json, pattern);
+    if (!p) {
+        return defval;
+    }
+    p = strchr(p, ':');
+    if (!p) {
+        return defval;
+    }
+    p++;
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    return atoi(p);
+}
+
+static bool stream_control_read_line(char *buffer, size_t size)
+{
+    size_t used = 0;
+
+    while (used + 1 < size) {
+        char byte;
+        int ret = recv(stream_control_sock, &byte, 1, 0);
+        if (ret <= 0) {
+            return false;
+        }
+        if (byte == '\n') {
+            break;
+        }
+        buffer[used++] = byte;
+    }
+    buffer[used] = '\0';
+    return used > 0;
+}
+
+static void stream_control_apply_status(const char *status)
+{
+    int returned_video;
+    int returned_spice;
+    int returned_input;
+
+    if (!status || !*status) {
+        return;
+    }
+    log_line("stream-control status %s", status);
+    if (strstr(status, "\"ok\":false")) {
+        return;
+    }
+
+    returned_video = json_get_int_field(status, "video_udp", 0);
+    returned_spice = json_get_int_field(status, "spice_tcp", 0);
+    returned_input = json_get_int_field(status, "input_tcp", 0);
+
+    if (returned_video > 0 && returned_video <= 65535) {
+        video_port = returned_video;
+    }
+    if (returned_spice > 0 && returned_spice <= 65535) {
+        snprintf(spice_port_storage, sizeof(spice_port_storage), "%d",
+                 returned_spice);
+        spice_port = spice_port_storage;
+    }
+    if (returned_input > 0 && returned_input <= 65535) {
+        native_input_port = returned_input;
+        native_input_enabled = true;
+    }
+    log_line("stream-control using ports video_udp=%d spice_tcp=%s input_tcp=%d",
+             video_port, spice_port, native_input_port);
+}
+
+static bool stream_control_start_session(void)
 {
     struct sockaddr_in addr;
     const char *host = stream_control_host ? stream_control_host : spice_host;
     char hello[256];
-    char byte;
+    char status[512];
     int one = 1;
+    DWORD timeout_ms = 1500;
+    DWORD no_timeout = 0;
 
-    (void)opaque;
     if (!stream_control_enabled || !host || !*host || stream_control_port <= 0) {
-        return 0;
+        return false;
     }
 
     ensure_winsock();
     if (!winsock_ready) {
         log_line("stream-control disabled: WSAStartup failed");
-        return 0;
+        return false;
     }
 
     stream_control_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (stream_control_sock == INVALID_SOCKET) {
         log_line("stream-control socket failed: %d", WSAGetLastError());
-        return 0;
+        return false;
     }
 
     setsockopt(stream_control_sock, IPPROTO_TCP, TCP_NODELAY,
                (const char *)&one, sizeof(one));
+    setsockopt(stream_control_sock, SOL_SOCKET, SO_RCVTIMEO,
+               (const char *)&timeout_ms, sizeof(timeout_ms));
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons((u_short)stream_control_port);
@@ -423,7 +501,7 @@ static DWORD WINAPI stream_control_thread(LPVOID opaque)
         log_line("stream-control connect %s:%d failed: %d",
                  host, stream_control_port, WSAGetLastError());
         stream_control_close();
-        return 0;
+        return false;
     }
 
     snprintf(hello, sizeof(hello),
@@ -432,11 +510,30 @@ static DWORD WINAPI stream_control_thread(LPVOID opaque)
     if (send(stream_control_sock, hello, (int)strlen(hello), 0) <= 0) {
         log_line("stream-control hello send failed: %d", WSAGetLastError());
         stream_control_close();
-        return 0;
+        return false;
     }
     log_line("stream-control connected %s:%d video_port=%d codec=%s",
              host, stream_control_port, video_port,
              video_codec ? video_codec : "h265");
+
+    if (stream_control_read_line(status, sizeof(status))) {
+        stream_control_apply_status(status);
+    } else {
+        log_line("stream-control did not return port status, using local ports");
+    }
+    setsockopt(stream_control_sock, SOL_SOCKET, SO_RCVTIMEO,
+               (const char *)&no_timeout, sizeof(no_timeout));
+    return true;
+}
+
+static DWORD WINAPI stream_control_thread(LPVOID opaque)
+{
+    char byte;
+
+    (void)opaque;
+    if (stream_control_sock == INVALID_SOCKET) {
+        return 0;
+    }
 
     while (InterlockedCompareExchange(&shutting_down, 0, 0) == 0) {
         int ret = recv(stream_control_sock, &byte, 1, 0);
@@ -1382,6 +1479,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
             InitializeCriticalSection(&native_input_lock);
             native_input_lock_ready = true;
         }
+        stream_control_start_session();
         CreateThread(NULL, 0, stream_control_thread, NULL, 0, NULL);
         set_gst_environment();
         load_spice_runtime();

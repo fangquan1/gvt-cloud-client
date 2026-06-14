@@ -300,7 +300,7 @@ static void connect_now(void)
         return;
     }
 
-    slot = video_port >= 5004 ? (video_port - 5004 + 1) / 2 : 0;
+    slot = video_port >= 5004 ? (video_port - 5004) / 4 : 0;
     if (slot < 0) {
         slot = 0;
     }

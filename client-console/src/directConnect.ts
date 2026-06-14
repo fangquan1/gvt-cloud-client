@@ -37,7 +37,7 @@ export function parseDirectEndpoint(value: string): DirectEndpoint {
 }
 
 export function derivePorts(videoPort: number): DesktopPorts {
-  const slot = videoPort >= 5004 ? Math.max(0, Math.round((videoPort - 5004) / 2)) : 0;
+  const slot = videoPort >= 5004 ? Math.max(0, Math.floor((videoPort - 5004) / 4)) : 0;
   return {
     video: videoPort,
     spice: 5900 + slot,

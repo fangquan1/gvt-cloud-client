@@ -4,9 +4,9 @@ import { derivePorts, directEndpointToDesktop, endpointToServerConfig, parseDire
 import { buildViewerArgs } from "../src/launcher.js";
 
 test("direct endpoint parser accepts host:port and derives companion ports", () => {
-  const endpoint = parseDirectEndpoint("192.168.0.188:5006");
+  const endpoint = parseDirectEndpoint("192.168.0.188:5008");
   assert.equal(endpoint.host, "192.168.0.188");
-  assert.deepEqual(endpoint.ports, { video: 5006, spice: 5901, input: 5906 });
+  assert.deepEqual(endpoint.ports, { video: 5008, spice: 5901, input: 5906 });
 });
 
 test("direct endpoint parser uses vm1 defaults when port is omitted", () => {
