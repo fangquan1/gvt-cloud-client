@@ -330,7 +330,7 @@ static void connect_now(void)
     append_flag_int(cmd, 8192, L"--stream-control-port", video_port);
     append_flag_int(cmd, 8192, L"--source-width", width);
     append_flag_int(cmd, 8192, L"--source-height", height);
-    wcsncat(cmd, L" --native-input --invert-case --no-drop-on-latency --auto-size", 8192 - wcslen(cmd) - 1);
+    wcsncat(cmd, L" --native-input --invert-case --spice-input-tablet --no-drop-on-latency --auto-size", 8192 - wcslen(cmd) - 1);
     append_portable_runtime_args(cmd, 8192);
 
     si.cb = sizeof(si);

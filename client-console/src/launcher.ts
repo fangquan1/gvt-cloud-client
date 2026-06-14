@@ -29,6 +29,7 @@ export function buildViewerArgs(
   if (defaults.invertCase) {
     args.push("--invert-case");
   }
+  args.push("--spice-input-tablet");
   if (desktop.mode !== "physical") {
     args.push("--video-port", String(desktop.ports.video));
   }
