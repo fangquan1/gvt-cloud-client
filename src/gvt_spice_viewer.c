@@ -141,6 +141,7 @@ static void *spice_audio_obj;
 static bool inputs_ready;
 static volatile LONG shutting_down;
 static volatile LONG media_started;
+static volatile LONG gst_started;
 static LONG button_state;
 static FILE *log_fp;
 static CRITICAL_SECTION input_lock;
@@ -1280,11 +1281,21 @@ static bool start_gst_receiver(void)
     char desc[4096];
     void *error = NULL;
     bool use_h265 = !strcmp(video_codec, "h265") || !strcmp(video_codec, "hevc");
+    ULONGLONG t_stage;
 
+    t_stage = viewer_now_ms();
     set_gst_environment();
+    log_line("gst receiver set-env dt=%I64ums",
+             (unsigned long long)(viewer_now_ms() - t_stage));
+    t_stage = viewer_now_ms();
     load_gst_runtime();
+    log_line("gst receiver load-runtime dt=%I64ums",
+             (unsigned long long)(viewer_now_ms() - t_stage));
     log_line("gst_init");
+    t_stage = viewer_now_ms();
     p_gst_init(NULL, NULL);
+    log_line("gst receiver gst-init dt=%I64ums",
+             (unsigned long long)(viewer_now_ms() - t_stage));
 
     if (use_h265) {
         snprintf(desc, sizeof(desc),
@@ -1304,7 +1315,10 @@ static bool start_gst_receiver(void)
                  video_port, video_latency, video_drop_on_latency ? "true" : "false");
     }
 
+    t_stage = viewer_now_ms();
     gst_pipeline = p_gst_parse_launch(desc, &error);
+    log_line("gst receiver parse-launch dt=%I64ums",
+             (unsigned long long)(viewer_now_ms() - t_stage));
     if (!gst_pipeline) {
         log_line("gst_parse_launch failed");
         MessageBoxA(main_hwnd, "Failed to create GStreamer RTP pipeline",
@@ -1320,7 +1334,10 @@ static bool start_gst_receiver(void)
     }
     p_gst_video_overlay_set_window_handle(gst_sink, (uintptr_t)video_hwnd);
     log_line("gst set window=%p", video_hwnd);
+    t_stage = viewer_now_ms();
     log_line("gst set playing ret=%d", p_gst_element_set_state(gst_pipeline, 4));
+    log_line("gst receiver set-playing dt=%I64ums",
+             (unsigned long long)(viewer_now_ms() - t_stage));
     return true;
 }
 
@@ -1510,6 +1527,23 @@ static void resize_window_to_source(HWND hwnd)
     layout_children(hwnd);
 }
 
+static DWORD WINAPI gst_receiver_thread(LPVOID opaque)
+{
+    ULONGLONG t0 = viewer_now_ms();
+
+    (void)opaque;
+    if (InterlockedExchange(&gst_started, 1) != 0) {
+        log_line("gst receiver already started");
+        return 0;
+    }
+
+    log_line("gst receiver thread begin");
+    start_gst_receiver();
+    log_line("gst receiver thread ready total=%I64ums",
+             (unsigned long long)(viewer_now_ms() - t0));
+    return 0;
+}
+
 static void start_media_stack(HWND hwnd)
 {
     ULONGLONG t0 = viewer_now_ms();
@@ -1525,24 +1559,8 @@ static void start_media_stack(HWND hwnd)
     set_gst_environment();
     log_line("media-stack set-gst-env dt=%I64ums",
              (unsigned long long)(viewer_now_ms() - t_stage));
-    t_stage = viewer_now_ms();
-    load_spice_runtime();
-    log_line("media-stack load-spice-runtime dt=%I64ums",
-             (unsigned long long)(viewer_now_ms() - t_stage));
-    t_stage = viewer_now_ms();
-    load_gst_runtime();
-    log_line("media-stack load-gst-runtime dt=%I64ums",
-             (unsigned long long)(viewer_now_ms() - t_stage));
-    log_line("gst_init pre-audio");
-    t_stage = viewer_now_ms();
-    p_gst_init(NULL, NULL);
-    log_line("media-stack gst-init dt=%I64ums",
-             (unsigned long long)(viewer_now_ms() - t_stage));
     CreateThread(NULL, 0, spice_thread, NULL, 0, NULL);
-    t_stage = viewer_now_ms();
-    start_gst_receiver();
-    log_line("media-stack start-gst-receiver dt=%I64ums",
-             (unsigned long long)(viewer_now_ms() - t_stage));
+    CreateThread(NULL, 0, gst_receiver_thread, NULL, 0, NULL);
     SetWindowTextA(hwnd, "GVT SPICE Viewer - video embedded, waiting for inputs");
     if (auto_size_on_start) {
         PostMessageA(hwnd, WM_COMMAND, ID_AUTO_SIZE, 0);
