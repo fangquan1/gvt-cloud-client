@@ -136,7 +136,8 @@ static HWND auto_button;
 static RECT video_rect;
 static void *gst_pipeline;
 static void *gst_sink;
-static void *gst_probe;
+static void *gst_rtp_probe;
+static void *gst_decode_probe;
 static void *main_loop;
 static void *inputs_channel;
 static void *spice_audio_obj;
@@ -170,8 +171,16 @@ static ULONGLONG log_start_ms;
 static int audio_channels;
 static int audio_frequency;
 static ULONGLONG audio_last_data_ms;
-static ULONGLONG video_last_handoff_ms;
-static unsigned int video_handoff_count;
+typedef struct VideoProbeStats {
+    const char *name;
+    const char *unit;
+    unsigned int sample_every;
+    ULONGLONG last_ms;
+    unsigned int count;
+} VideoProbeStats;
+
+static VideoProbeStats video_rtp_probe_stats = { "rtp", "packets", 1800, 0, 0 };
+static VideoProbeStats video_decode_probe_stats = { "decode", "frames", 120, 0, 0 };
 
 static char *dup_app_dir(void);
 static void set_gst_environment(void);
@@ -278,10 +287,7 @@ static bool latency_debug(void)
     DWORD len = GetEnvironmentVariableA("GVT_SPICE_VIEWER_LATENCY_DEBUG",
                                         value, sizeof(value));
 
-    if (len > 0 && len < sizeof(value) && value[0] == '0') {
-        return false;
-    }
-    return true;
+    return len > 0 && len < sizeof(value) && value[0] != '0';
 }
 
 static bool env_is_set(const char *name)
@@ -342,6 +348,11 @@ static int getenv_int_clamped(const char *name, int defval, int minval, int maxv
 static bool audio_debug(void)
 {
     return latency_debug() || env_is_set("GVT_SPICE_VIEWER_AUDIO_DEBUG");
+}
+
+static bool video_debug(void)
+{
+    return env_is_set("GVT_SPICE_VIEWER_VIDEO_DEBUG");
 }
 
 static bool input_transport_ready(void)
@@ -1175,22 +1186,27 @@ static void load_gst_runtime(void)
 
 static void video_handoff_cb(void *identity, void *buffer, void *opaque)
 {
+    VideoProbeStats *stats = opaque;
     ULONGLONG now_ms = viewer_now_ms();
-    ULONGLONG gap_ms = video_last_handoff_ms ? now_ms - video_last_handoff_ms : 0;
+    ULONGLONG gap_ms;
     (void)identity;
     (void)buffer;
-    (void)opaque;
 
-    video_handoff_count++;
-    if (latency_debug() &&
-        (video_handoff_count <= 20 || (video_handoff_count % 120) == 0 ||
-         gap_ms > 50)) {
-        log_line("latency-video-handoff frames=%u gap_ms=%I64u codec=%s latency_ms=%d drop_on_latency=%d",
-                 video_handoff_count, (unsigned long long)gap_ms,
-                 video_codec ? video_codec : "h264", video_latency,
-                 video_drop_on_latency ? 1 : 0);
+    if (!stats) {
+        return;
     }
-    video_last_handoff_ms = now_ms;
+
+    gap_ms = stats->last_ms ? now_ms - stats->last_ms : 0;
+    stats->count++;
+    if (stats->count <= 20 ||
+        (stats->sample_every > 0 && (stats->count % stats->sample_every) == 0) ||
+        gap_ms > 50) {
+        log_line("latency-video-%s-handoff %s=%u gap_ms=%I64u codec=%s latency_ms=%d drop_on_latency=%d",
+                 stats->name, stats->unit, stats->count,
+                 (unsigned long long)gap_ms, video_codec ? video_codec : "h264",
+                 video_latency, video_drop_on_latency ? 1 : 0);
+    }
+    stats->last_ms = now_ms;
 }
 
 static void channel_event(void *channel, gint event, void *opaque)
@@ -1539,6 +1555,14 @@ static bool start_gst_receiver(void)
     char desc[4096];
     void *error = NULL;
     bool use_h265 = !strcmp(video_codec, "h265") || !strcmp(video_codec, "hevc");
+    bool enable_video_debug = video_debug();
+    const char *rtp_probe =
+        enable_video_debug ? "! identity name=rtpprobe signal-handoffs=true silent=true " : "";
+    const char *decode_probe =
+        enable_video_debug ? "! identity name=decodeprobe signal-handoffs=true silent=true " : "";
+    const char *video_sink =
+        "! d3d11videosink name=vsink sync=false async=false qos=false "
+        "max-lateness=0 enable-last-sample=false";
     ULONGLONG t_stage;
 
     t_stage = viewer_now_ms();
@@ -1560,19 +1584,25 @@ static bool start_gst_receiver(void)
                  "udpsrc port=%d buffer-size=4194304 "
                  "caps=\"application/x-rtp, media=(string)video, clock-rate=(int)90000, encoding-name=(string)H265, payload=(int)96, ssrc=(uint)2222\" "
                  "! rtpjitterbuffer latency=%d drop-on-latency=%s do-lost=true faststart-min-packets=1 max-dropout-time=200 max-misorder-time=50 "
+                 "%s"
                  "! rtph265depay ! h265parse ! d3d11h265dec "
-                 "! identity name=vidprobe signal-handoffs=true silent=true "
-                 "! d3d11videosink name=vsink sync=false",
-                 video_port, video_latency, video_drop_on_latency ? "true" : "false");
+                 "%s"
+                 "%s",
+                 video_port, video_latency,
+                 video_drop_on_latency ? "true" : "false",
+                 rtp_probe, decode_probe, video_sink);
     } else {
         snprintf(desc, sizeof(desc),
                  "udpsrc port=%d buffer-size=4194304 "
                  "caps=\"application/x-rtp, media=(string)video, clock-rate=(int)90000, encoding-name=(string)H264, payload=(int)96, ssrc=(uint)2222\" "
                  "! rtpjitterbuffer latency=%d drop-on-latency=%s do-lost=true faststart-min-packets=1 max-dropout-time=200 max-misorder-time=50 "
+                 "%s"
                  "! rtph264depay ! h264parse ! d3d11h264dec "
-                 "! identity name=vidprobe signal-handoffs=true silent=true "
-                 "! d3d11videosink name=vsink sync=false",
-                 video_port, video_latency, video_drop_on_latency ? "true" : "false");
+                 "%s"
+                 "%s",
+                 video_port, video_latency,
+                 video_drop_on_latency ? "true" : "false",
+                 rtp_probe, decode_probe, video_sink);
     }
 
     t_stage = viewer_now_ms();
@@ -1592,17 +1622,27 @@ static bool start_gst_receiver(void)
                     "GVT SPICE Viewer", MB_ICONERROR);
         return false;
     }
-    gst_probe = p_gst_bin_get_by_name(gst_pipeline, "vidprobe");
-    video_last_handoff_ms = 0;
-    video_handoff_count = 0;
-    if (gst_probe && p_g_signal_connect_data) {
-        p_g_signal_connect_data(gst_probe, "handoff",
-                                (GCallback)video_handoff_cb,
-                                NULL, NULL, 0);
-        log_line("latency-video-probe connected");
+    if (enable_video_debug) {
+        gst_rtp_probe = p_gst_bin_get_by_name(gst_pipeline, "rtpprobe");
+        gst_decode_probe = p_gst_bin_get_by_name(gst_pipeline, "decodeprobe");
+        video_rtp_probe_stats.last_ms = 0;
+        video_rtp_probe_stats.count = 0;
+        video_decode_probe_stats.last_ms = 0;
+        video_decode_probe_stats.count = 0;
+        if (gst_rtp_probe && p_g_signal_connect_data) {
+            p_g_signal_connect_data(gst_rtp_probe, "handoff",
+                                    (GCallback)video_handoff_cb,
+                                    &video_rtp_probe_stats, NULL, 0);
+        }
+        if (gst_decode_probe && p_g_signal_connect_data) {
+            p_g_signal_connect_data(gst_decode_probe, "handoff",
+                                    (GCallback)video_handoff_cb,
+                                    &video_decode_probe_stats, NULL, 0);
+        }
+        log_line("latency-video-probes rtp=%p decode=%p signal=%p",
+                 gst_rtp_probe, gst_decode_probe, p_g_signal_connect_data);
     } else {
-        log_line("latency-video-probe unavailable probe=%p signal=%p",
-                 gst_probe, p_g_signal_connect_data);
+        log_line("latency-video-probes disabled");
     }
     p_gst_video_overlay_set_window_handle(gst_sink, (uintptr_t)video_hwnd);
     log_line("gst set window=%p", video_hwnd);
@@ -1851,6 +1891,10 @@ static void start_media_stack(HWND hwnd)
 
     log_line("media-stack begin");
     t_stage = viewer_now_ms();
+    load_spice_runtime();
+    log_line("media-stack load-spice-runtime dt=%I64ums",
+             (unsigned long long)(viewer_now_ms() - t_stage));
+    t_stage = viewer_now_ms();
     set_gst_environment();
     log_line("media-stack set-gst-env dt=%I64ums",
              (unsigned long long)(viewer_now_ms() - t_stage));
@@ -2077,9 +2121,13 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
                 p_gst_object_unref(gst_sink);
                 gst_sink = NULL;
             }
-            if (gst_probe) {
-                p_gst_object_unref(gst_probe);
-                gst_probe = NULL;
+            if (gst_rtp_probe) {
+                p_gst_object_unref(gst_rtp_probe);
+                gst_rtp_probe = NULL;
+            }
+            if (gst_decode_probe) {
+                p_gst_object_unref(gst_decode_probe);
+                gst_decode_probe = NULL;
             }
             p_gst_object_unref(gst_pipeline);
             gst_pipeline = NULL;
