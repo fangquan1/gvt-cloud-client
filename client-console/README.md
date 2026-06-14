@@ -17,6 +17,17 @@ the console and exposes `/launch-viewer`, which starts the existing
 `direct-stream/client/gvt_spice_viewer.exe` with the selected desktop ports and
 resolution.
 
+For a no-install folder build:
+
+```powershell
+npm run portable
+```
+
+The portable output is written to `../build/gvt-cloud-client-portable/`. Launch
+it with `GVT Cloud Client.exe`. `Open Web Console.bat` remains as an optional
+management-console fallback, but ordinary users should not need it. Source
+control keeps the packaging recipe, not the generated runtime binaries.
+
 The first screen also supports direct connection, closer to SPICE/VNC habits:
 enter `host:port` such as `192.168.0.188:5004` and click Connect. The client
 remembers recent addresses in `localStorage`. For the current RTP transport the

@@ -9,8 +9,11 @@ import { fileURLToPath } from "node:url";
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const consoleRoot = path.resolve(scriptDir, "..");
 const distRoot = path.join(consoleRoot, "dist");
+const portableRoot = path.resolve(consoleRoot, "..");
 const workspaceRoot = path.resolve(consoleRoot, "..", "..", "..");
-const viewerExe = process.env.GVT_VIEWER_EXE || path.join(workspaceRoot, "direct-stream", "client", "gvt_spice_viewer.exe");
+const portableViewerExe = path.join(consoleRoot, "viewer", "gvt_spice_viewer.exe");
+const workspaceViewerExe = path.join(workspaceRoot, "direct-stream", "client", "gvt_spice_viewer.exe");
+const viewerExe = process.env.GVT_VIEWER_EXE || (existsSync(portableViewerExe) ? portableViewerExe : workspaceViewerExe);
 const port = Number(process.env.GVT_CONSOLE_PORT || 5177);
 const host = process.env.GVT_CONSOLE_HOST || "127.0.0.1";
 
@@ -28,6 +31,8 @@ const allowedArgs = new Map([
   ["--spice-host", true],
   ["--video-codec", true],
   ["--spice-port", true],
+  ["--spice-runtime", true],
+  ["--gst-root", true],
   ["--input-host", true],
   ["--input-port", true],
   ["--source-width", true],
@@ -105,6 +110,22 @@ function normalizeSpiceInstallPayload(payload) {
 function argValue(args, flag) {
   const index = args.indexOf(flag);
   return index >= 0 ? args[index + 1] : "";
+}
+
+function addArgIfMissing(args, flag, value) {
+  if (!args.includes(flag) && value && existsSync(value)) {
+    args.push(flag, value);
+  }
+}
+
+function appendPortableRuntimeArgs(args) {
+  const gstRoot = process.env.GVT_GST_ROOT ||
+    path.join(portableRoot, "tools", "gstreamer-1.0-mingw-x86_64-1.18.6", "gstreamer", "1.0", "mingw_x86_64");
+  const spiceRuntime = process.env.GVT_SPICE_RUNTIME ||
+    path.join(portableRoot, "runtime", "virtviewer", "bin");
+  addArgIfMissing(args, "--gst-root", gstRoot);
+  addArgIfMissing(args, "--spice-runtime", spiceRuntime);
+  return args;
 }
 
 function psSingleQuoted(value) {
@@ -209,6 +230,7 @@ async function launchViewer(request, response) {
     const args = viewerKind === "spice-install"
       ? normalizeSpiceInstallPayload(payload)
       : normalizeArgs(payload.args);
+    appendPortableRuntimeArgs(args);
     await closeStaleViewers(exe, args);
     const child = spawn(exe, args, {
       cwd: path.dirname(exe),
