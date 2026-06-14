@@ -155,6 +155,7 @@ static bool native_input_lock_ready;
 static SOCKET native_input_sock = INVALID_SOCKET;
 static SOCKET stream_control_sock = INVALID_SOCKET;
 static bool winsock_ready;
+static ULONGLONG log_start_ms;
 
 static char *dup_app_dir(void);
 static void set_gst_environment(void);
@@ -181,10 +182,19 @@ typedef struct InputEv {
     guint scancode;
 } InputEv;
 
+static ULONGLONG viewer_now_ms(void)
+{
+    return (ULONGLONG)GetTickCount();
+}
+
 static void log_line(const char *fmt, ...)
 {
     va_list ap;
+    ULONGLONG now_ms = viewer_now_ms();
 
+    if (!log_start_ms) {
+        log_start_ms = now_ms;
+    }
     if (!log_fp) {
         char *app_dir = dup_app_dir();
         char path[MAX_PATH * 2];
@@ -195,6 +205,7 @@ static void log_line(const char *fmt, ...)
     if (!log_fp) {
         return;
     }
+    fprintf(log_fp, "+%I64ums ", (unsigned long long)(now_ms - log_start_ms));
     va_start(ap, fmt);
     vfprintf(log_fp, fmt, ap);
     va_end(ap);
@@ -474,22 +485,35 @@ static bool stream_control_start_session(void)
     int one = 1;
     DWORD timeout_ms = 1500;
     DWORD no_timeout = 0;
+    ULONGLONG t0 = viewer_now_ms();
+    ULONGLONG t_stage;
 
+    log_line("stream-control begin host=%s port=%d",
+             host ? host : "", stream_control_port);
     if (!stream_control_enabled || !host || !*host || stream_control_port <= 0) {
+        log_line("stream-control skipped enabled=%d host=%s port=%d",
+                 stream_control_enabled, host ? host : "", stream_control_port);
         return false;
     }
 
+    t_stage = viewer_now_ms();
     ensure_winsock();
+    log_line("stream-control winsock ready=%d dt=%I64ums",
+             winsock_ready,
+             (unsigned long long)(viewer_now_ms() - t_stage));
     if (!winsock_ready) {
         log_line("stream-control disabled: WSAStartup failed");
         return false;
     }
 
+    t_stage = viewer_now_ms();
     stream_control_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (stream_control_sock == INVALID_SOCKET) {
         log_line("stream-control socket failed: %d", WSAGetLastError());
         return false;
     }
+    log_line("stream-control socket-created dt=%I64ums",
+             (unsigned long long)(viewer_now_ms() - t_stage));
 
     setsockopt(stream_control_sock, IPPROTO_TCP, TCP_NODELAY,
                (const char *)&one, sizeof(one));
@@ -499,6 +523,7 @@ static bool stream_control_start_session(void)
     addr.sin_family = AF_INET;
     addr.sin_port = htons((u_short)stream_control_port);
     addr.sin_addr.s_addr = inet_addr(host);
+    t_stage = viewer_now_ms();
     if (addr.sin_addr.s_addr == INADDR_NONE ||
         connect(stream_control_sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         log_line("stream-control connect %s:%d failed: %d",
@@ -506,26 +531,38 @@ static bool stream_control_start_session(void)
         stream_control_close();
         return false;
     }
+    log_line("stream-control connect-ok dt=%I64ums",
+             (unsigned long long)(viewer_now_ms() - t_stage));
 
     snprintf(hello, sizeof(hello),
              "{\"type\":\"start\",\"video_port\":%d,\"codec\":\"%s\"}\n",
              video_port, video_codec ? video_codec : "h265");
+    t_stage = viewer_now_ms();
     if (send(stream_control_sock, hello, (int)strlen(hello), 0) <= 0) {
         log_line("stream-control hello send failed: %d", WSAGetLastError());
         stream_control_close();
         return false;
     }
+    log_line("stream-control hello-sent dt=%I64ums bytes=%u",
+             (unsigned long long)(viewer_now_ms() - t_stage),
+             (unsigned)strlen(hello));
     log_line("stream-control connected %s:%d video_port=%d codec=%s",
              host, stream_control_port, video_port,
              video_codec ? video_codec : "h265");
 
+    t_stage = viewer_now_ms();
     if (stream_control_read_line(status, sizeof(status))) {
+        log_line("stream-control status-read dt=%I64ums",
+                 (unsigned long long)(viewer_now_ms() - t_stage));
         stream_control_apply_status(status);
     } else {
-        log_line("stream-control did not return port status, using local ports");
+        log_line("stream-control did not return port status after %I64ums, using local ports",
+                 (unsigned long long)(viewer_now_ms() - t_stage));
     }
     setsockopt(stream_control_sock, SOL_SOCKET, SO_RCVTIMEO,
                (const char *)&no_timeout, sizeof(no_timeout));
+    log_line("stream-control ready total=%I64ums",
+             (unsigned long long)(viewer_now_ms() - t0));
     return true;
 }
 
@@ -968,7 +1005,7 @@ static void playback_data_cb(void *channel, gpointer audio, gint size,
     chunks++;
     bytes += size > 0 ? (unsigned int)size : 0;
     if (audio_debug() && (chunks <= 5 || (chunks % 200) == 0)) {
-        log_line("SPICE playback-data chunks=%u bytes=%llu last=%d",
+        log_line("SPICE playback-data chunks=%u bytes=%I64u last=%d",
                  chunks, bytes, size);
     }
 }
@@ -1475,27 +1512,52 @@ static void resize_window_to_source(HWND hwnd)
 
 static void start_media_stack(HWND hwnd)
 {
+    ULONGLONG t0 = viewer_now_ms();
+    ULONGLONG t_stage;
+
     if (InterlockedExchange(&media_started, 1) != 0) {
+        log_line("media-stack already started");
         return;
     }
 
+    log_line("media-stack begin");
+    t_stage = viewer_now_ms();
     set_gst_environment();
+    log_line("media-stack set-gst-env dt=%I64ums",
+             (unsigned long long)(viewer_now_ms() - t_stage));
+    t_stage = viewer_now_ms();
     load_spice_runtime();
+    log_line("media-stack load-spice-runtime dt=%I64ums",
+             (unsigned long long)(viewer_now_ms() - t_stage));
+    t_stage = viewer_now_ms();
     load_gst_runtime();
+    log_line("media-stack load-gst-runtime dt=%I64ums",
+             (unsigned long long)(viewer_now_ms() - t_stage));
     log_line("gst_init pre-audio");
+    t_stage = viewer_now_ms();
     p_gst_init(NULL, NULL);
+    log_line("media-stack gst-init dt=%I64ums",
+             (unsigned long long)(viewer_now_ms() - t_stage));
     CreateThread(NULL, 0, spice_thread, NULL, 0, NULL);
+    t_stage = viewer_now_ms();
     start_gst_receiver();
+    log_line("media-stack start-gst-receiver dt=%I64ums",
+             (unsigned long long)(viewer_now_ms() - t_stage));
     SetWindowTextA(hwnd, "GVT SPICE Viewer - video embedded, waiting for inputs");
     if (auto_size_on_start) {
         PostMessageA(hwnd, WM_COMMAND, ID_AUTO_SIZE, 0);
     }
+    log_line("media-stack ready total=%I64ums",
+             (unsigned long long)(viewer_now_ms() - t0));
 }
 
 static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
     switch (msg) {
     case WM_CREATE:
+    {
+        ULONGLONG t0 = viewer_now_ms();
+
         main_hwnd = hwnd;
         log_line("WM_CREATE");
         if (!input_lock_ready) {
@@ -1521,11 +1583,15 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
         layout_children(hwnd);
         SetWindowTextA(hwnd, "GVT SPICE Viewer - connecting");
         CreateThread(NULL, 0, stream_control_thread, NULL, 0, NULL);
+        log_line("WM_CREATE ready dt=%I64ums",
+                 (unsigned long long)(viewer_now_ms() - t0));
         if (!stream_control_enabled) {
             PostMessageA(hwnd, WM_STREAM_READY, 0, 0);
         }
         return 0;
+    }
     case WM_STREAM_READY:
+        log_line("WM_STREAM_READY connected=%d", (int)wparam);
         start_media_stack(hwnd);
         return 0;
     case WM_SIZE:
@@ -1802,3 +1868,4 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
     }
     return (int)msg.wParam;
 }
+
