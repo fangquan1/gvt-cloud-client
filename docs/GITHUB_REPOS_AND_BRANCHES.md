@@ -74,7 +74,7 @@
 
 ## 需要提交到客户端仓库的当前资料
 
-- `ui-test/` 原型。
+- 原生 Win32 launcher 和 `gvt_spice_viewer.c`。旧 `ui-test` Web 原型已废弃并删除。
 - `direct-stream/client/gvt_spice_viewer.c`。
 - `direct-stream/client/gvt_control_overlay.py`。
 - `direct-stream/client/spice_glib_probe.c`。
