@@ -61,6 +61,19 @@ static void history_path(wchar_t *out, size_t out_count)
     path_join(out, out_count, app_dir, L"gvt_client_history.txt");
 }
 
+static void debug_log(const wchar_t *text)
+{
+    wchar_t path[MAX_PATH];
+    FILE *fp;
+    path_join(path, MAX_PATH, app_dir, L"gvt_client_debug.log");
+    fp = _wfopen(path, L"at, ccs=UTF-8");
+    if (!fp) {
+        return;
+    }
+    fwprintf(fp, L"%s\n", text);
+    fclose(fp);
+}
+
 static void load_history(void)
 {
     wchar_t path[MAX_PATH];
@@ -193,7 +206,10 @@ static void find_viewer(wchar_t *viewer, size_t viewer_count)
 
 static void quote_append(wchar_t *cmd, size_t cmd_count, const wchar_t *value)
 {
-    wcsncat(cmd, L" \"", cmd_count - wcslen(cmd) - 1);
+    if (cmd[0]) {
+        wcsncat(cmd, L" ", cmd_count - wcslen(cmd) - 1);
+    }
+    wcsncat(cmd, L"\"", cmd_count - wcslen(cmd) - 1);
     for (const wchar_t *p = value; *p && wcslen(cmd) + 3 < cmd_count; p++) {
         if (*p == L'"') {
             wcsncat(cmd, L"\\\"", cmd_count - wcslen(cmd) - 1);
@@ -210,6 +226,25 @@ static void append_flag_value(wchar_t *cmd, size_t cmd_count, const wchar_t *fla
     wcsncat(cmd, L" ", cmd_count - wcslen(cmd) - 1);
     wcsncat(cmd, flag, cmd_count - wcslen(cmd) - 1);
     quote_append(cmd, cmd_count, value);
+}
+
+static void show_last_error(const wchar_t *title, const wchar_t *context)
+{
+    DWORD err = GetLastError();
+    wchar_t *message = NULL;
+    wchar_t text[2048];
+
+    FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER |
+                   FORMAT_MESSAGE_FROM_SYSTEM |
+                   FORMAT_MESSAGE_IGNORE_INSERTS,
+                   NULL, err, 0, (LPWSTR)&message, 0, NULL);
+    _snwprintf(text, 2048, L"%s\n\nWindows error %lu: %s",
+               context, err, message ? message : L"unknown error");
+    text[2047] = 0;
+    MessageBoxW(NULL, text, title, MB_ICONERROR);
+    if (message) {
+        LocalFree(message);
+    }
 }
 
 static void append_flag_int(wchar_t *cmd, size_t cmd_count, const wchar_t *flag, int value)
@@ -297,8 +332,10 @@ static void connect_now(void)
     append_portable_runtime_args(cmd, 8192);
 
     si.cb = sizeof(si);
-    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, app_dir, &si, &pi)) {
-        MessageBoxW(NULL, L"Failed to start the desktop viewer.", L"GVT Cloud Client", MB_ICONERROR);
+    debug_log(cmd);
+    if (!CreateProcessW(viewer, cmd, NULL, NULL, FALSE, 0, NULL, app_dir, &si, &pi)) {
+        show_last_error(L"GVT Cloud Client",
+                        L"Failed to start the desktop viewer.");
         return;
     }
     CloseHandle(pi.hThread);
