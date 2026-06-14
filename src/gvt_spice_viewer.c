@@ -127,6 +127,7 @@ static int source_width = 1920;
 static int source_height = 1200;
 static bool auto_size_on_start = true;
 static bool spice_display_mode = false;
+static bool gst_warmup_mode = false;
 static void *display_mode_session;
 
 static HWND main_hwnd;
@@ -1235,6 +1236,7 @@ static void set_gst_environment(void)
     char root[MAX_PATH * 2];
     char bin[MAX_PATH * 2];
     char plugins[MAX_PATH * 2];
+    char cache_dir[MAX_PATH * 2];
     char registry[MAX_PATH * 2];
     char old_path[32768];
     char new_path[32768];
@@ -1252,7 +1254,10 @@ static void set_gst_environment(void)
     }
     snprintf(bin, sizeof(bin), "%s\\bin", gst_root);
     snprintf(plugins, sizeof(plugins), "%s\\lib\\gstreamer-1.0", gst_root);
-    snprintf(registry, sizeof(registry), "%s\\..\\..\\..\\gst-registry-gvt-spice-viewer.bin", gst_root);
+    snprintf(cache_dir, sizeof(cache_dir), "%s\\..\\..\\cache", app_dir);
+    CreateDirectoryA(cache_dir, NULL);
+    snprintf(registry, sizeof(registry),
+             "%s\\gst-registry-gvt-spice-viewer.bin", cache_dir);
 
     GetEnvironmentVariableA("PATH", old_path, sizeof(old_path));
     snprintf(new_path, sizeof(new_path), "%s;%s", bin, old_path);
@@ -1260,6 +1265,7 @@ static void set_gst_environment(void)
     SetEnvironmentVariableA("GST_PLUGIN_PATH", plugins);
     SetEnvironmentVariableA("GST_PLUGIN_SYSTEM_PATH_1_0", plugins);
     SetEnvironmentVariableA("GST_REGISTRY", registry);
+    log_line("GStreamer registry %s", registry);
     if (!env_is_set("SPICE_GST_AUDIOSINK")) {
         snprintf(audio_sink, sizeof(audio_sink),
             "appsrc is-live=1 do-timestamp=0 format=time "
@@ -1339,6 +1345,29 @@ static bool start_gst_receiver(void)
     log_line("gst receiver set-playing dt=%I64ums",
              (unsigned long long)(viewer_now_ms() - t_stage));
     return true;
+}
+
+static int run_gst_warmup(void)
+{
+    ULONGLONG t0 = viewer_now_ms();
+    ULONGLONG t_stage;
+
+    log_line("gst warmup begin");
+    t_stage = viewer_now_ms();
+    set_gst_environment();
+    log_line("gst warmup set-env dt=%I64ums",
+             (unsigned long long)(viewer_now_ms() - t_stage));
+    t_stage = viewer_now_ms();
+    load_gst_runtime();
+    log_line("gst warmup load-runtime dt=%I64ums",
+             (unsigned long long)(viewer_now_ms() - t_stage));
+    t_stage = viewer_now_ms();
+    p_gst_init(NULL, NULL);
+    log_line("gst warmup gst-init dt=%I64ums",
+             (unsigned long long)(viewer_now_ms() - t_stage));
+    log_line("gst warmup done total=%I64ums",
+             (unsigned long long)(viewer_now_ms() - t0));
+    return 0;
 }
 
 static void send_position_from_lparam_priority(LPARAM lparam, gint priority,
@@ -1838,6 +1867,8 @@ static void parse_args(int argc, char **argv)
             auto_size_on_start = true;
         } else if (!strcmp(argv[i], "--spice-display")) {
             spice_display_mode = true;
+        } else if (!strcmp(argv[i], "--gst-warmup")) {
+            gst_warmup_mode = true;
         }
     }
 }
@@ -1858,6 +1889,9 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
         WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, argv[i], len, NULL, NULL);
     }
     parse_args(argc, argv);
+    if (gst_warmup_mode) {
+        return run_gst_warmup();
+    }
     if (spice_display_mode) {
         return run_spice_display_mode(argc, argv);
     }

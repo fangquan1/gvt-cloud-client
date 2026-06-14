@@ -65,6 +65,22 @@ copyIfExists(spiceRuntime, path.join(outRoot, "runtime", "virtviewer", "bin"));
 
 rmSync(path.join(outRoot, "app", "dist", "test"), { recursive: true, force: true });
 
+const portableViewer = path.join(outRoot, "app", "viewer", "gvt_spice_viewer.exe");
+const portableGstRoot = path.join(outRoot, "tools", "gstreamer-1.0-mingw-x86_64-1.18.6", "gstreamer", "1.0", "mingw_x86_64");
+if (existsSync(portableViewer) && existsSync(portableGstRoot) && process.env.GVT_SKIP_GST_WARMUP !== "1") {
+  console.log("Prewarming GStreamer registry...");
+  const warmup = spawnSync(portableViewer, ["--gst-warmup", "--gst-root", portableGstRoot], {
+    cwd: path.dirname(portableViewer),
+    stdio: "inherit",
+    windowsHide: true
+  });
+  if (warmup.error) {
+    console.warn(`GStreamer warmup failed to launch: ${warmup.error.message}`);
+  } else if (warmup.status !== 0) {
+    console.warn(`GStreamer warmup exited with status ${warmup.status}`);
+  }
+}
+
 const bat = String.raw`@echo off
 setlocal
 cd /d "%~dp0"
@@ -96,7 +112,7 @@ The first screen accepts a server address like:
 
 Current port convention:
   5004 video, 5900 SPICE audio/session, 5905 native input
-  5006 video, 5901 SPICE audio/session, 5906 native input
+  5008 video, 5901 SPICE audio/session, 5906 native input
 
 This portable folder contains the web console, local launcher, node runtime
 when available, gvt_spice_viewer.exe when available at packaging time, and the

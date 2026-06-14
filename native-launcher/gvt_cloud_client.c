@@ -268,6 +268,34 @@ static void append_portable_runtime_args(wchar_t *cmd, size_t cmd_count)
     }
 }
 
+static void start_gst_warmup(void)
+{
+    wchar_t viewer[MAX_PATH];
+    wchar_t cmd[4096] = L"";
+    STARTUPINFOW si = {0};
+    PROCESS_INFORMATION pi = {0};
+
+    find_viewer(viewer, MAX_PATH);
+    if (!viewer[0]) {
+        return;
+    }
+
+    quote_append(cmd, 4096, viewer);
+    wcsncat(cmd, L" --gst-warmup", 4096 - wcslen(cmd) - 1);
+    append_portable_runtime_args(cmd, 4096);
+
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    debug_log(L"starting GStreamer warmup");
+    debug_log(cmd);
+    if (CreateProcessW(viewer, cmd, NULL, NULL, FALSE,
+                       CREATE_NO_WINDOW, NULL, app_dir, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+}
+
 static void connect_now(void)
 {
     wchar_t endpoint[256];
@@ -400,6 +428,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         height_edit = make_edit(hwnd, IDC_HEIGHT, L"1200", 358, 192, 82, 26);
 
         status_label = make_label(hwnd, L"Ready.", 24, 248, 500, 28);
+        start_gst_warmup();
         return 0;
     }
     case WM_COMMAND:
