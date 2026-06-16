@@ -148,6 +148,8 @@ static CRITICAL_SECTION native_input_lock;
 static bool native_input_lock_ready;
 static SOCKET native_input_sock = INVALID_SOCKET;
 static bool winsock_ready;
+static volatile LONG video_probe_counts[4];
+static HANDLE video_probe_thread;
 
 static char *dup_app_dir(void);
 static void set_gst_environment(void);
@@ -213,6 +215,95 @@ static bool env_is_set(const char *name)
 static bool audio_debug(void)
 {
     return env_is_set("GVT_SPICE_VIEWER_AUDIO_DEBUG");
+}
+
+static bool video_debug(void)
+{
+    return env_is_set("GVT_SPICE_VIEWER_VIDEO_DEBUG");
+}
+
+static const char *video_probe_name(int index)
+{
+    static const char *names[] = {
+        "jitter_out",
+        "depay_out",
+        "parse_out",
+        "decode_out",
+    };
+
+    if (index < 0 || index >= (int)(sizeof(names) / sizeof(names[0]))) {
+        return "?";
+    }
+    return names[index];
+}
+
+static void video_probe_handoff(void *identity, void *buffer, gpointer data)
+{
+    intptr_t index = (intptr_t)data;
+
+    (void)identity;
+    (void)buffer;
+    if (index >= 0 && index < 4) {
+        InterlockedIncrement(&video_probe_counts[index]);
+    }
+}
+
+static DWORD WINAPI video_probe_report_thread(void *arg)
+{
+    LONG last[4] = { 0 };
+
+    (void)arg;
+    while (!InterlockedCompareExchange(&shutting_down, 0, 0)) {
+        Sleep(1000);
+        if (!gst_pipeline) {
+            break;
+        }
+        LONG cur[4];
+        for (int i = 0; i < 4; i++) {
+            cur[i] = InterlockedCompareExchange(&video_probe_counts[i], 0, 0);
+        }
+        log_line("video-probe fps %s=%ld %s=%ld %s=%ld %s=%ld",
+                 video_probe_name(0), cur[0] - last[0],
+                 video_probe_name(1), cur[1] - last[1],
+                 video_probe_name(2), cur[2] - last[2],
+                 video_probe_name(3), cur[3] - last[3]);
+        memcpy(last, cur, sizeof(last));
+    }
+    return 0;
+}
+
+static void connect_video_probe(const char *element_name, int index)
+{
+    void *element;
+
+    element = p_gst_bin_get_by_name(gst_pipeline, element_name);
+    if (!element) {
+        log_line("video-probe missing element %s", element_name);
+        return;
+    }
+    p_g_signal_connect_data(element, "handoff",
+                            (GCallback)video_probe_handoff,
+                            (gpointer)(intptr_t)index, NULL, 0);
+    p_gst_object_unref(element);
+}
+
+static void start_video_probes(void)
+{
+    DWORD tid;
+
+    if (!video_debug()) {
+        return;
+    }
+    connect_video_probe("probe_jitter", 0);
+    connect_video_probe("probe_depay", 1);
+    connect_video_probe("probe_parse", 2);
+    connect_video_probe("probe_decode", 3);
+    log_line("video-probe enabled latency=%d drop_on_latency=%d codec=%s",
+             video_latency, video_drop_on_latency ? 1 : 0, video_codec);
+    if (!video_probe_thread) {
+        video_probe_thread = CreateThread(NULL, 0, video_probe_report_thread,
+                                          NULL, 0, &tid);
+    }
 }
 
 static bool input_transport_ready(void)
@@ -1018,9 +1109,18 @@ static void set_gst_environment(void)
 
 static bool start_gst_receiver(void)
 {
-    char desc[4096];
+    char desc[8192];
     void *error = NULL;
     bool use_h265 = !strcmp(video_codec, "h265") || !strcmp(video_codec, "hevc");
+    bool vdebug = video_debug();
+    const char *probe_jitter =
+        vdebug ? "! identity name=probe_jitter silent=true signal-handoffs=true " : "";
+    const char *probe_depay =
+        vdebug ? "! identity name=probe_depay silent=true signal-handoffs=true " : "";
+    const char *probe_parse =
+        vdebug ? "! identity name=probe_parse silent=true signal-handoffs=true " : "";
+    const char *probe_decode =
+        vdebug ? "! identity name=probe_decode silent=true signal-handoffs=true " : "";
 
     set_gst_environment();
     load_gst_runtime();
@@ -1032,17 +1132,24 @@ static bool start_gst_receiver(void)
                  "udpsrc port=%d buffer-size=4194304 "
                  "caps=\"application/x-rtp, media=(string)video, clock-rate=(int)90000, encoding-name=(string)H265, payload=(int)96, ssrc=(uint)2222\" "
                  "! rtpjitterbuffer latency=%d drop-on-latency=%s do-lost=true faststart-min-packets=1 max-dropout-time=200 max-misorder-time=50 "
-                 "! rtph265depay ! h265parse ! d3d11h265dec "
+                 "%s! rtph265depay %s! h265parse %s! d3d11h265dec %s"
                  "! d3d11videosink name=vsink sync=false",
-                 video_port, video_latency, video_drop_on_latency ? "true" : "false");
+                 video_port, video_latency,
+                 video_drop_on_latency ? "true" : "false",
+                 probe_jitter, probe_depay, probe_parse, probe_decode);
     } else {
         snprintf(desc, sizeof(desc),
                  "udpsrc port=%d buffer-size=4194304 "
                  "caps=\"application/x-rtp, media=(string)video, clock-rate=(int)90000, encoding-name=(string)H264, payload=(int)96, ssrc=(uint)2222\" "
                  "! rtpjitterbuffer latency=%d drop-on-latency=%s do-lost=true faststart-min-packets=1 max-dropout-time=200 max-misorder-time=50 "
-                 "! rtph264depay ! h264parse ! d3d11h264dec "
+                 "%s! rtph264depay %s! h264parse %s! d3d11h264dec %s"
                  "! d3d11videosink name=vsink sync=false",
-                 video_port, video_latency, video_drop_on_latency ? "true" : "false");
+                 video_port, video_latency,
+                 video_drop_on_latency ? "true" : "false",
+                 probe_jitter, probe_depay, probe_parse, probe_decode);
+    }
+    if (vdebug) {
+        log_line("video pipeline: %s", desc);
     }
 
     gst_pipeline = p_gst_parse_launch(desc, &error);
@@ -1059,6 +1166,7 @@ static bool start_gst_receiver(void)
                     "GVT SPICE Viewer", MB_ICONERROR);
         return false;
     }
+    start_video_probes();
     p_gst_video_overlay_set_window_handle(gst_sink, (uintptr_t)video_hwnd);
     log_line("gst set window=%p", video_hwnd);
     log_line("gst set playing ret=%d", p_gst_element_set_state(gst_pipeline, 4));
@@ -1459,6 +1567,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
                 p_gst_object_unref(gst_sink);
             }
             p_gst_object_unref(gst_pipeline);
+            gst_pipeline = NULL;
         }
         PostQuitMessage(0);
         return 0;
