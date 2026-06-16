@@ -115,7 +115,7 @@ static const char *native_input_host = "192.168.0.188";
 static int native_input_port = 5905;
 static bool native_input_enabled = true;
 static int video_port = 5004;
-static int video_latency = 15;
+static int video_latency = 0;
 static bool video_drop_on_latency = false;
 static const char *video_codec = "h264";
 static int source_width = 1920;
@@ -215,6 +215,37 @@ static bool env_is_set(const char *name)
 static bool audio_debug(void)
 {
     return env_is_set("GVT_SPICE_VIEWER_AUDIO_DEBUG");
+}
+
+static int getenv_int_clamped(const char *name, int defval, int minval, int maxval)
+{
+    char buf[64];
+    char *end = NULL;
+    DWORD len;
+    long parsed;
+
+    len = GetEnvironmentVariableA(name, buf, sizeof(buf));
+    if (len == 0 || len >= sizeof(buf)) {
+        return defval;
+    }
+
+    parsed = strtol(buf, &end, 10);
+    if (end == buf) {
+        return defval;
+    }
+    if (parsed < minval) {
+        return minval;
+    }
+    if (parsed > maxval) {
+        return maxval;
+    }
+    return (int)parsed;
+}
+
+static int video_udp_buffer_size(void)
+{
+    return getenv_int_clamped("GVT_SPICE_VIEWER_UDP_BUFFER_SIZE",
+                              524288, 65536, 16777216);
 }
 
 static bool video_debug(void)
@@ -1121,6 +1152,7 @@ static bool start_gst_receiver(void)
         vdebug ? "! identity name=probe_parse silent=true signal-handoffs=true " : "";
     const char *probe_decode =
         vdebug ? "! identity name=probe_decode silent=true signal-handoffs=true " : "";
+    int udp_buffer = video_udp_buffer_size();
 
     set_gst_environment();
     load_gst_runtime();
@@ -1129,22 +1161,22 @@ static bool start_gst_receiver(void)
 
     if (use_h265) {
         snprintf(desc, sizeof(desc),
-                 "udpsrc port=%d buffer-size=4194304 "
+                 "udpsrc port=%d buffer-size=%d "
                  "caps=\"application/x-rtp, media=(string)video, clock-rate=(int)90000, encoding-name=(string)H265, payload=(int)96, ssrc=(uint)2222\" "
                  "! rtpjitterbuffer latency=%d drop-on-latency=%s do-lost=true faststart-min-packets=1 max-dropout-time=200 max-misorder-time=50 "
                  "%s! rtph265depay %s! h265parse %s! d3d11h265dec %s"
                  "! d3d11videosink name=vsink sync=false",
-                 video_port, video_latency,
+                 video_port, udp_buffer, video_latency,
                  video_drop_on_latency ? "true" : "false",
                  probe_jitter, probe_depay, probe_parse, probe_decode);
     } else {
         snprintf(desc, sizeof(desc),
-                 "udpsrc port=%d buffer-size=4194304 "
+                 "udpsrc port=%d buffer-size=%d "
                  "caps=\"application/x-rtp, media=(string)video, clock-rate=(int)90000, encoding-name=(string)H264, payload=(int)96, ssrc=(uint)2222\" "
                  "! rtpjitterbuffer latency=%d drop-on-latency=%s do-lost=true faststart-min-packets=1 max-dropout-time=200 max-misorder-time=50 "
                  "%s! rtph264depay %s! h264parse %s! d3d11h264dec %s"
                  "! d3d11videosink name=vsink sync=false",
-                 video_port, video_latency,
+                 video_port, udp_buffer, video_latency,
                  video_drop_on_latency ? "true" : "false",
                  probe_jitter, probe_depay, probe_parse, probe_decode);
     }
