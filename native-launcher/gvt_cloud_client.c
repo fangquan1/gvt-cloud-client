@@ -268,6 +268,19 @@ static void append_portable_runtime_args(wchar_t *cmd, size_t cmd_count)
     }
 }
 
+static void set_viewer_low_latency_env(void)
+{
+    SetEnvironmentVariableW(L"GVT_SPICE_VIEWER_DROP_COMPLETE_FRAMES", L"1");
+    SetEnvironmentVariableW(L"GVT_SPICE_VIEWER_UDP_BUFFER_SIZE", L"524288");
+    SetEnvironmentVariableW(
+        L"GVT_SPICE_VIEWER_VIDEO_TAIL",
+        L"queue name=post_decode_q leaky=downstream max-size-buffers=1 "
+        L"max-size-time=0 max-size-bytes=0 ! "
+        L"d3d11videosink name=vsink sync=false async=false qos=true "
+        L"max-lateness=0 processing-deadline=0 render-delay=0 "
+        L"enable-last-sample=false");
+}
+
 static void start_gst_warmup(void)
 {
     wchar_t viewer[MAX_PATH];
@@ -363,6 +376,7 @@ static void connect_now(void)
 
     si.cb = sizeof(si);
     debug_log(cmd);
+    set_viewer_low_latency_env();
     if (!CreateProcessW(viewer, cmd, NULL, NULL, FALSE, 0, NULL, app_dir, &si, &pi)) {
         show_last_error(L"GVT Cloud Client",
                         L"Failed to start the desktop viewer.");

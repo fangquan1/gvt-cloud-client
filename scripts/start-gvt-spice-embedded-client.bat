@@ -10,10 +10,14 @@ set "SOURCE_HEIGHT=%GVT_SOURCE_HEIGHT%"
 if "%SOURCE_HEIGHT%"=="" set "SOURCE_HEIGHT=1200"
 set "VIDEO_CODEC=%GVT_VIDEO_CODEC%"
 if "%VIDEO_CODEC%"=="" set "VIDEO_CODEC=h264"
+set "GVT_SPICE_VIEWER_DROP_COMPLETE_FRAMES=1"
+set "GVT_SPICE_VIEWER_UDP_BUFFER_SIZE=%GVT_VIDEO_UDP_BUFFER_SIZE%"
+if "%GVT_SPICE_VIEWER_UDP_BUFFER_SIZE%"=="" set "GVT_SPICE_VIEWER_UDP_BUFFER_SIZE=524288"
+set "GVT_SPICE_VIEWER_VIDEO_TAIL=queue name=post_decode_q leaky=downstream max-size-buffers=1 max-size-time=0 max-size-bytes=0 ! d3d11videosink name=vsink sync=false async=false qos=true max-lateness=0 processing-deadline=0 render-delay=0 enable-last-sample=false"
 
 "%PYEXE%" ".\direct-stream\client\stop_local_direct.py" >nul 2>nul
 "%PYEXE%" ".\direct-stream\start_input_proxy.py" stop >nul 2>nul
-"%PYEXE%" ".\direct-stream\start_gvt_stream_qemu.py" start --restart --port 5004 --fps 60 --bitrate 18000 --video-codec %VIDEO_CODEC% --capture-ms 16 --idle-capture-ms 16 --idle-after-ms 0 --idle-probe-ms 0 --fec 0 --fec-important 0
+"%PYEXE%" ".\direct-stream\start_gvt_stream_qemu.py" start --restart --port 5004 --fps 59 --bitrate 18000 --video-codec %VIDEO_CODEC% --keyint 59 --capture-ms 17 --idle-capture-ms 17 --idle-after-ms 0 --idle-probe-ms 0 --fec 0 --fec-important 0
 if errorlevel 1 (
     set "CLIENT_EXIT=1"
     goto cleanup
