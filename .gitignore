@@ -11,6 +11,7 @@ __pycache__/
 build/
 cache/
 dist/
+test_output/
 tools/*
 !tools/
 !tools/measure-gvt-video-latency.ps1
