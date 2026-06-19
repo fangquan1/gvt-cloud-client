@@ -10,7 +10,9 @@ __pycache__/
 .venv/
 build/
 dist/
-tools/
+tools/*
+!tools/
+!tools/measure-gvt-video-latency.ps1
 runtime/
 secrets/
 *.env

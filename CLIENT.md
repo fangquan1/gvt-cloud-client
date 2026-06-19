@@ -162,6 +162,72 @@ Logs:
 - `gvt_client_debug.log`: launcher log.
 - `app\viewer\gvt_spice_viewer.log`: viewer, GStreamer, SPICE, and control log.
 
+## Video-After-Input Latency Test
+
+`tools\measure-gvt-video-latency.ps1` measures the latency from an input
+trigger to the first visible client-side video change in a selected region. It
+is an end-to-end acceptance number for "input caused a visible video reaction",
+not a pure keyboard/mouse dispatch benchmark.
+
+Before running it:
+
+- Start the portable client and connect to the VM.
+- Keep the viewer window visible and unobstructed.
+- Put the guest in a state where the trigger causes an obvious visual change.
+  A right-click on the Windows desktop is the simplest test because it opens a
+  context menu.
+- Use the same guest resolution passed to the viewer, normally `1920x1200`.
+
+Example, using the native input TCP channel on port `5905`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\measure-gvt-video-latency.ps1 `
+  -WindowProcessName gvt_spice_viewer `
+  -InputHost 192.168.0.188 `
+  -InputPort 5905 `
+  -UseVideoArea `
+  -SourceWidth 1920 `
+  -SourceHeight 1200 `
+  -ToolbarHeight 32 `
+  -OpenAction click `
+  -OpenButton right `
+  -GuestX 16384 `
+  -GuestY 16384 `
+  -Trials 5 `
+  -OutDir build\latency-captures
+```
+
+Useful variants:
+
+```powershell
+# Send a local Windows click into the viewer instead of the TCP input channel.
+powershell -ExecutionPolicy Bypass -File tools\measure-gvt-video-latency.ps1 `
+  -Trigger local -WindowProcessName gvt_spice_viewer -UseVideoArea
+
+# Measure a different region or make detection stricter/looser.
+powershell -ExecutionPolicy Bypass -File tools\measure-gvt-video-latency.ps1 `
+  -GuestX 12000 -GuestY 8000 -RoiWidth 500 -RoiHeight 420 `
+  -MinChangedThreshold 700
+```
+
+Outputs go to `build\latency-captures` by default:
+
+- `results.csv`: trial number, latency, changed pixel count, trigger time, and
+  detection time.
+- `trial-*-baseline.png`: captured ROI before the trigger.
+- `trial-*-detected.png`: first captured ROI that crossed the change threshold.
+
+For log correlation, compare the script's `trigger_ts` with:
+
+- `app\viewer\gvt_spice_viewer.log`: `latency-input-send` and
+  `latency-input-dispatch`.
+- Server QEMU log: `latency-input-recv` and `latency-video-after-input`.
+
+If the script cannot find the window, check `-WindowProcessName`. If it reports
+no detection, confirm the trigger opens visible UI, move `-GuestX/-GuestY` into
+the changed area, or raise `-MaxWaitMs`. If it detects too early, raise
+`-MinChangedThreshold` or shrink the ROI.
+
 ## Runtime Notes
 
 - The viewer sends `start` to the server only after the local GStreamer
