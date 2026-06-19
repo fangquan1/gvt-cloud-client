@@ -271,7 +271,7 @@ static void append_portable_runtime_args(wchar_t *cmd, size_t cmd_count)
 static void set_viewer_low_latency_env(void)
 {
     SetEnvironmentVariableW(L"GVT_SPICE_VIEWER_DROP_COMPLETE_FRAMES", L"1");
-    SetEnvironmentVariableW(L"GVT_SPICE_VIEWER_UDP_BUFFER_SIZE", L"524288");
+    SetEnvironmentVariableW(L"GVT_SPICE_VIEWER_UDP_BUFFER_SIZE", L"2097152");
     SetEnvironmentVariableW(
         L"GVT_SPICE_VIEWER_VIDEO_TAIL",
         L"queue name=post_decode_q leaky=downstream max-size-buffers=1 "

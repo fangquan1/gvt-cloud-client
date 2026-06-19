@@ -372,7 +372,33 @@ static bool video_drop_complete_frames(void)
 static int video_udp_buffer_size(void)
 {
     return getenv_int_clamped("GVT_SPICE_VIEWER_UDP_BUFFER_SIZE",
-                              524288, 65536, 16777216);
+                              2097152, 65536, 16777216);
+}
+
+static int video_jitter_dropout_ms(void)
+{
+    int defval = video_latency * 4;
+
+    if (defval < 60) {
+        defval = 60;
+    } else if (defval > 200) {
+        defval = 200;
+    }
+    return getenv_int_clamped("GVT_SPICE_VIEWER_JITTER_DROPOUT_MS",
+                              defval, 10, 1000);
+}
+
+static int video_jitter_misorder_ms(void)
+{
+    int defval = video_latency + 5;
+
+    if (defval < 10) {
+        defval = 10;
+    } else if (defval > 50) {
+        defval = 50;
+    }
+    return getenv_int_clamped("GVT_SPICE_VIEWER_JITTER_MISORDER_MS",
+                              defval, 0, 1000);
 }
 
 static const char *video_probe_name(int index)
@@ -1687,6 +1713,8 @@ static bool start_gst_receiver(void)
         "! queue name=frame_drop_q leaky=downstream max-size-buffers=1 "
         "max-size-time=0 max-size-bytes=0 " : "";
     int udp_buffer = video_udp_buffer_size();
+    int jitter_dropout_ms = video_jitter_dropout_ms();
+    int jitter_misorder_ms = video_jitter_misorder_ms();
     ULONGLONG t_stage;
 
     t_stage = viewer_now_ms();
@@ -1707,22 +1735,24 @@ static bool start_gst_receiver(void)
         snprintf(desc, sizeof(desc),
                  "udpsrc port=%d buffer-size=%d "
                  "caps=\"application/x-rtp, media=(string)video, clock-rate=(int)90000, encoding-name=(string)H265, payload=(int)96, ssrc=(uint)2222\" "
-                 "! rtpjitterbuffer latency=%d drop-on-latency=%s do-lost=true faststart-min-packets=1 max-dropout-time=200 max-misorder-time=50 "
+                 "! rtpjitterbuffer latency=%d drop-on-latency=%s do-lost=true faststart-min-packets=1 max-dropout-time=%d max-misorder-time=%d "
                  "%s! rtph265depay %s! h265parse %s%s! d3d11h265dec %s"
                  "! %s",
                  video_port, udp_buffer, video_latency,
                  video_drop_on_latency ? "true" : "false",
+                 jitter_dropout_ms, jitter_misorder_ms,
                  probe_jitter, probe_depay, probe_parse, frame_drop_queue,
                  decode_probe, sink_tail);
     } else {
         snprintf(desc, sizeof(desc),
                  "udpsrc port=%d buffer-size=%d "
                  "caps=\"application/x-rtp, media=(string)video, clock-rate=(int)90000, encoding-name=(string)H264, payload=(int)96, ssrc=(uint)2222\" "
-                 "! rtpjitterbuffer latency=%d drop-on-latency=%s do-lost=true faststart-min-packets=1 max-dropout-time=200 max-misorder-time=50 "
+                 "! rtpjitterbuffer latency=%d drop-on-latency=%s do-lost=true faststart-min-packets=1 max-dropout-time=%d max-misorder-time=%d "
                  "%s! rtph264depay %s! h264parse %s%s! d3d11h264dec %s"
                  "! %s",
                  video_port, udp_buffer, video_latency,
                  video_drop_on_latency ? "true" : "false",
+                 jitter_dropout_ms, jitter_misorder_ms,
                  probe_jitter, probe_depay, probe_parse, frame_drop_queue,
                  decode_probe, sink_tail);
     }
