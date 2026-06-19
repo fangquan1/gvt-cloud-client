@@ -77,6 +77,25 @@ function ConvertFrom-GvtBase64Utf8 {
     return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Text))
 }
 
+function ConvertFrom-GvtJsonLine {
+    param(
+        [string[]]$Lines,
+        [string]$Context = "JSON"
+    )
+
+    $candidates = @($Lines | ForEach-Object { $_.ToString().Trim() } |
+        Where-Object { $_.StartsWith("{") -or $_.StartsWith("[") })
+    for ($i = $candidates.Count - 1; $i -ge 0; $i--) {
+        try {
+            return ($candidates[$i] | ConvertFrom-Json)
+        } catch {
+        }
+    }
+
+    $joined = ($Lines -join " ")
+    throw "$Context did not contain a parseable JSON response. Output: $joined"
+}
+
 function Invoke-GvtQgaCommand {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Command,
@@ -155,8 +174,7 @@ print(text)
         throw "QGA command returned no response."
     }
 
-    $responseText = ($lines | Select-Object -Last 1)
-    $response = $responseText | ConvertFrom-Json
+    $response = ConvertFrom-GvtJsonLine -Lines $lines -Context "QGA command"
     if ($response.PSObject.Properties.Name -contains "error") {
         if (-not $AllowError) {
             throw "QGA error: $($response.error.desc)"

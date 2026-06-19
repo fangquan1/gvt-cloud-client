@@ -164,6 +164,67 @@ function Get-GvtVideoFlashTimes {
     return $times.ToArray()
 }
 
+function Get-GvtMedianDouble {
+    param([object[]]$Values)
+
+    $numbers = @($Values | Where-Object { $null -ne $_ } | ForEach-Object { [double]$_ } | Sort-Object)
+    if ($numbers.Count -le 0) {
+        return $null
+    }
+
+    $mid = [int]($numbers.Count / 2)
+    if (($numbers.Count % 2) -eq 1) {
+        return [double]$numbers[$mid]
+    }
+    return ([double]$numbers[$mid - 1] + [double]$numbers[$mid]) / 2.0
+}
+
+function Get-GvtNearestAvPairs {
+    param(
+        [object[]]$VideoTimesMs,
+        [object[]]$AudioTimesMs,
+        [double]$MaxDistanceMs = 750.0
+    )
+
+    $usedVideo = @{}
+    $pairs = New-Object System.Collections.Generic.List[object]
+
+    for ($ai = 0; $ai -lt $AudioTimesMs.Count; $ai++) {
+        $audioMs = [double]$AudioTimesMs[$ai]
+        $bestIndex = -1
+        $bestAbs = [double]::PositiveInfinity
+        $bestDiff = $null
+
+        for ($vi = 0; $vi -lt $VideoTimesMs.Count; $vi++) {
+            if ($usedVideo.ContainsKey([string]$vi)) {
+                continue
+            }
+            $diff = $audioMs - [double]$VideoTimesMs[$vi]
+            $abs = [Math]::Abs($diff)
+            if ($abs -lt $bestAbs) {
+                $bestIndex = $vi
+                $bestAbs = $abs
+                $bestDiff = $diff
+            }
+        }
+
+        if ($bestIndex -ge 0 -and $bestAbs -le $MaxDistanceMs) {
+            $usedVideo[[string]$bestIndex] = $true
+            [void]$pairs.Add([pscustomobject]@{
+                index = $pairs.Count
+                video_index = $bestIndex
+                audio_index = $ai
+                video_ms = [Math]::Round([double]$VideoTimesMs[$bestIndex], 2)
+                audio_ms = [Math]::Round($audioMs, 2)
+                audio_minus_video_ms = [Math]::Round($bestDiff, 2)
+                abs_ms = [Math]::Round($bestAbs, 2)
+            })
+        }
+    }
+
+    return $pairs
+}
+
 $clientRoot = Resolve-GvtClientRoot
 $resolvedOut = Join-Path $clientRoot $OutDir
 New-Item -ItemType Directory -Force -Path $resolvedOut | Out-Null
@@ -294,6 +355,24 @@ if ($pairs.Count -ge 2) {
     $relativeDrift = @($pairs | ForEach-Object { [Math]::Round(([double]$_.audio_minus_video_ms - $first), 2) })
 }
 
+$nearestPairToleranceMs = 750.0
+$nearestPairs = Get-GvtNearestAvPairs -VideoTimesMs $videoTimesMs -AudioTimesMs $audioTimesMs -MaxDistanceMs $nearestPairToleranceMs
+$nearestOffsets = @($nearestPairs | ForEach-Object { [double]$_.audio_minus_video_ms })
+$nearestAvgOffset = $null
+$nearestMedianOffset = $null
+$nearestMaxAbsOffset = $null
+$nearestRelativeDrift = @()
+$nearestMaxAbsRelativeDrift = $null
+if ($nearestOffsets.Count -gt 0) {
+    $nearestAvgOffset = [Math]::Round((($nearestOffsets | Measure-Object -Average).Average), 2)
+    $nearestMedianOffset = [Math]::Round((Get-GvtMedianDouble -Values $nearestOffsets), 2)
+    $nearestMaxAbsOffset = [Math]::Round((($nearestOffsets | ForEach-Object { [Math]::Abs($_) } | Measure-Object -Maximum).Maximum), 2)
+    $nearestRelativeDrift = @($nearestOffsets | ForEach-Object { [Math]::Round(([double]$_ - $nearestMedianOffset), 2) })
+    if ($nearestRelativeDrift.Count -gt 0) {
+        $nearestMaxAbsRelativeDrift = [Math]::Round((($nearestRelativeDrift | ForEach-Object { [Math]::Abs($_) } | Measure-Object -Maximum).Maximum), 2)
+    }
+}
+
 $summary = [ordered]@{
     generated_at = (Get-Date).ToString("o")
     output_dir = $runDir
@@ -305,10 +384,18 @@ $summary = [ordered]@{
     marker_rect = "{0},{1} {2}x{3}" -f $markerRect.Left, $markerRect.Top, $markerRect.Width, $markerRect.Height
     video_flash_times_ms = @($videoTimesMs | ForEach-Object { [Math]::Round($_, 2) })
     audio_pulse_times_ms_estimated = @($audioTimesMs | ForEach-Object { [Math]::Round($_, 2) })
+    nearest_pair_tolerance_ms = $nearestPairToleranceMs
+    nearest_pairs = $nearestPairs
+    nearest_average_audio_minus_video_ms_estimated = $nearestAvgOffset
+    nearest_median_audio_minus_video_ms_estimated = $nearestMedianOffset
+    nearest_max_abs_audio_minus_video_ms_estimated = $nearestMaxAbsOffset
+    nearest_relative_offset_drift_ms = $nearestRelativeDrift
+    nearest_max_abs_relative_offset_drift_ms = $nearestMaxAbsRelativeDrift
     pairs = $pairs
     average_audio_minus_video_ms_estimated = $avgOffset
     max_abs_audio_minus_video_ms_estimated = $maxAbsOffset
     relative_offset_drift_ms = $relativeDrift
+    legacy_pairing_note = "pairs uses raw event order and can be wrong when either detector misses an event; prefer nearest_pairs and nearest_relative_offset_drift_ms."
 }
 
 $summary | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $summaryJson -Encoding UTF8
@@ -319,12 +406,23 @@ $report = @(
     "- Output: $runDir",
     "- Video flashes: $($videoTimesMs.Count)",
     "- Audio pulses: $($audioTimesMs.Count)",
-    "- Paired events: $pairCount",
-    "- Estimated audio-minus-video avg: $avgOffset ms",
-    "- Estimated audio-minus-video max abs: $maxAbsOffset ms",
-    "- Note: absolute offset uses gst-launch process start as audio sample-zero time; use relative drift for stability checks.",
+    "- Nearest paired events: $($nearestPairs.Count) (tolerance $nearestPairToleranceMs ms)",
+    "- Nearest estimated audio-minus-video avg: $nearestAvgOffset ms",
+    "- Nearest estimated audio-minus-video median: $nearestMedianOffset ms",
+    "- Nearest relative drift max abs: $nearestMaxAbsRelativeDrift ms",
+    "- Legacy index paired events: $pairCount",
+    "- Legacy index estimated audio-minus-video avg: $avgOffset ms",
+    "- Note: absolute offset uses gst-launch process start as audio sample-zero time; nearest-pair relative drift is the most useful stability signal.",
     "",
-    "## Pairs",
+    "## Nearest pairs",
+    ""
+)
+foreach ($pair in $nearestPairs) {
+    $report += "- $($pair.index): video#$($pair.video_index)=$($pair.video_ms) ms audio#$($pair.audio_index)=$($pair.audio_ms) ms diff=$($pair.audio_minus_video_ms) ms"
+}
+$report += @(
+    "",
+    "## Legacy index pairs",
     ""
 )
 foreach ($pair in $pairs) {
@@ -334,4 +432,5 @@ $report | Set-Content -LiteralPath $reportMd -Encoding UTF8
 
 Write-Host "GVT AV sync estimate"
 Write-Host "  Summary: $summaryJson"
-Write-Host "  Paired events=$pairCount estimated_audio_minus_video_avg_ms=$avgOffset max_abs_ms=$maxAbsOffset"
+Write-Host "  Nearest pairs=$($nearestPairs.Count) estimated_audio_minus_video_avg_ms=$nearestAvgOffset relative_drift_max_ms=$nearestMaxAbsRelativeDrift"
+Write-Host "  Legacy index pairs=$pairCount estimated_audio_minus_video_avg_ms=$avgOffset max_abs_ms=$maxAbsOffset"

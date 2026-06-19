@@ -172,6 +172,7 @@ static int audio_frequency;
 static ULONGLONG audio_last_data_ms;
 static volatile LONG video_probe_counts[4];
 static HANDLE video_probe_thread;
+static HANDLE spice_thread_handle;
 
 static char *dup_app_dir(void);
 static void set_gst_environment(void);
@@ -1526,6 +1527,11 @@ static DWORD WINAPI spice_thread(LPVOID opaque)
         inputs_ready = false;
         spice_audio_obj = NULL;
 
+        if (p_spice_session_disconnect) {
+            log_line("spice session disconnect");
+            p_spice_session_disconnect(session);
+        }
+
         if (p_g_main_loop_unref) {
             p_g_main_loop_unref(loop);
         }
@@ -1654,9 +1660,11 @@ static void set_gst_environment(void)
     char new_path[32768];
     char audio_sink[1024];
     int audio_buffer_us = getenv_int_clamped("GVT_SPICE_AUDIO_BUFFER_US",
-                                             50000, 20000, 1000000);
+                                             300000, 20000, 1000000);
     int audio_latency_us = getenv_int_clamped("GVT_SPICE_AUDIO_LATENCY_US",
-                                              10000, 5000, 500000);
+                                              100000, 5000, 500000);
+    int audio_queue_ms = getenv_int_clamped("GVT_SPICE_AUDIO_QUEUE_MS",
+                                            1000, 100, 2000);
 
     if (!gst_root) {
         snprintf(root, sizeof(root),
@@ -1680,16 +1688,16 @@ static void set_gst_environment(void)
     log_line("GStreamer registry %s", registry);
     if (!env_is_set("SPICE_GST_AUDIOSINK")) {
         snprintf(audio_sink, sizeof(audio_sink),
-            "appsrc is-live=1 do-timestamp=0 format=time "
+            "appsrc is-live=1 do-timestamp=1 format=time "
             "caps=\"audio/x-raw,format=S16LE,channels=2,rate=48000,layout=interleaved\" "
-            "name=\"appsrc\" ! queue max-size-time=200000000 max-size-buffers=0 max-size-bytes=0 "
+            "name=\"appsrc\" ! queue max-size-time=%d000000 max-size-buffers=0 max-size-bytes=0 "
             "! audioconvert ! audioresample "
             "! directsoundsink name=\"audiosink\" sync=false async=false "
             "buffer-time=%d latency-time=%d",
-            audio_buffer_us, audio_latency_us);
+            audio_queue_ms, audio_buffer_us, audio_latency_us);
         SetEnvironmentVariableA("SPICE_GST_AUDIOSINK", audio_sink);
-        log_line("SPICE audio sink buffer_us=%d latency_us=%d",
-                 audio_buffer_us, audio_latency_us);
+        log_line("SPICE audio sink queue_ms=%d buffer_us=%d latency_us=%d",
+                 audio_queue_ms, audio_buffer_us, audio_latency_us);
     }
     free(app_dir);
 }
@@ -2036,7 +2044,10 @@ static void start_media_stack(HWND hwnd)
     set_gst_environment();
     log_line("media-stack set-gst-env dt=%I64ums",
              (unsigned long long)(viewer_now_ms() - t_stage));
-    CreateThread(NULL, 0, spice_thread, NULL, 0, NULL);
+    spice_thread_handle = CreateThread(NULL, 0, spice_thread, NULL, 0, NULL);
+    if (!spice_thread_handle) {
+        log_line("failed to create spice thread err=%lu", GetLastError());
+    }
     CreateThread(NULL, 0, gst_receiver_thread, NULL, 0, NULL);
     SetWindowTextA(hwnd, "GVT SPICE Viewer - video embedded, waiting for inputs");
     if (auto_size_on_start) {
@@ -2261,6 +2272,14 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
             }
             p_gst_object_unref(gst_pipeline);
             gst_pipeline = NULL;
+        }
+        if (spice_thread_handle) {
+            DWORD wait_rc = WaitForSingleObject(spice_thread_handle, 1500);
+            if (wait_rc == WAIT_TIMEOUT) {
+                log_line("spice thread did not exit within shutdown grace");
+            }
+            CloseHandle(spice_thread_handle);
+            spice_thread_handle = NULL;
         }
         PostQuitMessage(0);
         return 0;

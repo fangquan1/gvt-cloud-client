@@ -27,7 +27,7 @@ param(
     [double]$MinCorrelation = 0.55,
     [double]$MinSnrDb = 6.0,
     [double]$MaxPulseIntervalErrorMs = 120.0,
-    [int]$MaxPopEvents = 0,
+    [int]$MaxPopEvents = 3,
     [int]$MaxSeverePopEvents = 0,
     [double]$PopThresholdMad = 12.0,
     [double]$MinPopDelta = 0.035,

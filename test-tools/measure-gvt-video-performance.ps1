@@ -26,6 +26,7 @@ param(
     [string]$ServerSsh = "root@192.168.0.188",
     [string]$ServerLog = "/root/qemu_cmd/win10-gvt-stream-diag.log",
     [switch]$LeaveWindowOpen,
+    [switch]$KeepProbeViewerOpen,
     [switch]$SkipGstWarmup,
     [switch]$StopExistingViewer
 )
@@ -322,19 +323,53 @@ $startInfo.Arguments = Join-ProcessArgs $viewerArgs
 $startInfo.EnvironmentVariables["GVT_SPICE_VIEWER_VIDEO_DEBUG"] = "1"
 $startInfo.EnvironmentVariables["GVT_SPICE_VIEWER_DROP_COMPLETE_FRAMES"] = "1"
 $startInfo.EnvironmentVariables["GVT_SPICE_VIEWER_UDP_BUFFER_SIZE"] = "2097152"
-$startInfo.EnvironmentVariables["GVT_SPICE_VIEWER_JITTER_MAX_DROPOUT_MS"] = "60"
-$startInfo.EnvironmentVariables["GVT_SPICE_VIEWER_JITTER_MAX_MISORDER_MS"] = "20"
+$startInfo.EnvironmentVariables["GVT_SPICE_VIEWER_JITTER_DROPOUT_MS"] = "60"
+$startInfo.EnvironmentVariables["GVT_SPICE_VIEWER_JITTER_MISORDER_MS"] = "20"
 $startInfo.EnvironmentVariables["GVT_SPICE_VIEWER_VIDEO_TAIL"] = "queue name=post_decode_q leaky=downstream max-size-buffers=1 max-size-time=0 max-size-bytes=0 ! d3d11videosink name=vsink sync=false async=false qos=true max-lateness=0 processing-deadline=0 render-delay=0 enable-last-sample=false"
 $startInfo.EnvironmentVariables["PATH"] = (Join-Path $GstRoot "bin") + ";" + $SpiceRuntime + ";" + $env:PATH
 
 $process = New-Object System.Diagnostics.Process
 $process.StartInfo = $startInfo
 [void]$process.Start()
+$probeProcess = $process
+$probeViewerReplaced = $false
 
 $totalWaitSec = [Math]::Max(1, $WarmupSec + $DurationSec)
 Start-Sleep -Seconds $totalWaitSec
 
-if (-not $LeaveWindowOpen -and -not $process.HasExited) {
+$localLines = @(Get-LocalLogTail -Path $ViewerLog -StartLine $localStartLine)
+$serverLines = @(Get-RemoteLogTail -StartLine $remoteStartLine)
+
+if ($LeaveWindowOpen -and -not $KeepProbeViewerOpen) {
+    if (-not $probeProcess.HasExited) {
+        $probeProcess.CloseMainWindow() | Out-Null
+        if (-not $probeProcess.WaitForExit(2000)) {
+            $probeProcess.Kill()
+            $probeProcess.WaitForExit()
+        }
+    }
+    Start-Sleep -Milliseconds 1500
+
+    $steadyStartInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $steadyStartInfo.FileName = $ViewerPath
+    $steadyStartInfo.WorkingDirectory = $ViewerDir
+    $steadyStartInfo.UseShellExecute = $false
+    $steadyStartInfo.Arguments = Join-ProcessArgs $viewerArgs
+    $steadyStartInfo.EnvironmentVariables["GVT_SPICE_VIEWER_DROP_COMPLETE_FRAMES"] = "1"
+    $steadyStartInfo.EnvironmentVariables["GVT_SPICE_VIEWER_UDP_BUFFER_SIZE"] = "2097152"
+    $steadyStartInfo.EnvironmentVariables["GVT_SPICE_VIEWER_JITTER_DROPOUT_MS"] = "60"
+    $steadyStartInfo.EnvironmentVariables["GVT_SPICE_VIEWER_JITTER_MISORDER_MS"] = "20"
+    $steadyStartInfo.EnvironmentVariables["GVT_SPICE_VIEWER_VIDEO_TAIL"] = $startInfo.EnvironmentVariables["GVT_SPICE_VIEWER_VIDEO_TAIL"]
+    $steadyStartInfo.EnvironmentVariables["PATH"] = $startInfo.EnvironmentVariables["PATH"]
+
+    $steadyProcess = New-Object System.Diagnostics.Process
+    $steadyProcess.StartInfo = $steadyStartInfo
+    [void]$steadyProcess.Start()
+    $process = $steadyProcess
+    $probeViewerReplaced = $true
+    Start-Sleep -Seconds 3
+}
+elseif (-not $LeaveWindowOpen -and -not $process.HasExited) {
     $process.CloseMainWindow() | Out-Null
     if (-not $process.WaitForExit(2000)) {
         $process.Kill()
@@ -343,9 +378,6 @@ if (-not $LeaveWindowOpen -and -not $process.HasExited) {
 }
 
 Start-Sleep -Milliseconds 500
-
-$localLines = @(Get-LocalLogTail -Path $ViewerLog -StartLine $localStartLine)
-$serverLines = @(Get-RemoteLogTail -StartLine $remoteStartLine)
 
 $pipeline = ($localLines | Where-Object { $_ -match "video pipeline:" } | Select-Object -Last 1)
 $streamControlReadyMs = $null
@@ -419,6 +451,9 @@ $summary = [ordered]@{
     viewer_pid = $process.Id
     viewer_running = (-not $process.HasExited)
     viewer_left_open = [bool]$LeaveWindowOpen
+    probe_viewer_pid = $probeProcess.Id
+    probe_viewer_replaced = $probeViewerReplaced
+    keep_probe_viewer_open = [bool]$KeepProbeViewerOpen
     duration_sec = $DurationSec
     warmup_sec = $WarmupSec
     codec = $Codec
@@ -497,6 +532,7 @@ $reportLines = @(
     "- Startup: media stack $($summary.client.media_stack_ready_ms) ms, stream control start $($summary.client.stream_control_start_sent_ms) ms, gst receiver $($summary.client.gst_receiver_ready_ms) ms",
     "- Server samples: $($summary.server.update_samples), fps avg $($summary.server.fps.avg), capture avg $($summary.server.capture_ms.avg) ms, encode failures last $($summary.server.encode_failures_last)",
     "- Viewer left open: $([bool]$LeaveWindowOpen), pid $($process.Id)",
+    "- Probe viewer replaced for steady run: $probeViewerReplaced, probe pid $($probeProcess.Id)",
     "",
     "## Reference model",
     "",

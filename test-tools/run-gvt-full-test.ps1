@@ -651,9 +651,9 @@ function Get-FullPopGrade {
     if ($null -eq $Pop) {
         return New-FullGrade "NA" "grade-na"
     }
-    $events = Get-FullNumber $Pop.event_count
-    $severe = Get-FullNumber $Pop.severe_event_count
-    $periodic = [bool]$Pop.periodic.detected
+    $events = Get-FullNumber (Get-FullMember -Object $Pop -Name "event_count")
+    $severe = Get-FullNumber (Get-FullMember -Object $Pop -Name "severe_event_count")
+    $periodic = [bool](Get-FullNestedMember -Object $Pop -Names @("periodic", "detected") -Default $false)
     if ($events -eq 0 -and $severe -eq 0 -and -not $periodic) {
         return New-FullGrade "好" "grade-good"
     }
@@ -748,6 +748,26 @@ function Get-FullMember {
     return $Default
 }
 
+function Get-FullNestedMember {
+    param(
+        [object]$Object,
+        [string[]]$Names,
+        [object]$Default = $null
+    )
+
+    $current = $Object
+    foreach ($name in $Names) {
+        if ($null -eq $current) {
+            return $Default
+        }
+        $current = Get-FullMember -Object $current -Name $name -Default $null
+    }
+    if ($null -eq $current) {
+        return $Default
+    }
+    return $current
+}
+
 function Get-FullStageHtmlRows {
     param([object]$Stages)
 
@@ -785,30 +805,46 @@ function Write-FullReports {
 
     $smoke = $Summary.artifacts.smoke_summary
     $audio = $Summary.artifacts.audio_summary
-    $wave = if ($audio) { $audio.waveform_analysis } else { $null }
-    $pop = if ($wave) { $wave.pop_detection } else { $null }
+    $wave = Get-FullNestedMember -Object $audio -Names @("waveform_analysis")
+    $pop = Get-FullNestedMember -Object $wave -Names @("pop_detection")
     $av = $Summary.artifacts.av_sync_summary
     $lat = $Summary.artifacts.latency
 
     $overall = if ($Summary.overall_ok) { "通过" } else { "失败" }
-    $popPass = if ($wave) { Format-FullStageState $wave.pass } else { "NA" }
-    $periodicText = if ($pop) { "$(Format-FullStageState (-not [bool]$pop.periodic.detected)) / 置信度 $($pop.periodic.confidence)" } else { "NA" }
-    $overviewSvg = if ($wave) { ConvertTo-FullReportLink ([string]$wave.plots.waveform_overview_svg) } else { "" }
-    $detailSvg = if ($wave) { ConvertTo-FullReportLink ([string]$wave.plots.waveform_detail_svg) } else { "" }
-    $scoreSvg = if ($wave) { ConvertTo-FullReportLink ([string]$wave.plots.pop_score_svg) } else { "" }
-    $spectrumSvg = if ($wave -and $wave.plots.spectrum_comparison_svg) { ConvertTo-FullReportLink ([string]$wave.plots.spectrum_comparison_svg) } else { "" }
+    $popPass = if ($wave) { Format-FullStageState (Get-FullMember -Object $wave -Name "pass") } else { "NA" }
+    $periodicDetected = [bool](Get-FullNestedMember -Object $pop -Names @("periodic", "detected") -Default $false)
+    $periodicConfidence = Get-FullNestedMember -Object $pop -Names @("periodic", "confidence") -Default "NA"
+    $periodicText = if ($pop) { "$(Format-FullStageState (-not $periodicDetected)) / 置信度 $periodicConfidence" } else { "NA" }
+    $overviewSvg = ConvertTo-FullReportLink ([string](Get-FullNestedMember -Object $wave -Names @("plots", "waveform_overview_svg") -Default ""))
+    $detailSvg = ConvertTo-FullReportLink ([string](Get-FullNestedMember -Object $wave -Names @("plots", "waveform_detail_svg") -Default ""))
+    $scoreSvg = ConvertTo-FullReportLink ([string](Get-FullNestedMember -Object $wave -Names @("plots", "pop_score_svg") -Default ""))
+    $spectrumSvg = ConvertTo-FullReportLink ([string](Get-FullNestedMember -Object $wave -Names @("plots", "spectrum_comparison_svg") -Default ""))
 
     $decodeFps = if ($smoke) { Get-FullNumber $smoke.client.decode_out_fps.avg } else { $null }
     $serverFps = if ($smoke) { Get-FullNumber $smoke.server.fps.avg } else { $null }
     $encodeFailures = if ($smoke) { Get-FullNumber $smoke.server.encode_failures_last } else { $null }
-    $clipPct = if ($audio) { Get-FullNumber $audio.recorded.clip.clipped_pct } else { $null }
-    $dropoutPct = if ($audio) { Get-FullNumber $audio.alignment.dropout_window_pct } else { $null }
-    $pulseErrorMs = if ($audio) { Get-FullNumber $audio.pulse_timing.max_abs_interval_error_ms } else { $null }
-    $spectrumDeltaDb = if ($wave -and $wave.spectrum) { Get-FullNumber $wave.spectrum.delta_rms_db } else { $null }
-    $avAvgMs = if ($av) { Get-FullNumber $av.average_audio_minus_video_ms_estimated } else { $null }
-    $avAbsMs = if ($null -ne $avAvgMs) { [Math]::Abs($avAvgMs) } else { $null }
+    $clipPct = Get-FullNumber (Get-FullNestedMember -Object $audio -Names @("recorded", "clip", "clipped_pct"))
+    $dropoutPct = Get-FullNumber (Get-FullNestedMember -Object $audio -Names @("alignment", "dropout_window_pct"))
+    $pulseErrorMs = Get-FullNumber (Get-FullNestedMember -Object $audio -Names @("pulse_timing", "max_abs_interval_error_ms"))
+    $spectrumDeltaDb = Get-FullNumber (Get-FullNestedMember -Object $wave -Names @("spectrum", "delta_rms_db"))
+    $avNearestPairs = if ($av) { Get-FullMember -Object $av -Name "nearest_pairs" -Default $null } else { $null }
+    $avLegacyPairs = if ($av) { Get-FullMember -Object $av -Name "pairs" -Default $null } else { $null }
+    $avNearestPairCount = if ($null -ne $avNearestPairs) { @($avNearestPairs).Count } else { 0 }
+    $avLegacyPairCount = if ($null -ne $avLegacyPairs) { @($avLegacyPairs).Count } else { 0 }
+    $avPairCount = if ($av) { if ($avNearestPairCount -gt 0) { $avNearestPairCount } else { $avLegacyPairCount } } else { $null }
+    $avAvgMs = if ($av) { Get-FullNumber (Get-FullMember -Object $av -Name "nearest_average_audio_minus_video_ms_estimated" -Default $null) } else { $null }
+    if ($null -eq $avAvgMs -and $av) {
+        $avAvgMs = Get-FullNumber (Get-FullMember -Object $av -Name "average_audio_minus_video_ms_estimated" -Default $null)
+    }
+    $avRelDriftMs = if ($av) { Get-FullNumber (Get-FullMember -Object $av -Name "nearest_max_abs_relative_offset_drift_ms" -Default $null) } else { $null }
+    $avGradeBasisMs = if ($null -ne $avRelDriftMs) { $avRelDriftMs } elseif ($null -ne $avAvgMs) { [Math]::Abs($avAvgMs) } else { $null }
     $latMedianMs = if ($lat) { Get-FullNumber $lat.median_ms } else { $null }
     $avDirection = Get-FullAvDirectionText $avAvgMs
+    $avDetail = if ($null -ne $avRelDriftMs) {
+        "绝对偏移估算：$avDirection；最近事件相对漂移 max $(Format-FullNumber $avRelDriftMs 1) ms。"
+    } else {
+        $avDirection
+    }
     $latencyTriggerDescription = Get-FullLatencyTriggerDescription $LatencyTriggerProfile
 
     $overallGrade = if ($Summary.overall_ok) { New-FullGrade "好" "grade-good" } else { New-FullGrade "差" "grade-bad" }
@@ -820,12 +856,12 @@ function Write-FullReports {
     $pulseGrade = Get-FullLowerBetterGrade -Value $pulseErrorMs -Good 20 -Fair 120
     $popGrade = Get-FullPopGrade $pop
     $periodicGrade = if ($pop) {
-        if ([bool]$pop.periodic.detected) { New-FullGrade "差" "grade-bad" } else { New-FullGrade "好" "grade-good" }
+        if ($periodicDetected) { New-FullGrade "差" "grade-bad" } else { New-FullGrade "好" "grade-good" }
     } else {
         New-FullGrade "NA" "grade-na"
     }
     $spectrumGrade = Get-FullLowerBetterGrade -Value $spectrumDeltaDb -Good 6 -Fair 12
-    $avGrade = Get-FullLowerBetterGrade -Value $avAbsMs -Good 80 -Fair 150
+    $avGrade = Get-FullLowerBetterGrade -Value $avGradeBasisMs -Good 80 -Fair 150
     $latencyGrade = Get-FullLowerBetterGrade -Value $latMedianMs -Good $LatencyGoodMs -Fair $LatencyPassMs
 
     $zh = @(
@@ -860,8 +896,10 @@ function Write-FullReports {
         "- 严重爆音候选数量: $(if ($pop) { $pop.severe_event_count } else { 'NA' })",
         "- 周期性爆音: $periodicText",
         "- 频域差异 RMS: $(Format-FullNumber $spectrumDeltaDb 2) dB（评级: $($spectrumGrade.Text)）",
-        "- AV sync paired events: $(if ($av) { @($av.pairs).Count } else { 'NA' })",
-        "- AV sync audio-minus-video avg: $(Format-FullNumber $avAvgMs 2) ms（$avDirection；评级: $($avGrade.Text)）",
+        "- AV sync nearest paired events: $(if ($av) { $avNearestPairCount } else { 'NA' })",
+        "- AV sync legacy index paired events: $(if ($av) { $avLegacyPairCount } else { 'NA' })",
+        "- AV sync audio-minus-video avg: $(Format-FullNumber $avAvgMs 2) ms（$avDirection；绝对偏移估算）",
+        "- AV sync relative drift max: $(Format-FullNumber $avRelDriftMs 2) ms（评级: $($avGrade.Text)）",
         "- 输入到画面延迟 median: $(Format-FullNumber $latMedianMs 1) ms（评级: $($latencyGrade.Text)）",
         "- 输入延迟触发方式: $latencyTriggerDescription",
         "",
@@ -887,7 +925,7 @@ function Write-FullReports {
         (New-FullMetricCard -Label "视频解码 FPS" -Value (Format-FullNumber $decodeFps 2) -Unit "fps" -Grade $decodeGrade -Help "客户端解码输出帧率，越接近 60Hz 越好；>=55 好，>=45 良好。" -Detail "客户端画面流畅度主指标。"),
         (New-FullMetricCard -Label "音频爆音" -Value $(if ($pop) { "$($pop.event_count) / $($pop.severe_event_count)" } else { "NA" }) -Unit "候选/严重" -Grade $popGrade -Help "逐采样扫描短促高频瞬态；0 个候选为好，少量非严重候选为良好。" -Detail "用于判断微小爆音、破音尖峰。"),
         (New-FullMetricCard -Label "频域差异" -Value (Format-FullNumber $spectrumDeltaDb 2) -Unit "dB" -Grade $spectrumGrade -Help "输入参考和录制输出的平均频谱差异 RMS；<=6dB 好，<=12dB 良好。" -Detail "辅助观察高频噪声和音色变化。"),
-        (New-FullMetricCard -Label "声画同步" -Value (Format-FullNumber $avAvgMs 1) -Unit "ms" -Grade $avGrade -Help "audio-minus-video：负数表示声音快于画面，正数表示画面快于声音；绝对值越小越好。" -Detail $avDirection),
+        (New-FullMetricCard -Label "声画同步" -Value (Format-FullNumber $avGradeBasisMs 1) -Unit "ms" -Grade $avGrade -Help "优先用最近音视频事件的相对漂移评分；audio-minus-video 绝对偏移只作估算。" -Detail $avDetail),
         (New-FullMetricCard -Label "输入延迟" -Value (Format-FullNumber $latMedianMs 1) -Unit "ms" -Grade $latencyGrade -Help "发送输入到画面 ROI 发生变化的中位耗时；Win+R 会包含系统 UI 启动误差，<=$([int]$LatencyGoodMs)ms 好，<=$([int]$LatencyPassMs)ms 良好/通过。" -Detail $latencyTriggerDescription)
     ) -join "`n"
 
@@ -898,8 +936,8 @@ function Write-FullReports {
         @("完整日志", (Join-Path $runDir "full.log")),
         @("视频 summary", $Summary.artifacts.smoke_summary_path),
         @("音频 summary", $Summary.artifacts.audio_summary_path),
-        @("音频波形分析 JSON", $(if ($audio) { $audio.waveform_analysis_path } else { "" })),
-        @("音频频域 CSV", $(if ($wave -and $wave.data.spectrum_csv) { $wave.data.spectrum_csv } else { "" })),
+        @("音频波形分析 JSON", $(Get-FullMember -Object $audio -Name "waveform_analysis_path" -Default "")),
+        @("音频频域 CSV", $(Get-FullNestedMember -Object $wave -Names @("data", "spectrum_csv") -Default "")),
         @("AV sync summary", $Summary.artifacts.av_sync_summary_path),
         @("延迟 CSV", $(if ($lat) { $lat.csv } else { "" }))
     ) | ForEach-Object {
@@ -917,7 +955,7 @@ function Write-FullReports {
     $imgScore = if ($scoreSvg) { "<figure><img src=`"$scoreSvg`" alt=`"爆音评分曲线`"><figcaption>瞬态爆音评分曲线；超过红线的位置会进入候选列表。</figcaption></figure>" } else { "" }
     $imgSpectrum = if ($spectrumSvg) { "<figure><img src=`"$spectrumSvg`" alt=`"频域对比曲线`"><figcaption>输入参考与客户端录制输出的频域对比；异常抬升的高频能量通常对应噪声、破音或爆音残留。</figcaption></figure>" } else { "" }
     $popRows = if ($pop) {
-        @($pop.events | Select-Object -First 20 | ForEach-Object {
+        @(Get-FullMember -Object $pop -Name "events" -Default @() | Select-Object -First 20 | ForEach-Object {
             "<tr><td>$($_.time_sec)</td><td>$($_.duration_ms)</td><td>$($_.peak_delta)</td><td>$($_.score)</td><td>$($_.severe)</td></tr>"
         }) -join "`n"
     } else {
@@ -927,16 +965,17 @@ function Write-FullReports {
         (New-FullMetricRow -Label "音频 clipped" -Value (Format-FullNumber $clipPct 5) -Unit "%" -Grade $clipGrade -Help "录制样本接近满幅的比例；削波会带来破音，越低越好。" -Detail "0.01% 以内好，0.10% 以内良好。"),
         (New-FullMetricRow -Label "dropout windows" -Value (Format-FullNumber $dropoutPct 3) -Unit "%" -Grade $dropoutGrade -Help "短窗口内接近静音或缺失的比例；越低越好。" -Detail "0.10% 以内好，2.00% 以内良好。"),
         (New-FullMetricRow -Label "pulse interval max error" -Value (Format-FullNumber $pulseErrorMs 2) -Unit "ms" -Grade $pulseGrade -Help "参考脉冲间隔的最大误差，用于判断音频节奏漂移或卡顿。" -Detail "20ms 以内好，120ms 以内良好。"),
-        (New-FullMetricRow -Label "爆音候选数量" -Value $(if ($pop) { "$($pop.event_count)" } else { "NA" }) -Unit "" -Grade $popGrade -Help "排除参考脉冲后检测到的短促高频瞬态数量。" -Detail "0 个候选为好；少量非严重候选为良好。"),
-        (New-FullMetricRow -Label "严重爆音候选数量" -Value $(if ($pop) { "$($pop.severe_event_count)" } else { "NA" }) -Unit "" -Grade $popGrade -Help "爆音评分超过严重阈值的候选数量。" -Detail "严重候选通常需要优先排查音频缓冲或编码链路。"),
-        (New-FullMetricRow -Label "周期性爆音" -Value $(if ($pop) { if ($pop.periodic.detected) { "检测到" } else { "未检测到" } } else { "NA" }) -Unit "" -Grade $periodicGrade -Help "候选爆音间隔是否呈稳定周期；周期性通常说明缓冲周期或调度周期问题。" -Detail "置信度 $(if ($pop) { $pop.periodic.confidence } else { 'NA' })。"),
+        (New-FullMetricRow -Label "爆音候选数量" -Value $(if ($pop) { "$(Get-FullMember -Object $pop -Name "event_count" -Default "NA")" } else { "NA" }) -Unit "" -Grade $popGrade -Help "排除参考脉冲后检测到的短促高频瞬态数量。" -Detail "0 个候选为好；少量非严重候选为良好。"),
+        (New-FullMetricRow -Label "严重爆音候选数量" -Value $(if ($pop) { "$(Get-FullMember -Object $pop -Name "severe_event_count" -Default "NA")" } else { "NA" }) -Unit "" -Grade $popGrade -Help "爆音评分超过严重阈值的候选数量。" -Detail "严重候选通常需要优先排查音频缓冲或编码链路。"),
+        (New-FullMetricRow -Label "周期性爆音" -Value $(if ($pop) { if ($periodicDetected) { "检测到" } else { "未检测到" } } else { "NA" }) -Unit "" -Grade $periodicGrade -Help "候选爆音间隔是否呈稳定周期；周期性通常说明缓冲周期或调度周期问题。" -Detail "置信度 $periodicConfidence。"),
         (New-FullMetricRow -Label "频域差异 RMS" -Value (Format-FullNumber $spectrumDeltaDb 2) -Unit "dB" -Grade $spectrumGrade -Help "输入参考和录制输出频谱的平均差异；主要用于辅助观察高频噪声和音色变化。" -Detail "当前不作为硬失败条件。")
     ) -join "`n"
     $videoMetricRows = @(
         (New-FullMetricRow -Label "客户端 decode FPS" -Value (Format-FullNumber $decodeFps 2) -Unit "fps" -Grade $decodeGrade -Help "客户端实际解码输出帧率；目标 60Hz。" -Detail ">=55 好，>=45 良好。"),
         (New-FullMetricRow -Label "服务端 FPS" -Value (Format-FullNumber $serverFps 2) -Unit "fps" -Grade $serverFpsGrade -Help "服务端采集/编码侧平均帧率；目标接近客户端刷新目标。" -Detail ">=55 好，>=45 良好。"),
         (New-FullMetricRow -Label "服务端 encode failures" -Value (Format-FullNumber $encodeFailures 0) -Unit "" -Grade $encodeGrade -Help "服务端编码失败累计值；0 最好。" -Detail "0 好，<=3 良好。"),
-        (New-FullMetricRow -Label "AV sync audio-minus-video avg" -Value (Format-FullNumber $avAvgMs 2) -Unit "ms" -Grade $avGrade -Help "音频事件时间减视频事件时间：负数=声音快于画面，正数=画面快于声音。" -Detail $avDirection),
+        (New-FullMetricRow -Label "AV sync nearest pairs" -Value $(if ($av) { "$avPairCount" } else { "NA" }) -Unit "" -Grade $avGrade -Help "优先使用最近事件配对；旧的按序号配对在漏检事件时会产生数秒级假偏移。" -Detail "最近配对 $avNearestPairCount；旧序号配对 $avLegacyPairCount。"),
+        (New-FullMetricRow -Label "AV sync relative drift max" -Value (Format-FullNumber $avRelDriftMs 2) -Unit "ms" -Grade $avGrade -Help "最近配对后，以中位 audio-minus-video 偏移为基准的最大相对漂移；比绝对偏移更可信。" -Detail $avDetail),
         (New-FullMetricRow -Label "输入到画面延迟 median" -Value (Format-FullNumber $latMedianMs 1) -Unit "ms" -Grade $latencyGrade -Help "发送输入触发后，到画面 ROI 首次明显变化的中位耗时；Win+R profile 的接受线为 <=$([int]$LatencyPassMs)ms。" -Detail $latencyTriggerDescription)
     ) -join "`n"
 
@@ -1225,8 +1264,19 @@ foreach ($entry in $stageResults.GetEnumerator()) {
 if ($artifacts.latency -and $artifacts.latency.valid_count -le 0) {
     $overallOk = $false
 }
-if ($artifacts.av_sync_summary -and @($artifacts.av_sync_summary.pairs).Count -le 0) {
-    $overallOk = $false
+if ($artifacts.av_sync_summary) {
+    $avCheckNearestPairs = Get-FullMember -Object $artifacts.av_sync_summary -Name "nearest_pairs" -Default $null
+    $avCheckLegacyPairs = Get-FullMember -Object $artifacts.av_sync_summary -Name "pairs" -Default $null
+    $avCheckPairCount = if ($null -ne $avCheckNearestPairs -and @($avCheckNearestPairs).Count -gt 0) {
+        @($avCheckNearestPairs).Count
+    } elseif ($null -ne $avCheckLegacyPairs) {
+        @($avCheckLegacyPairs).Count
+    } else {
+        0
+    }
+    if ($avCheckPairCount -le 0) {
+        $overallOk = $false
+    }
 }
 
 $summary = [ordered]@{
