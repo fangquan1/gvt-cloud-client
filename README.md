@@ -1,34 +1,15 @@
 # GVT Cloud Client
 
-Windows client for the GVT-g cloud desktop project.
+Native Windows client for the current GVT-g cloud desktop route.
 
-Target repository: `https://github.com/fangquan1/gvt-cloud-client`
+This repository keeps only the Win32 shell and portable client path:
 
-Main source:
+- `native-launcher/gvt_cloud_client.c`: the first-window Win32 launcher.
+- `src/gvt_spice_viewer.c`: embedded video, SPICE audio/session, and native input.
+- `scripts/package-portable.mjs`: builds and assembles the portable folder.
 
-- `native-launcher/gvt_cloud_client.c`
-- `src/gvt_spice_viewer.c`
-- `scripts/package-portable.mjs`
+Removed from `current`: Python client prototypes, input overlay scripts,
+standalone RTP receive scripts, old batch launchers, and historical docs. Those
+remain available in Git history if needed for reference.
 
-Current baseline:
-
-- Video: QEMU `gvt-stream` H.264 RTP.
-- Audio/session: SPICE playback via `spice-client-glib`.
-- Input: QEMU native TCP input, with the current overlay path retained.
-- UI: native Win32 launcher plus native viewer. The old web console/prototype
-  has been removed.
-
-Build the portable client with:
-
-```powershell
-node scripts/package-portable.mjs
-```
-
-or:
-
-```bat
-scripts\build-portable-client.bat
-```
-
-Do not commit runtime binaries, logs, VM images, passwords, or private server
-configuration.
+Start with [CLIENT.md](CLIENT.md).

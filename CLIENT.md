@@ -1,0 +1,174 @@
+# GVT Cloud Client Notes
+
+## Purpose
+
+This repository builds the Windows portable client for the current GVT-g cloud
+desktop route. The product entry point is a native Win32 launcher that starts
+`gvt_spice_viewer.exe` with the right video, SPICE, input, and runtime paths.
+
+The client talks to the patched QEMU `gvt-stream` backend:
+
+```text
+QEMU gvt-stream RTP video -> GStreamer D3D11 video sink
+QEMU SPICE audio/session  -> spice-client-glib from VirtViewer
+QEMU native input TCP     -> gvt_spice_viewer.exe
+```
+
+## Kept Files
+
+- `native-launcher/gvt_cloud_client.c`: Win32 launcher UI.
+- `native-launcher/build.ps1`: builds `GVT Cloud Client.exe`.
+- `src/gvt_spice_viewer.c`: native viewer process.
+- `src/build-viewer.ps1`: builds `gvt_spice_viewer.exe`.
+- `scripts/package-portable.mjs`: builds and packages the portable client.
+
+The old Python client, Python input overlay, diagnostic RTP receiver scripts,
+and start/stop batch files are intentionally not part of `current`.
+
+## Build Dependencies
+
+Install these on the Windows packaging machine:
+
+- Git.
+- Node.js 18 or newer.
+- MinGW-w64 GCC. The build scripts first try
+  `C:\Program Files\mingw64\bin\gcc.exe`, then fall back to `gcc.exe` in `PATH`.
+- GStreamer Windows runtime used by the current client:
+  `gstreamer-1.0-mingw-x86_64-1.18.6`.
+- VirtViewer runtime with SPICE client DLLs, tested with
+  `C:\Program Files\VirtViewer v11.0-256\bin`.
+
+The GStreamer and VirtViewer runtimes are not committed to Git. Put them under
+the parent workspace or point the package script at them with environment
+variables:
+
+```powershell
+$env:GVT_GSTREAMER_ROOT = "C:\job\gvt-cloud-current\tools\gstreamer-1.0-mingw-x86_64-1.18.6"
+$env:GVT_SPICE_RUNTIME = "C:\Program Files\VirtViewer v11.0-256\bin"
+```
+
+`GVT_GSTREAMER_ROOT` should be the directory that contains:
+
+```text
+gstreamer\1.0\mingw_x86_64\bin
+gstreamer\1.0\mingw_x86_64\lib\gstreamer-1.0
+```
+
+If `GVT_GSTREAMER_ROOT` is not set, the package script checks:
+
+```text
+<parent-workspace>\tools\gstreamer-1.0-mingw-x86_64-1.18.6
+<repo>\tools\gstreamer-1.0-mingw-x86_64-1.18.6
+```
+
+## Build Portable Client
+
+From a fresh clone:
+
+```powershell
+git clone https://github.com/fangquan1/gvt-cloud-client.git
+cd gvt-cloud-client
+
+$env:GVT_GSTREAMER_ROOT = "C:\path\to\gstreamer-1.0-mingw-x86_64-1.18.6"
+$env:GVT_SPICE_RUNTIME = "C:\Program Files\VirtViewer v11.0-256\bin"
+
+node scripts/package-portable.mjs
+```
+
+Output:
+
+```text
+build\gvt-cloud-client-portable\
+  GVT Cloud Client.exe
+  app\viewer\gvt_spice_viewer.exe
+  runtime\virtviewer\bin\...
+  tools\gstreamer-1.0-mingw-x86_64-1.18.6\...
+  README.txt
+```
+
+The package script also prewarms the GStreamer registry through
+`gvt_spice_viewer.exe --gst-warmup`. To skip that during CI or diagnostics:
+
+```powershell
+$env:GVT_SKIP_GST_WARMUP = "1"
+node scripts/package-portable.mjs
+```
+
+For compile-only checks without copying runtimes:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File src\build-viewer.ps1
+powershell -ExecutionPolicy Bypass -File native-launcher\build.ps1
+```
+
+`GVT_ALLOW_MISSING_RUNTIME=1 node scripts/package-portable.mjs` is available
+only for local smoke tests; it does not produce a truly portable client.
+
+## Run
+
+On the client machine, open:
+
+```text
+build\gvt-cloud-client-portable\GVT Cloud Client.exe
+```
+
+Enter a server endpoint and click `Connect`:
+
+```text
+192.168.0.188:5004
+```
+
+Port convention:
+
+- `5004`: stream control TCP and video RTP UDP.
+- `5900`: SPICE audio/session.
+- `5905`: native input TCP.
+
+For additional VMs, ports advance in slots of four:
+
+```text
+5008 -> SPICE 5901, input 5906
+5012 -> SPICE 5902, input 5907
+```
+
+The launcher stores recent endpoints in `gvt_client_history.txt` next to the
+portable executable.
+
+## Direct Viewer Diagnostics
+
+Normally use `GVT Cloud Client.exe`. For debugging, run the viewer directly:
+
+```powershell
+.\app\viewer\gvt_spice_viewer.exe `
+  --video-codec h264 `
+  --video-port 5004 `
+  --latency 15 `
+  --spice-host 192.168.0.188 `
+  --spice-port 5900 `
+  --native-input `
+  --input-host 192.168.0.188 `
+  --input-port 5905 `
+  --stream-control-host 192.168.0.188 `
+  --stream-control-port 5004 `
+  --gst-root .\tools\gstreamer-1.0-mingw-x86_64-1.18.6\gstreamer\1.0\mingw_x86_64 `
+  --spice-runtime .\runtime\virtviewer\bin `
+  --source-width 1920 `
+  --source-height 1200 `
+  --auto-size
+```
+
+Logs:
+
+- `gvt_client_debug.log`: launcher log.
+- `app\viewer\gvt_spice_viewer.log`: viewer, GStreamer, SPICE, and control log.
+
+## Runtime Notes
+
+- The viewer sends `start` to the server only after the local GStreamer
+  receiver is ready, so reconnect does not ask the server to encode too early.
+- Closing the viewer closes the stream-control session; the server should stop
+  encoding.
+- The current default latency is `15 ms` and `drop-on-latency=false`, matching
+  the low-latency no-green-frame baseline.
+- SPICE is used for audio/session only. Primary video comes from QEMU
+  `gvt-stream` RTP.
