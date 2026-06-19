@@ -164,6 +164,7 @@ static CRITICAL_SECTION native_input_lock;
 static bool native_input_lock_ready;
 static SOCKET native_input_sock = INVALID_SOCKET;
 static SOCKET stream_control_sock = INVALID_SOCKET;
+static volatile LONG stream_control_start_sent;
 static bool winsock_ready;
 static ULONGLONG log_start_ms;
 static int audio_channels;
@@ -611,6 +612,43 @@ static void stream_control_close(void)
         closesocket(stream_control_sock);
         stream_control_sock = INVALID_SOCKET;
     }
+    InterlockedExchange(&stream_control_start_sent, 0);
+}
+
+static bool stream_control_send_start(const char *reason)
+{
+    char start[256];
+    ULONGLONG t_stage;
+
+    if (!stream_control_enabled || stream_control_sock == INVALID_SOCKET) {
+        log_line("stream-control start skipped reason=%s enabled=%d sock=%d",
+                 reason ? reason : "", stream_control_enabled,
+                 stream_control_sock != INVALID_SOCKET);
+        return false;
+    }
+    if (InterlockedExchange(&stream_control_start_sent, 1) != 0) {
+        log_line("stream-control start already sent reason=%s",
+                 reason ? reason : "");
+        return true;
+    }
+
+    snprintf(start, sizeof(start),
+             "{\"type\":\"start\",\"video_port\":%d,\"codec\":\"%s\"}\n",
+             video_port, video_codec ? video_codec : "h264");
+    t_stage = viewer_now_ms();
+    if (send(stream_control_sock, start, (int)strlen(start), 0) <= 0) {
+        log_line("stream-control start send failed reason=%s err=%d",
+                 reason ? reason : "", WSAGetLastError());
+        InterlockedExchange(&stream_control_start_sent, 0);
+        return false;
+    }
+    log_line("stream-control start-sent reason=%s dt=%I64ums bytes=%u "
+             "video_port=%d codec=%s",
+             reason ? reason : "",
+             (unsigned long long)(viewer_now_ms() - t_stage),
+             (unsigned)strlen(start), video_port,
+             video_codec ? video_codec : "h264");
+    return true;
 }
 
 static int json_get_int_field(const char *json, const char *key, int defval)
@@ -745,16 +783,15 @@ static bool stream_control_start_session(void)
     log_line("stream-control connect-ok dt=%I64ums",
              (unsigned long long)(viewer_now_ms() - t_stage));
 
-    snprintf(hello, sizeof(hello),
-             "{\"type\":\"start\",\"video_port\":%d,\"codec\":\"%s\"}\n",
-             video_port, video_codec ? video_codec : "h264");
+    InterlockedExchange(&stream_control_start_sent, 0);
+    snprintf(hello, sizeof(hello), "{\"type\":\"status\"}\n");
     t_stage = viewer_now_ms();
     if (send(stream_control_sock, hello, (int)strlen(hello), 0) <= 0) {
-        log_line("stream-control hello send failed: %d", WSAGetLastError());
+        log_line("stream-control status request send failed: %d", WSAGetLastError());
         stream_control_close();
         return false;
     }
-    log_line("stream-control hello-sent dt=%I64ums bytes=%u",
+    log_line("stream-control status-request-sent dt=%I64ums bytes=%u",
              (unsigned long long)(viewer_now_ms() - t_stage),
              (unsigned)strlen(hello));
     log_line("stream-control connected %s:%d video_port=%d codec=%s",
@@ -769,6 +806,7 @@ static bool stream_control_start_session(void)
     } else {
         log_line("stream-control did not return port status after %I64ums, using local ports",
                  (unsigned long long)(viewer_now_ms() - t_stage));
+        stream_control_send_start("legacy-status-timeout");
     }
     setsockopt(stream_control_sock, SOL_SOCKET, SO_RCVTIMEO,
                (const char *)&no_timeout, sizeof(no_timeout));
@@ -1931,6 +1969,7 @@ static void resize_window_to_source(HWND hwnd)
 static DWORD WINAPI gst_receiver_thread(LPVOID opaque)
 {
     ULONGLONG t0 = viewer_now_ms();
+    bool ready;
 
     (void)opaque;
     if (InterlockedExchange(&gst_started, 1) != 0) {
@@ -1939,7 +1978,10 @@ static DWORD WINAPI gst_receiver_thread(LPVOID opaque)
     }
 
     log_line("gst receiver thread begin");
-    start_gst_receiver();
+    ready = start_gst_receiver();
+    if (ready) {
+        stream_control_send_start("gst-ready");
+    }
     log_line("gst receiver thread ready total=%I64ums",
              (unsigned long long)(viewer_now_ms() - t0));
     return 0;
