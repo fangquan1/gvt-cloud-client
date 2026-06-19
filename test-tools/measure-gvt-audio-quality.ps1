@@ -11,6 +11,8 @@ param(
     [string]$ServerSsh = "root@192.168.0.188",
     [string]$QgaSock = "/root/qemu_cmd/win10-gvt-stream-qga.sock",
     [string]$GuestRoot = "C:\ProgramData\GvtCloudTest",
+    [string]$GuestAgentScheduledTaskName = "GvtCloudTestAgent",
+    [int]$GuestCommandConsumeTimeoutSec = 8,
     [ValidateSet("agent-file", "qga-once", "none")]
     [string]$GuestTrigger = "agent-file",
     [string]$GstRoot = "",
@@ -19,6 +21,9 @@ param(
     [int]$PostRollSec = 2,
     [int]$SampleRate = 48000,
     [int]$LatencyUs = 10000,
+    [int]$CaptureBufferTimeUs = 200000,
+    [int]$CaptureBufferDurationUs = 10000,
+    [switch]$CaptureLowLatency,
     [string]$OutDir = "build\audio-quality",
     [switch]$BatchMode,
     [int]$MinDetectedPulses = 8,
@@ -37,6 +42,7 @@ param(
     [int]$SpectrumFftSize = 8192,
     [int]$SpectrumWindows = 24,
     [double]$SpectrumMaxHz = 12000.0,
+    [string]$ViewerProcessName = "gvt_spice_viewer",
     [switch]$RequireWaveformMatch
 )
 
@@ -59,6 +65,50 @@ function Join-GvtProcessArgs {
     param([string[]]$ArgList)
 
     return (($ArgList | ForEach-Object { Quote-GvtProcessArg $_ }) -join " ")
+}
+
+function Get-GvtUnixTimeMs {
+    return [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+}
+
+function Get-GvtLocalLineCount {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return 0
+    }
+    return (Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue | Measure-Object -Line).Lines
+}
+
+function Get-GvtLocalLogTail {
+    param(
+        [string]$Path,
+        [int]$StartLine
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return @()
+    }
+
+    $allLines = @(Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue)
+    $tail = New-Object System.Collections.Generic.List[string]
+    for ($i = $StartLine; $i -lt $allLines.Count; $i++) {
+        [void]$tail.Add($allLines[$i])
+    }
+    return $tail.ToArray()
+}
+
+function Get-GvtViewerLogPath {
+    param([string]$ProcessName)
+
+    $proc = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path } |
+        Sort-Object StartTime -Descending |
+        Select-Object -First 1
+    if (-not $proc) {
+        return $null
+    }
+    return Join-Path (Split-Path -Parent $proc.Path) "gvt_spice_viewer.log"
 }
 
 function Get-GvtWavRms {
@@ -227,9 +277,31 @@ $recordedWavForGst = $recordedWav -replace "\\", "/"
 $gstLog = Join-Path $runDir "gst-loopback.log"
 $summaryJson = Join-Path $runDir "summary.json"
 $reportMd = Join-Path $runDir "report.md"
+$viewerLogOut = Join-Path $runDir "viewer-log-tail.log"
+$viewerAudioLogOut = Join-Path $runDir "viewer-audio.log"
 $waveformAnalysisDir = Join-Path $runDir "waveform-analysis"
 $waveformAnalysisJson = Join-Path $waveformAnalysisDir "waveform-analysis.json"
 $waveformAnalysisLog = Join-Path $waveformAnalysisDir "waveform-analysis.log"
+$viewerLogSource = Get-GvtViewerLogPath -ProcessName $ViewerProcessName
+$viewerLogStartLine = if ($viewerLogSource) { Get-GvtLocalLineCount -Path $viewerLogSource } else { 0 }
+$recordStartWallMs = $null
+$triggerWallMs = $null
+$recordEndWallMs = $null
+$guestCommandConsumedWallMs = $null
+$guestAgentBeforeTrigger = $null
+$guestAgentAfterTrigger = $null
+
+if ($GuestTrigger -eq "agent-file") {
+    Write-Host "Preparing guest test agent..."
+    $guestAgentBeforeTrigger = Wait-GvtGuestTestAgentReady `
+        -GuestRoot $GuestRoot `
+        -ScheduledTaskName $GuestAgentScheduledTaskName `
+        -ServerSsh $ServerSsh `
+        -QgaSock $QgaSock `
+        -TimeoutSec ([Math]::Max(8, $GuestCommandConsumeTimeoutSec)) `
+        -ClearCommand `
+        -BatchMode:$BatchMode
+}
 
 Write-Host "Generating reference audio..."
 New-GvtReferenceAudioFile -Path $referenceWav -DurationSec $DurationSec -SampleRate $SampleRate -Channels 2
@@ -237,14 +309,15 @@ New-GvtReferenceAudioFile -Path $referenceWav -DurationSec $DurationSec -SampleR
 $gstLaunch = Resolve-GvtGstExe -Name "gst-launch-1.0.exe" -GstRoot $GstRoot
 $gstRootResolved = Split-Path -Parent (Split-Path -Parent $gstLaunch)
 $recordSec = $DurationSec + [Math]::Ceiling($PreRollMs / 1000.0) + $PostRollSec
-$numBuffers = [Math]::Ceiling(($recordSec * 1000000.0) / [double]$LatencyUs)
+$numBuffers = [Math]::Ceiling(($recordSec * 1000000.0) / [double]([Math]::Max(1000, $CaptureBufferDurationUs)))
+$captureLowLatencyValue = if ($CaptureLowLatency) { "true" } else { "false" }
 
 $gstArgs = @(
     "-e",
     "wasapisrc",
     "loopback=true",
-    "low-latency=true",
-    "buffer-time=50000",
+    ("low-latency={0}" -f $captureLowLatencyValue),
+    ("buffer-time={0}" -f $CaptureBufferTimeUs),
     ("latency-time={0}" -f $LatencyUs),
     ("num-buffers={0}" -f $numBuffers),
     "!",
@@ -274,12 +347,14 @@ $startInfo.EnvironmentVariables["GST_PLUGIN_SYSTEM_PATH_1_0"] = Join-Path $gstRo
 Write-Host "Recording loopback audio for about $recordSec seconds..."
 $process = [Diagnostics.Process]::new()
 $process.StartInfo = $startInfo
+$recordStartWallMs = Get-GvtUnixTimeMs
 [void]$process.Start()
 
 Start-Sleep -Milliseconds $PreRollMs
 
 if ($GuestTrigger -eq "agent-file") {
     Write-Host "Triggering guest agent playback through command.json..."
+    $triggerWallMs = Get-GvtUnixTimeMs
     $cmd = @{
         command = "play-audio-test"
         duration_sec = $DurationSec
@@ -293,8 +368,16 @@ if ($GuestTrigger -eq "agent-file") {
         -ServerSsh $ServerSsh `
         -QgaSock $QgaSock `
         -BatchMode:$BatchMode
+    $guestAgentAfterTrigger = Wait-GvtGuestTestCommandConsumed `
+        -GuestRoot $GuestRoot `
+        -ServerSsh $ServerSsh `
+        -QgaSock $QgaSock `
+        -TimeoutSec $GuestCommandConsumeTimeoutSec `
+        -BatchMode:$BatchMode
+    $guestCommandConsumedWallMs = Get-GvtUnixTimeMs
 } elseif ($GuestTrigger -eq "qga-once") {
     Write-Host "Triggering guest one-shot playback through QGA guest-exec..."
+    $triggerWallMs = Get-GvtUnixTimeMs
     $guestAgent = Join-Path $GuestRoot "gvt-test-agent.ps1"
     [void](Invoke-GvtQgaCommand `
         -Command @{
@@ -310,6 +393,7 @@ if ($GuestTrigger -eq "agent-file") {
         -BatchMode:$BatchMode)
 } else {
     Write-Host "GuestTrigger=none. Start playback in the guest now."
+    $triggerWallMs = Get-GvtUnixTimeMs
 }
 
 $waitMs = [int](($recordSec + 8) * 1000)
@@ -317,10 +401,24 @@ if (-not $process.WaitForExit($waitMs)) {
     $process.Kill()
     $process.WaitForExit()
 }
+$recordEndWallMs = Get-GvtUnixTimeMs
 
 $stdout = $process.StandardOutput.ReadToEnd()
 $stderr = $process.StandardError.ReadToEnd()
 Set-Content -LiteralPath $gstLog -Value ($stdout + "`r`n" + $stderr) -Encoding UTF8
+
+$viewerLogTail = @()
+$viewerAudioLines = @()
+if ($viewerLogSource) {
+    $viewerLogTail = @(Get-GvtLocalLogTail -Path $viewerLogSource -StartLine $viewerLogStartLine)
+    if ($viewerLogTail.Count -gt 0) {
+        Set-Content -LiteralPath $viewerLogOut -Value $viewerLogTail -Encoding UTF8
+        $viewerAudioLines = @($viewerLogTail | Where-Object {
+            $_ -match "playback|latency-audio|SPICE audio sink|spice session disconnect|SPICE channel-new type=5|SPICE channel-event type=5"
+        })
+        Set-Content -LiteralPath $viewerAudioLogOut -Value $viewerAudioLines -Encoding UTF8
+    }
+}
 
 if (-not (Test-Path -LiteralPath $recordedWav)) {
     throw "Loopback recording was not created. See $gstLog"
@@ -420,11 +518,34 @@ $summary = [ordered]@{
     reference_wav = $referenceWav
     recorded_wav = $recordedWav
     gst_log = $gstLog
+    viewer_log_source = $viewerLogSource
+    viewer_log_start_line = $viewerLogStartLine
+    viewer_log_tail = if ($viewerLogTail.Count -gt 0) { $viewerLogOut } else { $null }
+    viewer_audio_log = if ($viewerAudioLines.Count -gt 0) { $viewerAudioLogOut } else { $null }
+    viewer_log_tail_lines = $viewerLogTail.Count
+    viewer_log_audio_lines = $viewerAudioLines.Count
+    guest_agent_before_trigger = $guestAgentBeforeTrigger
+    guest_agent_after_trigger = $guestAgentAfterTrigger
+    timing = [ordered]@{
+        record_start_wall_ms = $recordStartWallMs
+        trigger_wall_ms = $triggerWallMs
+        guest_command_consumed_wall_ms = $guestCommandConsumedWallMs
+        record_end_wall_ms = $recordEndWallMs
+        trigger_after_record_start_ms = if ($null -ne $recordStartWallMs -and $null -ne $triggerWallMs) { $triggerWallMs - $recordStartWallMs } else { $null }
+        guest_command_consume_after_trigger_ms = if ($null -ne $guestCommandConsumedWallMs -and $null -ne $triggerWallMs) { $guestCommandConsumedWallMs - $triggerWallMs } else { $null }
+    }
     waveform_analysis_path = $waveformAnalysisJson
     waveform_analysis_log = $waveformAnalysisLog
     guest_trigger = $GuestTrigger
     duration_sec = $DurationSec
     sample_rate = $SampleRate
+    capture = [ordered]@{
+        latency_us = $LatencyUs
+        buffer_time_us = $CaptureBufferTimeUs
+        buffer_duration_us = $CaptureBufferDurationUs
+        low_latency = [bool]$CaptureLowLatency
+        num_buffers = $numBuffers
+    }
     reference = [ordered]@{
         duration_sec = [Math]::Round($ref.DurationSec, 3)
         pulses = @($refPulses | ForEach-Object { [Math]::Round($_, 4) })
@@ -466,6 +587,8 @@ $report = @(
     "",
     "- 结果: $($summary.pass)",
     "- 输出目录: $runDir",
+    "- viewer audio log: $(if ($viewerAudioLines.Count -gt 0) { $viewerAudioLogOut } else { 'NA' })",
+    "- 录音触发 wall_ms: start=$recordStartWallMs trigger=$triggerWallMs consumed=$guestCommandConsumedWallMs end=$recordEndWallMs",
     "- 录制 RMS: $([Math]::Round($recRms, 6))",
     "- 识别到的参考脉冲数: $($recPulses.Count)",
     "- 削波样本比例: $($clip.clipped_pct)%",

@@ -96,6 +96,38 @@ function ConvertFrom-GvtJsonLine {
     throw "$Context did not contain a parseable JSON response. Output: $joined"
 }
 
+function ConvertFrom-GvtJsonText {
+    param(
+        [string]$Text,
+        [string]$Context = "JSON"
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        throw "$Context was empty."
+    }
+
+    $trimmed = $Text.Trim()
+    try {
+        return ($trimmed | ConvertFrom-Json)
+    } catch {
+        $lines = @($trimmed -split "`r?`n" |
+            Where-Object { $_.Trim().StartsWith("{") -or $_.Trim().StartsWith("[") })
+        for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+            try {
+                return ($lines[$i] | ConvertFrom-Json)
+            } catch {
+            }
+        }
+        throw "$Context did not contain parseable JSON. Output: $trimmed"
+    }
+}
+
+function ConvertTo-GvtPowerShellSingleQuoted {
+    param([string]$Value)
+
+    return "'" + ($Value -replace "'", "''") + "'"
+}
+
 function Invoke-GvtQgaCommand {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Command,
@@ -295,6 +327,248 @@ function Write-GvtQgaFile {
     }
 }
 
+function Invoke-GvtGuestPowerShell {
+    param(
+        [Parameter(Mandatory = $true)][string]$Script,
+        [string]$ServerSsh = "root@192.168.0.188",
+        [string]$QgaSock = "/root/qemu_cmd/win10-gvt-stream-qga.sock",
+        [int]$TimeoutSec = 30,
+        [switch]$BatchMode
+    )
+
+    $exec = Invoke-GvtQgaGuestExec `
+        -Path "powershell.exe" `
+        -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $Script) `
+        -ServerSsh $ServerSsh `
+        -QgaSock $QgaSock `
+        -TimeoutSec $TimeoutSec `
+        -BatchMode:$BatchMode
+
+    if ($exec.ExitCode -ne 0) {
+        throw "guest PowerShell exited with $($exec.ExitCode). stdout=$($exec.Stdout) stderr=$($exec.Stderr)"
+    }
+    return $exec.Stdout
+}
+
+function Get-GvtGuestTestAgentState {
+    param(
+        [string]$GuestRoot = "C:\ProgramData\GvtCloudTest",
+        [string]$ServerSsh = "root@192.168.0.188",
+        [string]$QgaSock = "/root/qemu_cmd/win10-gvt-stream-qga.sock",
+        [switch]$BatchMode
+    )
+
+    $rootLiteral = ConvertTo-GvtPowerShellSingleQuoted $GuestRoot
+    $script = @"
+`$root = $rootLiteral
+`$commandPath = Join-Path `$root 'command.json'
+`$statusPath = Join-Path `$root 'status.json'
+`$statusRaw = `$null
+`$statusState = `$null
+`$statusGeneratedAt = `$null
+if (Test-Path -LiteralPath `$statusPath) {
+    `$statusRaw = Get-Content -LiteralPath `$statusPath -Raw -ErrorAction SilentlyContinue
+    if (-not [string]::IsNullOrWhiteSpace(`$statusRaw)) {
+        try {
+            `$status = `$statusRaw | ConvertFrom-Json
+            if (`$status.PSObject.Properties.Name -contains 'state') {
+                `$statusState = [string]`$status.state
+            }
+            if (`$status.PSObject.Properties.Name -contains 'generated_at') {
+                `$statusGeneratedAt = [string]`$status.generated_at
+            }
+        } catch {
+        }
+    }
+}
+`$agents = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object { `$_.CommandLine -like '*gvt-test-agent.ps1*' } |
+    Select-Object ProcessId,SessionId,Name)
+`$interactiveAgents = @(`$agents | Where-Object { [int]`$_.SessionId -gt 0 })
+[pscustomobject]@{
+    checked_at = (Get-Date).ToString('o')
+    root = `$root
+    command_path = `$commandPath
+    command_exists = [bool](Test-Path -LiteralPath `$commandPath)
+    status_path = `$statusPath
+    status_exists = [bool](Test-Path -LiteralPath `$statusPath)
+    status_state = `$statusState
+    status_generated_at = `$statusGeneratedAt
+    agent_count = `$agents.Count
+    interactive_agent_count = `$interactiveAgents.Count
+    agents = @(`$agents)
+} | ConvertTo-Json -Compress -Depth 6
+"@
+
+    $stdout = Invoke-GvtGuestPowerShell `
+        -Script $script `
+        -ServerSsh $ServerSsh `
+        -QgaSock $QgaSock `
+        -TimeoutSec 20 `
+        -BatchMode:$BatchMode
+    return ConvertFrom-GvtJsonText -Text $stdout -Context "guest test agent state"
+}
+
+function Clear-GvtGuestTestCommand {
+    param(
+        [string]$GuestRoot = "C:\ProgramData\GvtCloudTest",
+        [string]$ServerSsh = "root@192.168.0.188",
+        [string]$QgaSock = "/root/qemu_cmd/win10-gvt-stream-qga.sock",
+        [switch]$BatchMode
+    )
+
+    $rootLiteral = ConvertTo-GvtPowerShellSingleQuoted $GuestRoot
+    $script = @"
+`$commandPath = Join-Path $rootLiteral 'command.json'
+Remove-Item -LiteralPath `$commandPath -Force -ErrorAction SilentlyContinue
+[pscustomobject]@{
+    command_path = `$commandPath
+    command_exists = [bool](Test-Path -LiteralPath `$commandPath)
+} | ConvertTo-Json -Compress
+"@
+    $stdout = Invoke-GvtGuestPowerShell `
+        -Script $script `
+        -ServerSsh $ServerSsh `
+        -QgaSock $QgaSock `
+        -TimeoutSec 20 `
+        -BatchMode:$BatchMode
+    return ConvertFrom-GvtJsonText -Text $stdout -Context "guest command cleanup"
+}
+
+function Start-GvtGuestTestAgent {
+    param(
+        [string]$ScheduledTaskName = "GvtCloudTestAgent",
+        [string]$ServerSsh = "root@192.168.0.188",
+        [string]$QgaSock = "/root/qemu_cmd/win10-gvt-stream-qga.sock",
+        [switch]$BatchMode
+    )
+
+    $exec = Invoke-GvtQgaGuestExec `
+        -Path "schtasks.exe" `
+        -ArgumentList @("/Run", "/TN", $ScheduledTaskName) `
+        -ServerSsh $ServerSsh `
+        -QgaSock $QgaSock `
+        -TimeoutSec 20 `
+        -BatchMode:$BatchMode
+
+    if ($exec.ExitCode -ne 0) {
+        throw "failed to start guest test agent task '$ScheduledTaskName'. stdout=$($exec.Stdout) stderr=$($exec.Stderr)"
+    }
+    return $exec
+}
+
+function Test-GvtGuestTestAgentInteractive {
+    param([object]$State)
+
+    if ($null -eq $State) {
+        return $false
+    }
+    if ($State.PSObject.Properties.Name -contains "interactive_agent_count") {
+        return ([int]$State.interactive_agent_count -gt 0)
+    }
+    foreach ($agent in @($State.agents)) {
+        if ($null -ne $agent -and [int]$agent.SessionId -gt 0) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-GvtGuestTestAgentIdle {
+    param([object]$State)
+
+    if ($null -eq $State) {
+        return $false
+    }
+    if ($State.PSObject.Properties.Name -contains "command_exists" -and [bool]$State.command_exists) {
+        return $false
+    }
+    if ($State.PSObject.Properties.Name -contains "status_state") {
+        $state = [string]$State.status_state
+        return ([string]::IsNullOrWhiteSpace($state) -or $state -eq "idle")
+    }
+    return $true
+}
+
+function Wait-GvtGuestTestAgentReady {
+    param(
+        [string]$GuestRoot = "C:\ProgramData\GvtCloudTest",
+        [string]$ScheduledTaskName = "GvtCloudTestAgent",
+        [string]$ServerSsh = "root@192.168.0.188",
+        [string]$QgaSock = "/root/qemu_cmd/win10-gvt-stream-qga.sock",
+        [int]$TimeoutSec = 12,
+        [switch]$ClearCommand,
+        [switch]$BatchMode
+    )
+
+    if ($ClearCommand) {
+        [void](Clear-GvtGuestTestCommand `
+            -GuestRoot $GuestRoot `
+            -ServerSsh $ServerSsh `
+            -QgaSock $QgaSock `
+            -BatchMode:$BatchMode)
+    }
+
+    $deadline = (Get-Date).AddSeconds([Math]::Max(1, $TimeoutSec))
+    $startedTask = $false
+    $lastState = $null
+    do {
+        $lastState = Get-GvtGuestTestAgentState `
+            -GuestRoot $GuestRoot `
+            -ServerSsh $ServerSsh `
+            -QgaSock $QgaSock `
+            -BatchMode:$BatchMode
+        if ((Test-GvtGuestTestAgentInteractive -State $lastState) -and
+            (Test-GvtGuestTestAgentIdle -State $lastState)) {
+            return $lastState
+        }
+
+        if (-not $startedTask) {
+            try {
+                [void](Start-GvtGuestTestAgent `
+                    -ScheduledTaskName $ScheduledTaskName `
+                    -ServerSsh $ServerSsh `
+                    -QgaSock $QgaSock `
+                    -BatchMode:$BatchMode)
+            } catch {
+            }
+            $startedTask = $true
+        }
+        Start-Sleep -Milliseconds 700
+    } while ((Get-Date) -lt $deadline)
+
+    $count = if ($lastState) { $lastState.interactive_agent_count } else { "unknown" }
+    $state = if ($lastState) { $lastState.status_state } else { "unknown" }
+    throw "guest test agent is not idle in an interactive session after $TimeoutSec sec (interactive_agent_count=$count, status_state=$state)."
+}
+
+function Wait-GvtGuestTestCommandConsumed {
+    param(
+        [string]$GuestRoot = "C:\ProgramData\GvtCloudTest",
+        [string]$ServerSsh = "root@192.168.0.188",
+        [string]$QgaSock = "/root/qemu_cmd/win10-gvt-stream-qga.sock",
+        [int]$TimeoutSec = 8,
+        [switch]$BatchMode
+    )
+
+    $deadline = (Get-Date).AddSeconds([Math]::Max(1, $TimeoutSec))
+    $lastState = $null
+    do {
+        $lastState = Get-GvtGuestTestAgentState `
+            -GuestRoot $GuestRoot `
+            -ServerSsh $ServerSsh `
+            -QgaSock $QgaSock `
+            -BatchMode:$BatchMode
+        if (-not [bool]$lastState.command_exists) {
+            return $lastState
+        }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+
+    $agentCount = if ($lastState) { $lastState.interactive_agent_count } else { "unknown" }
+    throw "guest test agent did not consume command.json within $TimeoutSec sec (interactive_agent_count=$agentCount)."
+}
+
 function New-GvtReferenceAudioFile {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -336,8 +610,7 @@ function New-GvtReferenceAudioFile {
             $t = [double]$i / [double]$SampleRate
             $sample =
                 0.10 * [Math]::Sin($twoPi * 440.0 * $t) +
-                0.06 * [Math]::Sin($twoPi * 880.0 * $t) +
-                0.04 * [Math]::Sin($twoPi * 1760.0 * $t)
+                0.03 * [Math]::Sin($twoPi * 660.0 * $t)
 
             $pulseIndex = [Math]::Round(($t - $PulseStartSec) / $PulseIntervalSec)
             $pulseCenter = $PulseStartSec + $pulseIndex * $PulseIntervalSec

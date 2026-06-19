@@ -107,10 +107,20 @@ def align_by_pulses(reference: dict, recorded: dict) -> dict:
     offset_sec = 0.0
     if ref_pulses and rec_pulses:
         offset_sec = rec_pulses[0] - ref_pulses[0]
+    drift_ratio = 1.0
+    pair_count = min(len(ref_pulses), len(rec_pulses))
+    if pair_count >= 2:
+        ref_span = ref_pulses[pair_count - 1] - ref_pulses[0]
+        rec_span = rec_pulses[pair_count - 1] - rec_pulses[0]
+        if ref_span > 0:
+            candidate = rec_span / ref_span
+            if 0.97 <= candidate <= 1.03:
+                drift_ratio = candidate
     offset_samples = int(round(offset_sec * sample_rate))
     ref_start = max(0, -offset_samples)
     rec_start = max(0, offset_samples)
-    count = min(len(reference["samples"]) - ref_start, len(recorded["samples"]) - rec_start)
+    rec_available = int((len(recorded["samples"]) - rec_start) / max(drift_ratio, 1e-9))
+    count = min(len(reference["samples"]) - ref_start, rec_available)
     if count <= sample_rate:
         raise ValueError(f"not enough overlap after alignment: count={count}")
 
@@ -120,10 +130,49 @@ def align_by_pulses(reference: dict, recorded: dict) -> dict:
         "recorded_pulses_sec": rec_pulses,
         "offset_sec": offset_sec,
         "offset_samples": offset_samples,
+        "drift_ratio": drift_ratio,
         "reference_start": ref_start,
         "recorded_start": rec_start,
         "count": count,
         "duration_sec": count / float(sample_rate),
+    }
+
+
+def interpolate_sample(samples: list[float], index: float) -> float:
+    if index <= 0:
+        return samples[0]
+    low = int(math.floor(index))
+    high = low + 1
+    if high >= len(samples):
+        return samples[-1]
+    frac = index - low
+    return samples[low] * (1.0 - frac) + samples[high] * frac
+
+
+def build_aligned_residual(reference: dict, recorded: dict, align: dict) -> dict:
+    ref = reference["samples"]
+    rec = recorded["samples"]
+    ref_start = align["reference_start"]
+    rec_start = align["recorded_start"]
+    drift_ratio = align.get("drift_ratio", 1.0)
+    count = align["count"]
+
+    ref_aligned = []
+    rec_aligned = []
+    for i in range(count):
+        ref_aligned.append(ref[ref_start + i])
+        rec_aligned.append(interpolate_sample(rec, rec_start + i * drift_ratio))
+
+    ref_energy = sum(value * value for value in ref_aligned)
+    gain = 0.0
+    if ref_energy > 0:
+        gain = sum(r * d for r, d in zip(ref_aligned, rec_aligned)) / ref_energy
+
+    residual = [d - gain * r for r, d in zip(ref_aligned, rec_aligned)]
+    return {
+        "samples": residual,
+        "gain": gain,
+        "rms": rms(residual),
     }
 
 
@@ -158,6 +207,26 @@ def robust_threshold(recorded_samples: list[float], start: int, count: int, samp
             continue
         delta = abs(recorded_samples[start + i] - recorded_samples[start + i - 1])
         sampled.append(delta)
+
+    if not sampled:
+        median = 0.0
+        mad = 0.0
+    else:
+        median = statistics.median(sampled)
+        mad = statistics.median(abs(value - median) for value in sampled)
+    threshold = max(args.min_pop_delta, median + args.pop_mad * max(mad, 1e-7))
+    return {"median_delta": median, "mad_delta": mad, "threshold_delta": threshold, "sampled_deltas": len(sampled)}
+
+
+def robust_threshold_series(samples: list[float], sample_rate: int, pulses: list[float], args) -> dict:
+    excluded = excluded_time_fn(pulses, args.exclude_pulse_ms / 1000.0)
+    duration_sec = len(samples) / float(sample_rate)
+    sampled = []
+    for i in range(1, len(samples), max(1, args.threshold_stride)):
+        time_sec = i / float(sample_rate)
+        if excluded(time_sec) or is_edge_excluded(time_sec, duration_sec, args.edge_exclude_ms):
+            continue
+        sampled.append(abs(samples[i] - samples[i - 1]))
 
     if not sampled:
         median = 0.0
@@ -292,6 +361,126 @@ def detect_pop_events(recorded_samples: list[float], align: dict, pulses: list[f
     }
 
 
+def detect_pop_events_from_series(samples: list[float], sample_rate: int, pulses: list[float], args) -> dict:
+    count = len(samples)
+    duration_sec = count / float(sample_rate)
+    threshold_info = robust_threshold_series(samples, sample_rate, pulses, args)
+    threshold = threshold_info["threshold_delta"]
+    excluded = excluded_time_fn(pulses, args.exclude_pulse_ms / 1000.0)
+    merge_gap = max(1, int(sample_rate * args.merge_gap_ms / 1000.0))
+    max_duration_ms = args.max_pop_duration_ms
+
+    events = []
+    current = None
+    last_hit = -999999
+    max_score = 0.0
+    score_series = []
+    score_window = max(1, int(sample_rate * args.score_hop_ms / 1000.0))
+    score_max = 0.0
+    score_start = 1
+
+    def finish_event(event):
+        if not event:
+            return
+        duration_ms = (event["end_index"] - event["start_index"] + 1) * 1000.0 / sample_rate
+        if duration_ms <= max_duration_ms:
+            event["time_sec"] = event["peak_index"] / float(sample_rate)
+            event["duration_ms"] = duration_ms
+            event["score"] = event["peak_delta"] / threshold if threshold > 0 else 0.0
+            event["severe"] = event["score"] >= args.severe_score
+            events.append(event)
+
+    for i in range(1, count):
+        time_sec = i / float(sample_rate)
+        if excluded(time_sec) or is_edge_excluded(time_sec, duration_sec, args.edge_exclude_ms):
+            hit = False
+            delta = 0.0
+            abs_value = 0.0
+        else:
+            value = samples[i]
+            prev = samples[i - 1]
+            delta = abs(value - prev)
+            abs_value = abs(value)
+            hit = delta >= threshold
+
+        score = delta / threshold if threshold > 0 else 0.0
+        max_score = max(max_score, score)
+        score_max = max(score_max, score)
+        if i - score_start >= score_window:
+            score_series.append((score_start / float(sample_rate), score_max))
+            score_start = i
+            score_max = 0.0
+
+        if hit:
+            if current is None or (i - last_hit) > merge_gap:
+                finish_event(current)
+                current = {
+                    "start_index": i,
+                    "end_index": i,
+                    "peak_index": i,
+                    "peak_delta": delta,
+                    "peak_abs": abs_value,
+                }
+            else:
+                current["end_index"] = i
+                if delta > current["peak_delta"]:
+                    current["peak_delta"] = delta
+                    current["peak_abs"] = abs_value
+                    current["peak_index"] = i
+            last_hit = i
+    finish_event(current)
+    if score_start < count:
+        score_series.append((score_start / float(sample_rate), score_max))
+
+    event_times = [event["time_sec"] for event in events]
+    intervals = [event_times[i] - event_times[i - 1] for i in range(1, len(event_times))]
+    periodic = False
+    periodic_confidence = 0.0
+    interval_mean = None
+    interval_cv = None
+    if len(intervals) >= 3:
+        filtered = [value for value in intervals if args.min_period_ms / 1000.0 <= value <= args.max_period_ms / 1000.0]
+        if len(filtered) >= 3:
+            interval_mean = sum(filtered) / len(filtered)
+            stdev = statistics.pstdev(filtered) if len(filtered) > 1 else 0.0
+            interval_cv = stdev / interval_mean if interval_mean > 0 else None
+            if interval_cv is not None:
+                periodic_confidence = max(0.0, min(1.0, 1.0 - interval_cv / args.periodic_cv_for_zero_confidence))
+                periodic = periodic_confidence >= args.periodic_confidence_threshold
+
+    severe_count = sum(1 for event in events if event["severe"])
+    passed = (
+        len(events) <= args.max_pop_events
+        and severe_count <= args.max_severe_pop_events
+        and not periodic
+    )
+
+    return {
+        "pass": passed,
+        "events": events,
+        "event_count": len(events),
+        "severe_event_count": severe_count,
+        "max_score": max_score,
+        "threshold": threshold_info,
+        "score_series": score_series,
+        "periodic": {
+            "detected": periodic,
+            "confidence": periodic_confidence,
+            "mean_interval_ms": interval_mean * 1000.0 if interval_mean is not None else None,
+            "interval_cv": interval_cv,
+        },
+        "thresholds": {
+            "max_pop_events": args.max_pop_events,
+            "max_severe_pop_events": args.max_severe_pop_events,
+            "severe_score": args.severe_score,
+            "periodic_confidence_threshold": args.periodic_confidence_threshold,
+            "exclude_pulse_ms": args.exclude_pulse_ms,
+            "edge_exclude_ms": args.edge_exclude_ms,
+            "basis": "aligned_residual",
+        },
+    }
+
+
 def downsample_waveforms(reference: dict, recorded: dict, align: dict, points: int, pop_scores: list[tuple[float, float]]):
     ref = reference["samples"]
     rec = recorded["samples"]
@@ -299,6 +488,7 @@ def downsample_waveforms(reference: dict, recorded: dict, align: dict, points: i
     rec_start = align["recorded_start"]
     count = align["count"]
     sample_rate = align["sample_rate"]
+    drift_ratio = align.get("drift_ratio", 1.0)
     buckets = max(1, min(points, count))
     step = max(1, count // buckets)
     score_index = 0
@@ -320,8 +510,14 @@ def downsample_waveforms(reference: dict, recorded: dict, align: dict, points: i
                 "t_end": t1,
                 "ref_min": min(ref_slice),
                 "ref_max": max(ref_slice),
-                "recorded_min": min(rec_slice),
-                "recorded_max": max(rec_slice),
+                "recorded_min": min(
+                    interpolate_sample(rec, rec_start + j * drift_ratio)
+                    for j in range(i, end)
+                ),
+                "recorded_max": max(
+                    interpolate_sample(rec, rec_start + j * drift_ratio)
+                    for j in range(i, end)
+                ),
                 "pop_score_max": score_max,
             }
         )
@@ -416,7 +612,13 @@ def compute_average_spectrum(reference: dict, recorded: dict, align: dict, pulse
             for i in range(fft_size)
         ]
         rec_values = [
-            complex(recorded["samples"][align["recorded_start"] + start + i] * window[i], 0.0)
+            complex(
+                interpolate_sample(
+                    recorded["samples"],
+                    align["recorded_start"] + (start + i) * align.get("drift_ratio", 1.0),
+                ) * window[i],
+                0.0,
+            )
             for i in range(fft_size)
         ]
         fft_in_place(ref_values)
@@ -583,9 +785,10 @@ def write_detail_svg(path: str, reference: dict, recorded: dict, align: dict, ce
 
     ref_points = []
     rec_points = []
+    drift_ratio = align.get("drift_ratio", 1.0)
     for i in range(start, end, step):
         ref_v = reference["samples"][align["reference_start"] + i]
-        rec_v = recorded["samples"][align["recorded_start"] + i]
+        rec_v = interpolate_sample(recorded["samples"], align["recorded_start"] + i * drift_ratio)
         ref_points.append(f"{x_for(i):.1f},{y_for(ref_v):.1f}")
         rec_points.append(f"{x_for(i):.1f},{y_for(rec_v):.1f}")
 
@@ -699,7 +902,8 @@ def main() -> int:
     reference = read_pcm16_wav(args.reference)
     recorded = read_pcm16_wav(args.recorded)
     align = align_by_pulses(reference, recorded)
-    pop = detect_pop_events(recorded["samples"], align, align["reference_pulses_sec"], args)
+    residual = build_aligned_residual(reference, recorded, align)
+    pop = detect_pop_events_from_series(residual["samples"], align["sample_rate"], align["reference_pulses_sec"], args)
     rows = downsample_waveforms(reference, recorded, align, args.points, pop["score_series"])
     spectrum = compute_average_spectrum(reference, recorded, align, align["reference_pulses_sec"], args)
     spectrum_rows = downsample_spectrum_rows(spectrum["rows"], args.spectrum_points)
@@ -763,6 +967,7 @@ def main() -> int:
         "alignment": {
             "offset_sec": round(align["offset_sec"], 6),
             "offset_samples": align["offset_samples"],
+            "drift_ratio": round(align["drift_ratio"], 8),
             "reference_start": align["reference_start"],
             "recorded_start": align["recorded_start"],
             "reference_pulses_sec": [round(value, 6) for value in align["reference_pulses_sec"]],
@@ -770,6 +975,9 @@ def main() -> int:
         },
         "pop_detection": {
             "pass": pop["pass"],
+            "basis": "aligned_residual",
+            "residual_gain": round(residual["gain"], 6),
+            "residual_rms": round(residual["rms"], 8),
             "event_count": pop["event_count"],
             "severe_event_count": pop["severe_event_count"],
             "max_score": round(pop["max_score"], 3),

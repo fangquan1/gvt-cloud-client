@@ -170,6 +170,10 @@ static ULONGLONG log_start_ms;
 static int audio_channels;
 static int audio_frequency;
 static ULONGLONG audio_last_data_ms;
+static unsigned int audio_chunks;
+static unsigned long long audio_bytes;
+static bool audio_have_last_frame;
+static int audio_last_frame_avg;
 static volatile LONG video_probe_counts[4];
 static HANDLE video_probe_thread;
 static HANDLE spice_thread_handle;
@@ -1389,36 +1393,132 @@ static void playback_start_cb(void *channel, gint format, gint channels,
     audio_channels = channels;
     audio_frequency = frequency;
     audio_last_data_ms = 0;
+    audio_chunks = 0;
+    audio_bytes = 0;
+    audio_have_last_frame = false;
+    audio_last_frame_avg = 0;
     if (audio_debug()) {
-        log_line("SPICE playback-start format=%d channels=%d frequency=%d",
-                 format, channels, frequency);
+        log_line("SPICE playback-start wall_ms=%I64u format=%d channels=%d frequency=%d",
+                 (unsigned long long)viewer_wall_ms(), format, channels, frequency);
     }
+}
+
+static void inspect_audio_pcm(gpointer audio, gint size, int chunk_ms, ULONGLONG gap_ms)
+{
+    const int16_t *samples = (const int16_t *)audio;
+    int channels = audio_channels > 0 ? audio_channels : 2;
+    int sample_count;
+    int frames;
+    int first_avg = 0;
+    int last_avg = 0;
+    int peak = 0;
+    int boundary_delta = 0;
+    int max_frame_delta = 0;
+    int max_frame_delta_index = 0;
+    long long abs_sum = 0;
+    bool silent_chunk;
+    bool boundary_jump;
+    bool frame_jump;
+
+    if (!audio_debug() || !samples || size <= 0 || channels <= 0) {
+        return;
+    }
+    sample_count = size / (int)sizeof(int16_t);
+    frames = sample_count / channels;
+    if (frames <= 0) {
+        return;
+    }
+
+    for (int i = 0; i < sample_count; i++) {
+        int value = samples[i];
+        int abs_value = value < 0 ? -value : value;
+        if (abs_value > peak) {
+            peak = abs_value;
+        }
+        abs_sum += abs_value;
+    }
+    for (int ch = 0; ch < channels; ch++) {
+        first_avg += samples[ch];
+        last_avg += samples[(frames - 1) * channels + ch];
+    }
+    first_avg /= channels;
+    last_avg /= channels;
+    if (frames > 1) {
+        int prev_avg = audio_have_last_frame ? audio_last_frame_avg : first_avg;
+        for (int frame = 0; frame < frames; frame++) {
+            int frame_avg = 0;
+            int delta;
+            for (int ch = 0; ch < channels; ch++) {
+                frame_avg += samples[frame * channels + ch];
+            }
+            frame_avg /= channels;
+            delta = frame_avg - prev_avg;
+            if (delta < 0) {
+                delta = -delta;
+            }
+            if (delta > max_frame_delta) {
+                max_frame_delta = delta;
+                max_frame_delta_index = frame;
+            }
+            prev_avg = frame_avg;
+        }
+    }
+    if (audio_have_last_frame) {
+        boundary_delta = first_avg - audio_last_frame_avg;
+        if (boundary_delta < 0) {
+            boundary_delta = -boundary_delta;
+        }
+    }
+
+    silent_chunk = frames >= 120 && peak <= 16;
+    boundary_jump = audio_have_last_frame && boundary_delta >= 2600;
+    frame_jump = max_frame_delta >= 2600;
+    if (silent_chunk || boundary_jump || frame_jump) {
+        double mean_abs = (double)abs_sum / ((double)sample_count * 32768.0);
+        log_line("latency-audio-pcm wall_ms=%I64u chunks=%u reason=%s%s%s mean_abs=%.6f peak=%.6f first=%.6f last=%.6f boundary_delta=%.6f frame_delta=%.6f frame_delta_ms=%.3f chunk_ms=%d gap_ms=%I64u",
+                 (unsigned long long)viewer_wall_ms(),
+                 audio_chunks,
+                 silent_chunk ? "silent" : "",
+                 boundary_jump ? "jump" : "",
+                 frame_jump ? "samplejump" : "",
+                 mean_abs,
+                 (double)peak / 32768.0,
+                 (double)first_avg / 32768.0,
+                 (double)last_avg / 32768.0,
+                 (double)boundary_delta / 32768.0,
+                 (double)max_frame_delta / 32768.0,
+                 (double)max_frame_delta_index * 1000.0 / (double)(audio_frequency > 0 ? audio_frequency : 48000),
+                 chunk_ms,
+                 (unsigned long long)gap_ms);
+    }
+
+    audio_last_frame_avg = last_avg;
+    audio_have_last_frame = true;
 }
 
 static void playback_data_cb(void *channel, gpointer audio, gint size,
                              void *opaque)
 {
-    static unsigned int chunks;
-    static unsigned long long bytes;
     ULONGLONG now_ms = viewer_now_ms();
     ULONGLONG gap_ms = audio_last_data_ms ? now_ms - audio_last_data_ms : 0;
     int chunk_ms = 0;
     (void)channel;
-    (void)audio;
     (void)opaque;
 
-    chunks++;
-    bytes += size > 0 ? (unsigned int)size : 0;
+    audio_chunks++;
+    audio_bytes += size > 0 ? (unsigned int)size : 0;
     if (audio_channels > 0 && audio_frequency > 0) {
         chunk_ms = (int)((int64_t)size * 1000 /
                          ((int64_t)audio_channels * 2 * audio_frequency));
     }
-    if (audio_debug() && (chunks <= 20 || (chunks % 100) == 0 ||
+    if (audio_debug() && (audio_chunks <= 20 || (audio_chunks % 100) == 0 ||
                           gap_ms > 80 || chunk_ms > 60)) {
-        log_line("latency-audio-playback chunks=%u total_bytes=%I64u last_bytes=%d chunk_ms=%d gap_ms=%I64u channels=%d freq=%d",
-                 chunks, bytes, size, chunk_ms, (unsigned long long)gap_ms,
+        log_line("latency-audio-playback wall_ms=%I64u chunks=%u total_bytes=%I64u last_bytes=%d chunk_ms=%d gap_ms=%I64u channels=%d freq=%d",
+                 (unsigned long long)viewer_wall_ms(),
+                 audio_chunks, audio_bytes, size, chunk_ms, (unsigned long long)gap_ms,
                  audio_channels, audio_frequency);
     }
+    inspect_audio_pcm(audio, size, chunk_ms, gap_ms);
     audio_last_data_ms = now_ms;
 }
 
@@ -1427,11 +1527,15 @@ static void playback_stop_cb(void *channel, void *opaque)
     (void)channel;
     (void)opaque;
     if (audio_debug()) {
-        log_line("SPICE playback-stop last_gap_ms=%I64u",
+        log_line("SPICE playback-stop wall_ms=%I64u chunks=%u total_bytes=%I64u last_gap_ms=%I64u",
+                 (unsigned long long)viewer_wall_ms(),
+                 audio_chunks, audio_bytes,
                  audio_last_data_ms ?
                  (unsigned long long)(viewer_now_ms() - audio_last_data_ms) : 0);
     }
     audio_last_data_ms = 0;
+    audio_have_last_frame = false;
+    audio_last_frame_avg = 0;
 }
 
 static void channel_new(void *session, void *channel, void *opaque)
@@ -1659,12 +1763,15 @@ static void set_gst_environment(void)
     char old_path[32768];
     char new_path[32768];
     char audio_sink[1024];
+    char audio_sink_kind[32];
+    const char *audio_sink_name = "directsound";
+    DWORD audio_sink_kind_len;
     int audio_buffer_us = getenv_int_clamped("GVT_SPICE_AUDIO_BUFFER_US",
-                                             300000, 20000, 1000000);
+                                             100000, 20000, 1000000);
     int audio_latency_us = getenv_int_clamped("GVT_SPICE_AUDIO_LATENCY_US",
-                                              100000, 5000, 500000);
+                                              20000, 5000, 500000);
     int audio_queue_ms = getenv_int_clamped("GVT_SPICE_AUDIO_QUEUE_MS",
-                                            1000, 100, 2000);
+                                            200, 100, 2000);
 
     if (!gst_root) {
         snprintf(root, sizeof(root),
@@ -1687,17 +1794,33 @@ static void set_gst_environment(void)
     SetEnvironmentVariableA("GST_REGISTRY", registry);
     log_line("GStreamer registry %s", registry);
     if (!env_is_set("SPICE_GST_AUDIOSINK")) {
-        snprintf(audio_sink, sizeof(audio_sink),
-            "appsrc is-live=1 do-timestamp=1 format=time "
-            "caps=\"audio/x-raw,format=S16LE,channels=2,rate=48000,layout=interleaved\" "
-            "name=\"appsrc\" ! queue max-size-time=%d000000 max-size-buffers=0 max-size-bytes=0 "
-            "! audioconvert ! audioresample "
-            "! directsoundsink name=\"audiosink\" sync=false async=false "
-            "buffer-time=%d latency-time=%d",
-            audio_queue_ms, audio_buffer_us, audio_latency_us);
+        audio_sink_kind_len = GetEnvironmentVariableA("GVT_SPICE_AUDIO_SINK",
+                                                      audio_sink_kind,
+                                                      sizeof(audio_sink_kind));
+        if (audio_sink_kind_len > 0 && audio_sink_kind_len < sizeof(audio_sink_kind) &&
+            _stricmp(audio_sink_kind, "wasapi") == 0) {
+            audio_sink_name = "wasapi";
+            snprintf(audio_sink, sizeof(audio_sink),
+                "appsrc is-live=1 do-timestamp=0 format=time "
+                "caps=\"audio/x-raw,format=S16LE,channels=2,rate=48000,layout=interleaved\" "
+                "name=\"appsrc\" ! queue max-size-time=%d000000 max-size-buffers=0 max-size-bytes=0 "
+                "! audioconvert ! audioresample "
+                "! wasapisink name=\"audiosink\" sync=false async=false low-latency=true "
+                "buffer-time=%d latency-time=%d",
+                audio_queue_ms, audio_buffer_us, audio_latency_us);
+        } else {
+            snprintf(audio_sink, sizeof(audio_sink),
+                "appsrc is-live=1 do-timestamp=0 format=time "
+                "caps=\"audio/x-raw,format=S16LE,channels=2,rate=48000,layout=interleaved\" "
+                "name=\"appsrc\" ! queue max-size-time=%d000000 max-size-buffers=0 max-size-bytes=0 "
+                "! audioconvert ! audioresample "
+                "! directsoundsink name=\"audiosink\" sync=false async=false "
+                "buffer-time=%d latency-time=%d",
+                audio_queue_ms, audio_buffer_us, audio_latency_us);
+        }
         SetEnvironmentVariableA("SPICE_GST_AUDIOSINK", audio_sink);
-        log_line("SPICE audio sink queue_ms=%d buffer_us=%d latency_us=%d",
-                 audio_queue_ms, audio_buffer_us, audio_latency_us);
+        log_line("SPICE audio sink kind=%s queue_ms=%d buffer_us=%d latency_us=%d",
+                 audio_sink_name, audio_queue_ms, audio_buffer_us, audio_latency_us);
     }
     free(app_dir);
 }

@@ -9,6 +9,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $script:CurrentPlayer = $null
+$script:CurrentPlaybackTimer = $null
 $script:MarkerForm = $null
 $script:MarkerLabel = $null
 
@@ -52,8 +53,7 @@ function New-GvtReferenceAudioFile {
             $t = [double]$i / [double]$SampleRate
             $sample =
                 0.10 * [Math]::Sin($twoPi * 440.0 * $t) +
-                0.06 * [Math]::Sin($twoPi * 880.0 * $t) +
-                0.04 * [Math]::Sin($twoPi * 1760.0 * $t)
+                0.03 * [Math]::Sin($twoPi * 660.0 * $t)
 
             $pulseIndex = [Math]::Round(($t - $PulseStartSec) / $PulseIntervalSec)
             $pulseCenter = $PulseStartSec + $pulseIndex * $PulseIntervalSec
@@ -149,6 +149,40 @@ function Set-GvtMarkerText {
     }
 }
 
+function Stop-GvtCurrentPlayer {
+    if ($script:CurrentPlaybackTimer) {
+        try {
+            $script:CurrentPlaybackTimer.Stop()
+        } catch {
+        }
+        try {
+            $script:CurrentPlaybackTimer.Dispose()
+        } catch {
+        }
+        $script:CurrentPlaybackTimer = $null
+    }
+    if ($script:CurrentPlayer) {
+        try {
+            $script:CurrentPlayer.Stop()
+        } catch {
+        }
+        try {
+            $script:CurrentPlayer.Dispose()
+        } catch {
+        }
+        $script:CurrentPlayer = $null
+    }
+}
+
+function Complete-GvtAudioPlayback {
+    Stop-GvtCurrentPlayer
+    Write-GvtStatus @{
+        state = "idle"
+        last_command = "play-audio-test"
+    }
+    Set-GvtMarkerText -Text "GVT_READY"
+}
+
 function Invoke-GvtPlayAudioTest {
     param(
         [int]$DurationSec = 20,
@@ -156,6 +190,7 @@ function Invoke-GvtPlayAudioTest {
         [switch]$Sync
     )
 
+    Stop-GvtCurrentPlayer
     New-Item -ItemType Directory -Force -Path $Root | Out-Null
     $wav = Join-Path $Root "audio-reference.wav"
     Set-GvtMarkerText -Text "GVT_AUDIO"
@@ -174,14 +209,16 @@ function Invoke-GvtPlayAudioTest {
 
     if ($Sync) {
         $player.PlaySync()
-        Write-GvtStatus @{
-            state = "idle"
-            last_command = "play-audio-test"
-            wav = $wav
-        }
-        Set-GvtMarkerText -Text "GVT_READY"
+        Complete-GvtAudioPlayback
     } else {
+        $timer = [System.Windows.Forms.Timer]::new()
+        $timer.Interval = [int]([Math]::Max(1, $DurationSec) * 1000)
+        $timer.Add_Tick({
+            Complete-GvtAudioPlayback
+        })
+        $script:CurrentPlaybackTimer = $timer
         $player.Play()
+        $timer.Start()
     }
 }
 
@@ -191,6 +228,7 @@ function Invoke-GvtAvSyncTest {
         [int]$SampleRate = 48000
     )
 
+    Stop-GvtCurrentPlayer
     New-Item -ItemType Directory -Force -Path $Root | Out-Null
     $click = Join-Path $Root "av-click.wav"
     New-GvtClickFile -Path $click -SampleRate $SampleRate
@@ -217,6 +255,7 @@ function Invoke-GvtAvSyncTest {
         state = "idle"
         last_command = "av-sync-test"
     }
+    Stop-GvtCurrentPlayer
 }
 
 function Invoke-GvtCommandObject {
@@ -237,6 +276,7 @@ function Invoke-GvtCommandObject {
     } elseif ($cmd -eq "av-sync-test") {
         Invoke-GvtAvSyncTest -DurationSec $dur -SampleRate $rate
     } elseif ($cmd -eq "stop") {
+        Stop-GvtCurrentPlayer
         [System.Windows.Forms.Application]::Exit()
     } else {
         Write-GvtStatus @{
@@ -252,7 +292,9 @@ if ($Once) {
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
     if ($Command -eq "play-audio-test") {
-        Invoke-GvtPlayAudioTest -DurationSec $DurationSec -SampleRate $SampleRate -Sync
+        Invoke-GvtPlayAudioTest -DurationSec $DurationSec -SampleRate $SampleRate
+        Start-Sleep -Seconds ([Math]::Max(1, $DurationSec))
+        Complete-GvtAudioPlayback
     } elseif ($Command -eq "av-sync-test") {
         Invoke-GvtAvSyncTest -DurationSec $DurationSec -SampleRate $SampleRate
     }

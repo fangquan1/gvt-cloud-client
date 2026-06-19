@@ -359,6 +359,7 @@ if ($LeaveWindowOpen -and -not $KeepProbeViewerOpen) {
     $steadyStartInfo.EnvironmentVariables["GVT_SPICE_VIEWER_UDP_BUFFER_SIZE"] = "2097152"
     $steadyStartInfo.EnvironmentVariables["GVT_SPICE_VIEWER_JITTER_DROPOUT_MS"] = "60"
     $steadyStartInfo.EnvironmentVariables["GVT_SPICE_VIEWER_JITTER_MISORDER_MS"] = "20"
+    $steadyStartInfo.EnvironmentVariables["GVT_SPICE_VIEWER_AUDIO_DEBUG"] = "1"
     $steadyStartInfo.EnvironmentVariables["GVT_SPICE_VIEWER_VIDEO_TAIL"] = $startInfo.EnvironmentVariables["GVT_SPICE_VIEWER_VIDEO_TAIL"]
     $steadyStartInfo.EnvironmentVariables["PATH"] = $startInfo.EnvironmentVariables["PATH"]
 

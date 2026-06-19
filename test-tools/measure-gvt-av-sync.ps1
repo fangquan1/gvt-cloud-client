@@ -12,6 +12,8 @@ param(
     [string]$ServerSsh = "root@192.168.0.188",
     [string]$QgaSock = "/root/qemu_cmd/win10-gvt-stream-qga.sock",
     [string]$GuestRoot = "C:\ProgramData\GvtCloudTest",
+    [string]$GuestAgentScheduledTaskName = "GvtCloudTestAgent",
+    [int]$GuestCommandConsumeTimeoutSec = 8,
     [string]$WindowProcessName = "gvt_spice_viewer",
     [string]$GstRoot = "",
     [int]$DurationSec = 20,
@@ -240,6 +242,17 @@ $reportMd = Join-Path $runDir "report.md"
 
 $videoRect = Get-GvtViewerVideoRect
 $markerRect = Get-GvtMarkerRect -VideoRect $videoRect
+$guestAgentBeforeTrigger = Wait-GvtGuestTestAgentReady `
+    -GuestRoot $GuestRoot `
+    -ScheduledTaskName $GuestAgentScheduledTaskName `
+    -ServerSsh $ServerSsh `
+    -QgaSock $QgaSock `
+    -TimeoutSec ([Math]::Max(8, $GuestCommandConsumeTimeoutSec)) `
+    -ClearCommand `
+    -BatchMode:$BatchMode
+$guestAgentAfterTrigger = $null
+$triggerMs = $null
+$guestCommandConsumedMs = $null
 
 $gstLaunch = Resolve-GvtGstExe -Name "gst-launch-1.0.exe" -GstRoot $GstRoot
 $gstRootResolved = Split-Path -Parent (Split-Path -Parent $gstLaunch)
@@ -287,18 +300,34 @@ $audioStartMs = $sw.Elapsed.TotalMilliseconds
 Start-Sleep -Milliseconds $PreRollMs
 
 Write-Host "Triggering guest AV sync pattern..."
+$triggerMs = [Math]::Round($sw.Elapsed.TotalMilliseconds, 2)
 $cmd = @{
     command = "av-sync-test"
     duration_sec = $DurationSec
     sample_rate = $SampleRate
     generated_at = (Get-Date).ToString("o")
 } | ConvertTo-Json -Compress
-Write-GvtQgaFile `
-    -GuestPath (Join-Path $GuestRoot "command.json") `
-    -Text $cmd `
-    -ServerSsh $ServerSsh `
-    -QgaSock $QgaSock `
-    -BatchMode:$BatchMode
+try {
+    Write-GvtQgaFile `
+        -GuestPath (Join-Path $GuestRoot "command.json") `
+        -Text $cmd `
+        -ServerSsh $ServerSsh `
+        -QgaSock $QgaSock `
+        -BatchMode:$BatchMode
+    $guestAgentAfterTrigger = Wait-GvtGuestTestCommandConsumed `
+        -GuestRoot $GuestRoot `
+        -ServerSsh $ServerSsh `
+        -QgaSock $QgaSock `
+        -TimeoutSec $GuestCommandConsumeTimeoutSec `
+        -BatchMode:$BatchMode
+    $guestCommandConsumedMs = [Math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+} catch {
+    if (-not $process.HasExited) {
+        $process.Kill()
+        $process.WaitForExit()
+    }
+    throw
+}
 
 $rows = New-Object System.Collections.Generic.List[object]
 $endAt = $sw.Elapsed.TotalMilliseconds + (($DurationSec + $PostRollSec) * 1000.0)
@@ -380,6 +409,11 @@ $summary = [ordered]@{
     video_csv = $videoCsv
     gst_log = $gstLog
     note = "Absolute offset is an estimate because gst-launch start time is used as audio sample-zero time."
+    trigger_ms = $triggerMs
+    guest_command_consumed_ms = $guestCommandConsumedMs
+    guest_command_consume_after_trigger_ms = if ($null -ne $triggerMs -and $null -ne $guestCommandConsumedMs) { [Math]::Round($guestCommandConsumedMs - $triggerMs, 2) } else { $null }
+    guest_agent_before_trigger = $guestAgentBeforeTrigger
+    guest_agent_after_trigger = $guestAgentAfterTrigger
     video_rect = $videoRect
     marker_rect = "{0},{1} {2}x{3}" -f $markerRect.Left, $markerRect.Top, $markerRect.Width, $markerRect.Height
     video_flash_times_ms = @($videoTimesMs | ForEach-Object { [Math]::Round($_, 2) })
@@ -406,6 +440,7 @@ $report = @(
     "- Output: $runDir",
     "- Video flashes: $($videoTimesMs.Count)",
     "- Audio pulses: $($audioTimesMs.Count)",
+    "- Guest command consumed after trigger: $(if ($null -ne $triggerMs -and $null -ne $guestCommandConsumedMs) { [Math]::Round($guestCommandConsumedMs - $triggerMs, 2) } else { 'NA' }) ms",
     "- Nearest paired events: $($nearestPairs.Count) (tolerance $nearestPairToleranceMs ms)",
     "- Nearest estimated audio-minus-video avg: $nearestAvgOffset ms",
     "- Nearest estimated audio-minus-video median: $nearestMedianOffset ms",
