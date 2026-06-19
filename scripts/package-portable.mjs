@@ -60,9 +60,9 @@ copyFileSync(
 );
 
 const gstRoot = firstExisting([
+  path.join(repoRoot, "tools", "gstreamer-1.0-mingw-x86_64-1.18.6"),
   process.env.GVT_GSTREAMER_ROOT,
   path.join(workspaceRoot, "tools", "gstreamer-1.0-mingw-x86_64-1.18.6"),
-  path.join(repoRoot, "tools", "gstreamer-1.0-mingw-x86_64-1.18.6")
 ]);
 copyRequired(
   gstRoot,
@@ -71,6 +71,7 @@ copyRequired(
 );
 
 const spiceRuntime = firstExisting([
+  path.join(repoRoot, "runtime", "virtviewer", "bin"),
   process.env.GVT_SPICE_RUNTIME,
   "C:\\Program Files\\VirtViewer v11.0-256\\bin"
 ]);
