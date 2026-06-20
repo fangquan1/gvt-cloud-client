@@ -170,6 +170,18 @@ For additional VMs, ports advance in slots of four:
 The launcher stores recent endpoints in `gvt_client_history.txt` next to the
 portable executable.
 
+### Guest Power Policy During Current Testing
+
+For the current `current-detach` external encoder experiment, the Windows guest
+is configured with both "turn off screen" and "sleep" set to `Never`. Manual and
+automated client validation therefore assumes the guest desktop stays awake
+while connected or between short reconnects.
+
+Suspend/display-sleep reconnect behavior is not part of the active client
+acceptance scope while this guest power policy is in place. Re-enable the
+no-scanout/suspend reconnect cases if the guest power policy is changed back to
+allow display sleep or system sleep.
+
 ## Direct Viewer Diagnostics
 
 Normally use `GVT Cloud Client.exe`. For debugging, run the viewer directly:
