@@ -385,7 +385,7 @@ if ($pairs.Count -ge 2) {
 }
 
 $nearestPairToleranceMs = 750.0
-$nearestPairs = Get-GvtNearestAvPairs -VideoTimesMs $videoTimesMs -AudioTimesMs $audioTimesMs -MaxDistanceMs $nearestPairToleranceMs
+$nearestPairs = @(Get-GvtNearestAvPairs -VideoTimesMs $videoTimesMs -AudioTimesMs $audioTimesMs -MaxDistanceMs $nearestPairToleranceMs)
 $nearestOffsets = @($nearestPairs | ForEach-Object { [double]$_.audio_minus_video_ms })
 $nearestAvgOffset = $null
 $nearestMedianOffset = $null
@@ -419,7 +419,7 @@ $summary = [ordered]@{
     video_flash_times_ms = @($videoTimesMs | ForEach-Object { [Math]::Round($_, 2) })
     audio_pulse_times_ms_estimated = @($audioTimesMs | ForEach-Object { [Math]::Round($_, 2) })
     nearest_pair_tolerance_ms = $nearestPairToleranceMs
-    nearest_pairs = $nearestPairs
+    nearest_pairs = @($nearestPairs)
     nearest_average_audio_minus_video_ms_estimated = $nearestAvgOffset
     nearest_median_audio_minus_video_ms_estimated = $nearestMedianOffset
     nearest_max_abs_audio_minus_video_ms_estimated = $nearestMaxAbsOffset
