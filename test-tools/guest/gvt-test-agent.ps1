@@ -84,7 +84,8 @@ function New-GvtClickFile {
     )
 
     $channels = 2
-    $durationSec = 0.12
+    $durationSec = 0.24
+    $pulseSec = 0.12
     $totalFrames = [int]($durationSec * $SampleRate)
     $bytesPerSample = 2
     $blockAlign = $channels * $bytesPerSample
@@ -109,9 +110,9 @@ function New-GvtClickFile {
         for ($i = 0; $i -lt $totalFrames; $i++) {
             $t = [double]$i / [double]$SampleRate
             $sample = 0.0
-            if ($t -lt 0.050) {
-                $env = [Math]::Sin([Math]::PI * ($t / 0.050))
-                $sample = 0.82 * $env * [Math]::Sin($twoPi * 1000.0 * $t)
+            if ($t -lt $pulseSec) {
+                $env = [Math]::Sin([Math]::PI * ($t / $pulseSec))
+                $sample = 0.92 * $env * [Math]::Sin($twoPi * 1000.0 * $t)
             }
             $pcm = [int16][Math]::Round($sample * 32767.0)
             for ($ch = 0; $ch -lt $channels; $ch++) {
@@ -245,10 +246,10 @@ function Invoke-GvtAvSyncTest {
     $stopAt = (Get-Date).AddSeconds($DurationSec)
     while ((Get-Date) -lt $stopAt) {
         Set-GvtMarkerText -Text "GVT_FLASH" -BackColor "White" -ForeColor "Black"
-        $player.Play()
-        Start-Sleep -Milliseconds 90
+        $player.Stop()
+        $player.PlaySync()
         Set-GvtMarkerText -Text "GVT_READY" -BackColor "LimeGreen" -ForeColor "Black"
-        Start-Sleep -Milliseconds 1910
+        Start-Sleep -Milliseconds 1760
     }
 
     Write-GvtStatus @{
@@ -287,6 +288,20 @@ function Invoke-GvtCommandObject {
 }
 
 New-Item -ItemType Directory -Force -Path $Root | Out-Null
+
+$script:CurrentSessionId = -1
+try {
+    $script:CurrentSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+} catch {
+}
+
+if (-not $Once -and $script:CurrentSessionId -le 0) {
+    Write-GvtStatus @{
+        state = "noninteractive-ignored"
+        session_id = $script:CurrentSessionId
+    }
+    exit 0
+}
 
 if ($Once) {
     Add-Type -AssemblyName System.Windows.Forms

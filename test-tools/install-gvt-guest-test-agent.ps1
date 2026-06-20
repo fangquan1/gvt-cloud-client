@@ -157,19 +157,33 @@ New-ItemProperty -Path `$winlogon -Name DefaultDomainName -Value `$computer -Pro
 }
 
 if ($StartNow) {
-    Write-Host "Starting guest agent now through QGA. If no marker appears, reboot or log off/on so Startup runs in the desktop session."
-    [void](Invoke-GvtQgaCommand `
-        -Command @{
-            execute = "guest-exec"
-            arguments = @{
-                path = "powershell.exe"
-                arg = @("-STA", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $guestAgent)
-                "capture-output" = $false
-            }
-        } `
-        -ServerSsh $ServerSsh `
-        -QgaSock $QgaSock `
-        -BatchMode:$BatchMode)
+    if (-not [string]::IsNullOrWhiteSpace($GuestUser)) {
+        Write-Host "Starting interactive guest agent scheduled task '$ScheduledTaskName'..."
+        $runTask = Invoke-GvtQgaGuestExec `
+            -Path "schtasks.exe" `
+            -ArgumentList @("/Run", "/TN", $ScheduledTaskName) `
+            -ServerSsh $ServerSsh `
+            -QgaSock $QgaSock `
+            -BatchMode:$BatchMode `
+            -TimeoutSec 20
+        if ($runTask.ExitCode -ne 0) {
+            throw "Failed to start scheduled task. stdout=$($runTask.Stdout) stderr=$($runTask.Stderr)"
+        }
+    } else {
+        Write-Host "Starting guest agent now through QGA. If no marker appears, reboot or log off/on so Startup runs in the desktop session."
+        [void](Invoke-GvtQgaCommand `
+            -Command @{
+                execute = "guest-exec"
+                arguments = @{
+                    path = "powershell.exe"
+                    arg = @("-STA", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $guestAgent)
+                    "capture-output" = $false
+                }
+            } `
+            -ServerSsh $ServerSsh `
+            -QgaSock $QgaSock `
+            -BatchMode:$BatchMode)
+    }
 }
 
 Write-Host "GVT guest test agent installed."
