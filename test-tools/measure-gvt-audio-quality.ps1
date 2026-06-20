@@ -67,6 +67,163 @@ function Join-GvtProcessArgs {
     return (($ArgList | ForEach-Object { Quote-GvtProcessArg $_ }) -join " ")
 }
 
+function Get-GvtAudioEnvironmentSnapshot {
+    $names = @(
+        "SPICE_GST_AUDIOSINK",
+        "GVT_SPICE_AUDIO_SINK",
+        "GVT_SPICE_AUDIO_BUFFER_US",
+        "GVT_SPICE_AUDIO_LATENCY_US",
+        "GVT_SPICE_AUDIO_QUEUE_MS",
+        "GVT_SPICE_PCM_DUMP_WAV"
+    )
+    $snapshot = [ordered]@{}
+    foreach ($name in $names) {
+        $value = [Environment]::GetEnvironmentVariable($name, "Process")
+        if ($null -eq $value) {
+            $value = [Environment]::GetEnvironmentVariable($name, "User")
+        }
+        if ($null -eq $value) {
+            $value = [Environment]::GetEnvironmentVariable($name, "Machine")
+        }
+        $snapshot[$name] = if ($null -eq $value) { $null } else { $value }
+    }
+    return $snapshot
+}
+
+function Get-GvtViewerProcessInfo {
+    param([string]$ProcessName)
+
+    $exeName = if ($ProcessName.EndsWith(".exe", [StringComparison]::OrdinalIgnoreCase)) {
+        $ProcessName
+    } else {
+        "$ProcessName.exe"
+    }
+    $escapedName = $exeName -replace "'", "''"
+    $proc = Get-CimInstance Win32_Process -Filter "name='$escapedName'" -ErrorAction SilentlyContinue |
+        Sort-Object CreationDate -Descending |
+        Select-Object -First 1
+    if (-not $proc) {
+        return $null
+    }
+
+    $hash = $null
+    if ($proc.ExecutablePath -and (Test-Path -LiteralPath $proc.ExecutablePath)) {
+        try {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $proc.ExecutablePath).Hash
+        } catch {
+            $hash = $null
+        }
+    }
+
+    return [ordered]@{
+        process_id = [int]$proc.ProcessId
+        executable_path = $proc.ExecutablePath
+        sha256 = $hash
+        command_line = $proc.CommandLine
+        creation_date = if ($proc.CreationDate) { $proc.CreationDate.ToString("o") } else { $null }
+    }
+}
+
+function Get-GvtRemoteQemuCmdlineSnapshot {
+    param([string]$ServerSsh)
+
+    try {
+        [void](Get-Command ssh.exe -ErrorAction Stop)
+        $remote = "ps -eo pid,args | grep '[q]emu-system'"
+        $cmd = "ssh -q -o BatchMode=yes -o ConnectTimeout=5 $ServerSsh `"$remote`""
+        $output = & cmd.exe /d /c $cmd 2>&1
+        $lines = @($output | ForEach-Object { $_.ToString() } | Where-Object { $_ })
+        $cmdlines = @($lines | Where-Object { $_ -match 'qemu-system' } | ForEach-Object {
+            if ($_ -match '^\s*([0-9]+)\s+(.*)$') {
+                "PID=$($Matches[1]) CMD=$($Matches[2])"
+            } else {
+                $_
+            }
+        })
+        $otherLines = @($lines | Where-Object { $_ -notmatch 'qemu-system' })
+        return [ordered]@{
+            ok = ($LASTEXITCODE -eq 0 -and $cmdlines.Count -gt 0)
+            cmdlines = $cmdlines
+            other_lines = $otherLines
+            error = if ($LASTEXITCODE -eq 0) { $null } else { ($lines -join " ") }
+        }
+    } catch {
+        return [ordered]@{
+            ok = $false
+            cmdlines = @()
+            other_lines = @()
+            error = $_.Exception.Message
+        }
+    }
+}
+
+function Measure-GvtViewerAudioProbe {
+    param([string[]]$Lines)
+
+    $events = New-Object System.Collections.Generic.List[object]
+    foreach ($line in @($Lines)) {
+        if ($line -notmatch "latency-audio-pcm") {
+            continue
+        }
+
+        $wallMs = $null
+        $chunkMs = $null
+        $gapMs = $null
+        $frameDeltaMs = $null
+        $peak = $null
+        $boundaryDelta = $null
+        $frameDelta = $null
+        $reason = ""
+
+        if ($line -match "wall_ms=([0-9]+)") { $wallMs = [int64]$Matches[1] }
+        if ($line -match "chunk_ms=([0-9]+)") { $chunkMs = [int]$Matches[1] }
+        if ($line -match "gap_ms=([0-9]+)") { $gapMs = [int64]$Matches[1] }
+        if ($line -match "frame_delta_ms=([-0-9.]+)") { $frameDeltaMs = [double]$Matches[1] }
+        if ($line -match "peak=([-0-9.]+)") { $peak = [double]$Matches[1] }
+        if ($line -match "boundary_delta=([-0-9.]+)") { $boundaryDelta = [double]$Matches[1] }
+        if ($line -match "frame_delta=([-0-9.]+)") { $frameDelta = [double]$Matches[1] }
+        if ($line -match "reason=([^ ]*)") { $reason = $Matches[1] }
+
+        [void]$events.Add([pscustomobject][ordered]@{
+            wall_ms = $wallMs
+            reason = $reason
+            samplejump = ($reason -match "samplejump")
+            silent = ($reason -match "silent")
+            chunk_ms = $chunkMs
+            gap_ms = $gapMs
+            frame_delta_ms = $frameDeltaMs
+            peak = $peak
+            boundary_delta = $boundaryDelta
+            frame_delta = $frameDelta
+            line = $line
+        })
+    }
+
+    $sampleJumpEvents = @($events | Where-Object { $_.samplejump })
+    $silentEvents = @($events | Where-Object { $_.silent })
+    $jumpReasonEvents = @($events | Where-Object { $_.reason -match "jump" })
+
+    return [ordered]@{
+        pcm_event_count = $events.Count
+        samplejump_count = $sampleJumpEvents.Count
+        jump_reason_count = $jumpReasonEvents.Count
+        silent_count = $silentEvents.Count
+        first_samplejump_wall_ms = if ($sampleJumpEvents.Count -gt 0) { $sampleJumpEvents[0].wall_ms } else { $null }
+        samplejump_wall_ms = @($sampleJumpEvents | Select-Object -First 80 | ForEach-Object { $_.wall_ms })
+        events = @($events | Select-Object -First 80)
+    }
+}
+
+function Get-GvtViewerAudioSinkLine {
+    param([string[]]$Lines)
+
+    $matches = @($Lines | Where-Object { $_ -match "SPICE audio sink" })
+    if ($matches.Count -le 0) {
+        return $null
+    }
+    return $matches[$matches.Count - 1]
+}
+
 function Get-GvtUnixTimeMs {
     return [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 }
@@ -284,6 +441,9 @@ $waveformAnalysisJson = Join-Path $waveformAnalysisDir "waveform-analysis.json"
 $waveformAnalysisLog = Join-Path $waveformAnalysisDir "waveform-analysis.log"
 $viewerLogSource = Get-GvtViewerLogPath -ProcessName $ViewerProcessName
 $viewerLogStartLine = if ($viewerLogSource) { Get-GvtLocalLineCount -Path $viewerLogSource } else { 0 }
+$viewerProcessInfo = Get-GvtViewerProcessInfo -ProcessName $ViewerProcessName
+$localAudioEnvironment = Get-GvtAudioEnvironmentSnapshot
+$remoteQemuCmdline = Get-GvtRemoteQemuCmdlineSnapshot -ServerSsh $ServerSsh
 $recordStartWallMs = $null
 $triggerWallMs = $null
 $recordEndWallMs = $null
@@ -332,6 +492,7 @@ $gstArgs = @(
     "filesink",
     ("location={0}" -f $recordedWavForGst)
 )
+$gstCommandLine = Join-GvtProcessArgs -ArgList $gstArgs
 
 $startInfo = [Diagnostics.ProcessStartInfo]::new()
 $startInfo.FileName = $gstLaunch
@@ -419,6 +580,11 @@ if ($viewerLogSource) {
         Set-Content -LiteralPath $viewerAudioLogOut -Value $viewerAudioLines -Encoding UTF8
     }
 }
+$viewerAudioSinkLine = Get-GvtViewerAudioSinkLine -Lines $viewerAudioLines
+if (-not $viewerAudioSinkLine -and $viewerLogSource) {
+    $viewerAudioSinkLine = Get-GvtViewerAudioSinkLine -Lines @(Get-Content -LiteralPath $viewerLogSource -Tail 300 -ErrorAction SilentlyContinue)
+}
+$viewerAudioProbe = Measure-GvtViewerAudioProbe -Lines $viewerAudioLines
 
 if (-not (Test-Path -LiteralPath $recordedWav)) {
     throw "Loopback recording was not created. See $gstLog"
@@ -524,6 +690,19 @@ $summary = [ordered]@{
     viewer_audio_log = if ($viewerAudioLines.Count -gt 0) { $viewerAudioLogOut } else { $null }
     viewer_log_tail_lines = $viewerLogTail.Count
     viewer_log_audio_lines = $viewerAudioLines.Count
+    diagnostics = [ordered]@{
+        viewer_process = $viewerProcessInfo
+        local_audio_environment = $localAudioEnvironment
+        qemu_cmdline = $remoteQemuCmdline
+        spice_gst_audiosink_line = $viewerAudioSinkLine
+        spice_pcm_probe = $viewerAudioProbe
+        gst_loopback = [ordered]@{
+            executable = $gstLaunch
+            root = $gstRootResolved
+            arguments = $gstCommandLine
+            log = $gstLog
+        }
+    }
     guest_agent_before_trigger = $guestAgentBeforeTrigger
     guest_agent_after_trigger = $guestAgentAfterTrigger
     timing = [ordered]@{
@@ -582,12 +761,34 @@ $summary = [ordered]@{
 
 $summary | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $summaryJson -Encoding UTF8
 
+$setAudioEnv = @($localAudioEnvironment.GetEnumerator() |
+    Where-Object { -not [string]::IsNullOrEmpty([string]$_.Value) } |
+    ForEach-Object { "$($_.Key)=$($_.Value)" })
+$audioEnvText = if ($setAudioEnv.Count -gt 0) { $setAudioEnv -join "; " } else { "none" }
+$qemuCmdlines = @($remoteQemuCmdline["cmdlines"])
+$qemuCmdlineText = if ($qemuCmdlines.Count -gt 0) { $qemuCmdlines -join "`n" } else { "NA" }
+$viewerExeText = if ($viewerProcessInfo) { $viewerProcessInfo["executable_path"] } else { "NA" }
+$viewerHashText = if ($viewerProcessInfo) { $viewerProcessInfo["sha256"] } else { "NA" }
+$viewerCommandText = if ($viewerProcessInfo) { $viewerProcessInfo["command_line"] } else { "NA" }
+$pcmSampleJumpCount = $viewerAudioProbe["samplejump_count"]
+$pcmEventCount = $viewerAudioProbe["pcm_event_count"]
+$pcmFirstSampleJumpMs = $viewerAudioProbe["first_samplejump_wall_ms"]
+
 $report = @(
     "# GVT 音频质量报告",
     "",
     "- 结果: $($summary.pass)",
     "- 输出目录: $runDir",
+    "- viewer exe: $viewerExeText",
+    "- viewer sha256: $viewerHashText",
+    "- viewer command line: $viewerCommandText",
+    "- 本机音频环境变量覆盖: $audioEnvText",
+    "- SPICE audio sink: $(if ($viewerAudioSinkLine) { $viewerAudioSinkLine } else { 'NA' })",
+    "- QEMU cmdline: $qemuCmdlineText",
+    "- loopback gst args: $gstCommandLine",
     "- viewer audio log: $(if ($viewerAudioLines.Count -gt 0) { $viewerAudioLogOut } else { 'NA' })",
+    "- SPICE PCM probe events/samplejump: $pcmEventCount / $pcmSampleJumpCount",
+    "- SPICE PCM first samplejump wall_ms: $(if ($null -ne $pcmFirstSampleJumpMs) { $pcmFirstSampleJumpMs } else { 'NA' })",
     "- 录音触发 wall_ms: start=$recordStartWallMs trigger=$triggerWallMs consumed=$guestCommandConsumedWallMs end=$recordEndWallMs",
     "- 录制 RMS: $([Math]::Round($recRms, 6))",
     "- 识别到的参考脉冲数: $($recPulses.Count)",

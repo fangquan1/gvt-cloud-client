@@ -807,6 +807,10 @@ function Write-FullReports {
     $audio = $Summary.artifacts.audio_summary
     $wave = Get-FullNestedMember -Object $audio -Names @("waveform_analysis")
     $pop = Get-FullNestedMember -Object $wave -Names @("pop_detection")
+    $audioDiag = Get-FullNestedMember -Object $audio -Names @("diagnostics")
+    $pcmProbe = Get-FullNestedMember -Object $audioDiag -Names @("spice_pcm_probe")
+    $viewerProc = Get-FullNestedMember -Object $audioDiag -Names @("viewer_process")
+    $qemuSnapshot = Get-FullNestedMember -Object $audioDiag -Names @("qemu_cmdline")
     $av = $Summary.artifacts.av_sync_summary
     $lat = $Summary.artifacts.latency
 
@@ -826,6 +830,14 @@ function Write-FullReports {
     $clipPct = Get-FullNumber (Get-FullNestedMember -Object $audio -Names @("recorded", "clip", "clipped_pct"))
     $dropoutPct = Get-FullNumber (Get-FullNestedMember -Object $audio -Names @("alignment", "dropout_window_pct"))
     $pulseErrorMs = Get-FullNumber (Get-FullNestedMember -Object $audio -Names @("pulse_timing", "max_abs_interval_error_ms"))
+    $pcmEventCount = Get-FullNumber (Get-FullMember -Object $pcmProbe -Name "pcm_event_count")
+    $pcmSampleJumps = Get-FullNumber (Get-FullMember -Object $pcmProbe -Name "samplejump_count")
+    $pcmFirstSampleJumpMs = Get-FullMember -Object $pcmProbe -Name "first_samplejump_wall_ms" -Default $null
+    $viewerSinkLine = Get-FullMember -Object $audioDiag -Name "spice_gst_audiosink_line" -Default "NA"
+    $viewerExe = Get-FullMember -Object $viewerProc -Name "executable_path" -Default "NA"
+    $viewerHash = Get-FullMember -Object $viewerProc -Name "sha256" -Default "NA"
+    $qemuCmdlines = @(Get-FullMember -Object $qemuSnapshot -Name "cmdlines" -Default @())
+    $qemuCmdlineText = if ($qemuCmdlines.Count -gt 0) { $qemuCmdlines -join " | " } else { "NA" }
     $spectrumDeltaDb = Get-FullNumber (Get-FullNestedMember -Object $wave -Names @("spectrum", "delta_rms_db"))
     $avNearestPairs = if ($av) { Get-FullMember -Object $av -Name "nearest_pairs" -Default $null } else { $null }
     $avLegacyPairs = if ($av) { Get-FullMember -Object $av -Name "pairs" -Default $null } else { $null }
@@ -855,6 +867,7 @@ function Write-FullReports {
     $dropoutGrade = Get-FullLowerBetterGrade -Value $dropoutPct -Good 0.10 -Fair 2.00
     $pulseGrade = Get-FullLowerBetterGrade -Value $pulseErrorMs -Good 20 -Fair 120
     $popGrade = Get-FullPopGrade $pop
+    $pcmSampleJumpGrade = Get-FullLowerBetterGrade -Value $pcmSampleJumps -Good 0 -Fair 5
     $periodicGrade = if ($pop) {
         if ($periodicDetected) { New-FullGrade "差" "grade-bad" } else { New-FullGrade "好" "grade-good" }
     } else {
@@ -894,6 +907,7 @@ function Write-FullReports {
         "- 爆音/微小爆音分析: $popPass（评级: $($popGrade.Text)）",
         "- 爆音候选数量: $(if ($pop) { $pop.event_count } else { 'NA' })",
         "- 严重爆音候选数量: $(if ($pop) { $pop.severe_event_count } else { 'NA' })",
+        "- SPICE PCM samplejump: $(Format-FullNumber $pcmSampleJumps 0) / $(Format-FullNumber $pcmEventCount 0)",
         "- 周期性爆音: $periodicText",
         "- 频域差异 RMS: $(Format-FullNumber $spectrumDeltaDb 2) dB（评级: $($spectrumGrade.Text)）",
         "- AV sync nearest paired events: $(if ($av) { $avNearestPairCount } else { 'NA' })",
@@ -902,6 +916,10 @@ function Write-FullReports {
         "- AV sync relative drift max: $(Format-FullNumber $avRelDriftMs 2) ms（评级: $($avGrade.Text)）",
         "- 输入到画面延迟 median: $(Format-FullNumber $latMedianMs 1) ms（评级: $($latencyGrade.Text)）",
         "- 输入延迟触发方式: $latencyTriggerDescription",
+        "- viewer exe: $viewerExe",
+        "- viewer sha256: $viewerHash",
+        "- SPICE audio sink: $viewerSinkLine",
+        "- QEMU cmdline: $qemuCmdlineText",
         "",
         "## 图表",
         "",
@@ -967,6 +985,9 @@ function Write-FullReports {
         (New-FullMetricRow -Label "pulse interval max error" -Value (Format-FullNumber $pulseErrorMs 2) -Unit "ms" -Grade $pulseGrade -Help "参考脉冲间隔的最大误差，用于判断音频节奏漂移或卡顿。" -Detail "20ms 以内好，120ms 以内良好。"),
         (New-FullMetricRow -Label "爆音候选数量" -Value $(if ($pop) { "$(Get-FullMember -Object $pop -Name "event_count" -Default "NA")" } else { "NA" }) -Unit "" -Grade $popGrade -Help "排除参考脉冲后检测到的短促高频瞬态数量。" -Detail "0 个候选为好；少量非严重候选为良好。"),
         (New-FullMetricRow -Label "严重爆音候选数量" -Value $(if ($pop) { "$(Get-FullMember -Object $pop -Name "severe_event_count" -Default "NA")" } else { "NA" }) -Unit "" -Grade $popGrade -Help "爆音评分超过严重阈值的候选数量。" -Detail "严重候选通常需要优先排查音频缓冲或编码链路。"),
+        (New-FullMetricRow -Label "SPICE PCM samplejump" -Value (Format-FullNumber $pcmSampleJumps 0) -Unit "" -Grade $pcmSampleJumpGrade -Help "viewer playback-data 层的 pre-sink PCM 跳变统计；用于区分源侧异常和本机播放/录音异常。" -Detail "PCM probe events=$(Format-FullNumber $pcmEventCount 0)，first wall_ms=$(if ($null -ne $pcmFirstSampleJumpMs) { $pcmFirstSampleJumpMs } else { 'NA' })。"),
+        (New-FullMetricRow -Label "SPICE audio sink" -Value $(if ($viewerSinkLine) { "$viewerSinkLine" } else { "NA" }) -Unit "" -Grade (New-FullGrade "诊断" "grade-na") -Help "本轮 viewer 实际写入的 SPICE_GST_AUDIOSINK 管线。" -Detail "用于确认 do-timestamp、queue、buffer 和 latency。"),
+        (New-FullMetricRow -Label "QEMU cmdline" -Value $(if ($qemuCmdlineText) { "$qemuCmdlineText" } else { "NA" }) -Unit "" -Grade (New-FullGrade "诊断" "grade-na") -Help "远端当前 qemu-system-x86_64 实际命令行快照。" -Detail "重点核对 -audiodev spice timer-period/out.buffer-length 以及 HDA 设备。"),
         (New-FullMetricRow -Label "周期性爆音" -Value $(if ($pop) { if ($periodicDetected) { "检测到" } else { "未检测到" } } else { "NA" }) -Unit "" -Grade $periodicGrade -Help "候选爆音间隔是否呈稳定周期；周期性通常说明缓冲周期或调度周期问题。" -Detail "置信度 $periodicConfidence。"),
         (New-FullMetricRow -Label "频域差异 RMS" -Value (Format-FullNumber $spectrumDeltaDb 2) -Unit "dB" -Grade $spectrumGrade -Help "输入参考和录制输出频谱的平均差异；主要用于辅助观察高频噪声和音色变化。" -Detail "当前不作为硬失败条件。")
     ) -join "`n"

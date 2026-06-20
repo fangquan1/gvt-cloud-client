@@ -147,6 +147,9 @@ static LONG button_state;
 static FILE *log_fp;
 static CRITICAL_SECTION log_lock;
 static volatile LONG log_lock_state;
+static FILE *audio_dump_fp;
+static CRITICAL_SECTION audio_dump_lock;
+static volatile LONG audio_dump_lock_state;
 static CRITICAL_SECTION input_lock;
 static bool input_lock_ready;
 static CRITICAL_SECTION runtime_load_lock;
@@ -174,6 +177,10 @@ static unsigned int audio_chunks;
 static unsigned long long audio_bytes;
 static bool audio_have_last_frame;
 static int audio_last_frame_avg;
+static char audio_dump_path[MAX_PATH * 2];
+static int audio_dump_channels;
+static int audio_dump_frequency;
+static uint64_t audio_dump_data_bytes;
 static volatile LONG video_probe_counts[4];
 static HANDLE video_probe_thread;
 static HANDLE spice_thread_handle;
@@ -344,6 +351,173 @@ static int getenv_int_clamped(const char *name, int defval, int minval, int maxv
 static bool audio_debug(void)
 {
     return latency_debug() || env_is_set("GVT_SPICE_VIEWER_AUDIO_DEBUG");
+}
+
+static void ensure_audio_dump_lock(void)
+{
+    LONG state = InterlockedCompareExchange(&audio_dump_lock_state, 1, 0);
+
+    if (state == 0) {
+        InitializeCriticalSection(&audio_dump_lock);
+        InterlockedExchange(&audio_dump_lock_state, 2);
+        return;
+    }
+    while (InterlockedCompareExchange(&audio_dump_lock_state, 2, 2) != 2) {
+        Sleep(0);
+    }
+}
+
+static void write_wav_u16(FILE *fp, uint16_t value)
+{
+    fputc(value & 0xff, fp);
+    fputc((value >> 8) & 0xff, fp);
+}
+
+static void write_wav_u32(FILE *fp, uint32_t value)
+{
+    fputc(value & 0xff, fp);
+    fputc((value >> 8) & 0xff, fp);
+    fputc((value >> 16) & 0xff, fp);
+    fputc((value >> 24) & 0xff, fp);
+}
+
+static uint32_t clamp_wav_size(uint64_t value)
+{
+    if (value > 0xffffffffULL) {
+        return 0xffffffffU;
+    }
+    return (uint32_t)value;
+}
+
+static void write_wav_header(FILE *fp, int channels, int frequency,
+                             uint64_t data_bytes)
+{
+    uint16_t block_align = (uint16_t)(channels * 2);
+    uint32_t byte_rate = (uint32_t)(frequency * block_align);
+
+    fwrite("RIFF", 1, 4, fp);
+    write_wav_u32(fp, clamp_wav_size(36ULL + data_bytes));
+    fwrite("WAVE", 1, 4, fp);
+    fwrite("fmt ", 1, 4, fp);
+    write_wav_u32(fp, 16);
+    write_wav_u16(fp, 1);
+    write_wav_u16(fp, (uint16_t)channels);
+    write_wav_u32(fp, (uint32_t)frequency);
+    write_wav_u32(fp, byte_rate);
+    write_wav_u16(fp, block_align);
+    write_wav_u16(fp, 16);
+    fwrite("data", 1, 4, fp);
+    write_wav_u32(fp, clamp_wav_size(data_bytes));
+}
+
+static bool resolve_audio_dump_path(char *path, size_t path_size)
+{
+    char value[MAX_PATH * 2];
+    DWORD len = GetEnvironmentVariableA("GVT_SPICE_PCM_DUMP_WAV",
+                                        value, sizeof(value));
+
+    if (!len || len >= sizeof(value) || value[0] == '0') {
+        return false;
+    }
+    if (!_stricmp(value, "1") || !_stricmp(value, "true") ||
+        !_stricmp(value, "yes")) {
+        char *app_dir = dup_app_dir();
+        snprintf(path, path_size, "%s\\spice-playback-pre-sink.wav", app_dir);
+        free(app_dir);
+        return true;
+    }
+    snprintf(path, path_size, "%s", value);
+    return true;
+}
+
+static void audio_dump_start(int format, int channels, int frequency)
+{
+    char path[MAX_PATH * 2];
+
+    if (!resolve_audio_dump_path(path, sizeof(path))) {
+        return;
+    }
+    if (channels <= 0) {
+        channels = 2;
+    }
+    if (frequency <= 0) {
+        frequency = 48000;
+    }
+
+    ensure_audio_dump_lock();
+    EnterCriticalSection(&audio_dump_lock);
+    if (audio_dump_fp) {
+        LeaveCriticalSection(&audio_dump_lock);
+        return;
+    }
+
+    audio_dump_fp = fopen(path, "wb+");
+    if (!audio_dump_fp) {
+        LeaveCriticalSection(&audio_dump_lock);
+        log_line("SPICE pcm dump open failed path=\"%s\"", path);
+        return;
+    }
+
+    snprintf(audio_dump_path, sizeof(audio_dump_path), "%s", path);
+    audio_dump_channels = channels;
+    audio_dump_frequency = frequency;
+    audio_dump_data_bytes = 0;
+    write_wav_header(audio_dump_fp, audio_dump_channels,
+                     audio_dump_frequency, audio_dump_data_bytes);
+    fflush(audio_dump_fp);
+    LeaveCriticalSection(&audio_dump_lock);
+    log_line("SPICE pcm dump start path=\"%s\" format=%d channels=%d frequency=%d",
+             path, format, channels, frequency);
+}
+
+static void audio_dump_write(gpointer audio, gint size)
+{
+    size_t written;
+
+    if (!audio || size <= 0 ||
+        InterlockedCompareExchange(&audio_dump_lock_state, 2, 2) != 2) {
+        return;
+    }
+
+    EnterCriticalSection(&audio_dump_lock);
+    if (audio_dump_fp) {
+        written = fwrite(audio, 1, (size_t)size, audio_dump_fp);
+        audio_dump_data_bytes += written;
+    }
+    LeaveCriticalSection(&audio_dump_lock);
+}
+
+static void audio_dump_finish(const char *reason)
+{
+    char path[MAX_PATH * 2];
+    uint64_t data_bytes;
+    int channels;
+    int frequency;
+
+    if (InterlockedCompareExchange(&audio_dump_lock_state, 2, 2) != 2) {
+        return;
+    }
+
+    EnterCriticalSection(&audio_dump_lock);
+    if (!audio_dump_fp) {
+        LeaveCriticalSection(&audio_dump_lock);
+        return;
+    }
+
+    snprintf(path, sizeof(path), "%s", audio_dump_path);
+    data_bytes = audio_dump_data_bytes;
+    channels = audio_dump_channels;
+    frequency = audio_dump_frequency;
+    fseek(audio_dump_fp, 0, SEEK_SET);
+    write_wav_header(audio_dump_fp, channels, frequency, data_bytes);
+    fflush(audio_dump_fp);
+    fclose(audio_dump_fp);
+    audio_dump_fp = NULL;
+    audio_dump_data_bytes = 0;
+    LeaveCriticalSection(&audio_dump_lock);
+    log_line("SPICE pcm dump finish reason=%s path=\"%s\" data_bytes=%I64u channels=%d frequency=%d",
+             reason ? reason : "unknown", path,
+             (unsigned long long)data_bytes, channels, frequency);
 }
 
 static bool video_debug(void)
@@ -1397,6 +1571,7 @@ static void playback_start_cb(void *channel, gint format, gint channels,
     audio_bytes = 0;
     audio_have_last_frame = false;
     audio_last_frame_avg = 0;
+    audio_dump_start(format, channels, frequency);
     if (audio_debug()) {
         log_line("SPICE playback-start wall_ms=%I64u format=%d channels=%d frequency=%d",
                  (unsigned long long)viewer_wall_ms(), format, channels, frequency);
@@ -1518,6 +1693,7 @@ static void playback_data_cb(void *channel, gpointer audio, gint size,
                  audio_chunks, audio_bytes, size, chunk_ms, (unsigned long long)gap_ms,
                  audio_channels, audio_frequency);
     }
+    audio_dump_write(audio, size);
     inspect_audio_pcm(audio, size, chunk_ms, gap_ms);
     audio_last_data_ms = now_ms;
 }
@@ -1536,6 +1712,7 @@ static void playback_stop_cb(void *channel, void *opaque)
     audio_last_data_ms = 0;
     audio_have_last_frame = false;
     audio_last_frame_avg = 0;
+    audio_dump_finish("playback-stop");
 }
 
 static void channel_new(void *session, void *channel, void *opaque)
@@ -1819,8 +1996,20 @@ static void set_gst_environment(void)
                 audio_queue_ms, audio_buffer_us, audio_latency_us);
         }
         SetEnvironmentVariableA("SPICE_GST_AUDIOSINK", audio_sink);
-        log_line("SPICE audio sink kind=%s queue_ms=%d buffer_us=%d latency_us=%d",
-                 audio_sink_name, audio_queue_ms, audio_buffer_us, audio_latency_us);
+        log_line("SPICE audio sink kind=%s queue_ms=%d buffer_us=%d latency_us=%d pipeline=\"%s\"",
+                 audio_sink_name, audio_queue_ms, audio_buffer_us,
+                 audio_latency_us, audio_sink);
+    } else {
+        DWORD audio_sink_len = GetEnvironmentVariableA("SPICE_GST_AUDIOSINK",
+                                                       audio_sink,
+                                                       sizeof(audio_sink));
+        if (audio_sink_len > 0 && audio_sink_len < sizeof(audio_sink)) {
+            log_line("SPICE audio sink kind=override pipeline=\"%s\"",
+                     audio_sink);
+        } else {
+            log_line("SPICE audio sink kind=override pipeline_unreadable_len=%lu",
+                     (unsigned long)audio_sink_len);
+        }
     }
     free(app_dir);
 }
@@ -2404,6 +2593,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
             CloseHandle(spice_thread_handle);
             spice_thread_handle = NULL;
         }
+        audio_dump_finish("viewer-exit");
         PostQuitMessage(0);
         return 0;
     default:
