@@ -119,7 +119,7 @@ static bool native_input_enabled = true;
 static int video_port = 5004;
 static int video_latency = 15;
 static bool video_drop_on_latency = false;
-static const char *video_codec = "h264";
+static const char *video_codec = "h265";
 static const char *stream_control_host = NULL;
 static int stream_control_port = 5004;
 static bool stream_control_enabled = true;
@@ -839,7 +839,7 @@ static bool stream_control_send_start(const char *reason)
 
     snprintf(start, sizeof(start),
              "{\"type\":\"start\",\"video_port\":%d,\"codec\":\"%s\"}\n",
-             video_port, video_codec ? video_codec : "h264");
+             video_port, video_codec ? video_codec : "h265");
     t_stage = viewer_now_ms();
     if (send(stream_control_sock, start, (int)strlen(start), 0) <= 0) {
         log_line("stream-control start send failed reason=%s err=%d",
@@ -852,7 +852,7 @@ static bool stream_control_send_start(const char *reason)
              reason ? reason : "",
              (unsigned long long)(viewer_now_ms() - t_stage),
              (unsigned)strlen(start), video_port,
-             video_codec ? video_codec : "h264");
+             video_codec ? video_codec : "h265");
     return true;
 }
 
@@ -1001,7 +1001,7 @@ static bool stream_control_start_session(void)
              (unsigned)strlen(hello));
     log_line("stream-control connected %s:%d video_port=%d codec=%s",
              host, stream_control_port, video_port,
-             video_codec ? video_codec : "h264");
+             video_codec ? video_codec : "h265");
 
     t_stage = viewer_now_ms();
     if (stream_control_read_line(status, sizeof(status))) {

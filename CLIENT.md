@@ -188,7 +188,7 @@ Normally use `GVT Cloud Client.exe`. For debugging, run the viewer directly:
 
 ```powershell
 .\app\viewer\gvt_spice_viewer.exe `
-  --video-codec h264 `
+  --video-codec h265 `
   --video-port 5004 `
   --latency 15 `
   --spice-host 192.168.0.188 `

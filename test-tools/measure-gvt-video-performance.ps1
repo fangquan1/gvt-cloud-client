@@ -13,7 +13,7 @@ param(
     [int]$SpicePort = 5900,
     [int]$InputPort = 5905,
     [ValidateSet("h264", "h265")]
-    [string]$Codec = "h264",
+    [string]$Codec = "h265",
     [int]$Latency = 15,
     [int]$SourceWidth = 1920,
     [int]$SourceHeight = 1200,

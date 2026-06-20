@@ -395,7 +395,7 @@ static void get_selected_codec(wchar_t *codec, size_t codec_count)
     codec[codec_count - 1] = 0;
     if (_wcsicmp(codec, L"h265") && _wcsicmp(codec, L"hevc") &&
         _wcsicmp(codec, L"h264")) {
-        wcsncpy(codec, L"h264", codec_count - 1);
+        wcsncpy(codec, L"h265", codec_count - 1);
         codec[codec_count - 1] = 0;
     }
     if (!_wcsicmp(codec, L"hevc")) {
@@ -510,7 +510,7 @@ static void connect_now(void)
     if (height <= 0) height = 1200;
 
     quote_append(cmd, 8192, viewer);
-    append_flag_value(cmd, 8192, L"--video-codec", codec[0] ? codec : L"h264");
+    append_flag_value(cmd, 8192, L"--video-codec", codec[0] ? codec : L"h265");
     append_flag_int(cmd, 8192, L"--video-port", video_port);
     append_flag_int(cmd, 8192, L"--latency", latency);
     append_flag_value(cmd, 8192, L"--spice-host", host);
@@ -587,8 +587,8 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         codec_combo = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
                                     24, 192, 110, 100, hwnd, (HMENU)(INT_PTR)IDC_CODEC, app_instance, NULL);
         SendMessageW(codec_combo, WM_SETFONT, (WPARAM)ui_font, TRUE);
-        SendMessageW(codec_combo, CB_ADDSTRING, 0, (LPARAM)L"h264");
         SendMessageW(codec_combo, CB_ADDSTRING, 0, (LPARAM)L"h265");
+        SendMessageW(codec_combo, CB_ADDSTRING, 0, (LPARAM)L"h264");
         SendMessageW(codec_combo, CB_SETCURSEL, 0, 0);
 
         make_label(hwnd, L"Latency ms", 154, 168, 90, 22);
