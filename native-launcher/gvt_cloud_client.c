@@ -1,8 +1,17 @@
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
 #include <stdbool.h>
 #include <stdio.h>
+
+#ifndef PROCESS_QUERY_LIMITED_INFORMATION
+#define PROCESS_QUERY_LIMITED_INFORMATION 0x1000
+#endif
 
 #define IDC_ENDPOINT 1001
 #define IDC_CONNECT 1002
@@ -22,6 +31,8 @@ static HWND height_edit;
 static HINSTANCE app_instance;
 static wchar_t app_dir[MAX_PATH];
 static HFONT ui_font;
+static HANDLE viewer_process;
+static DWORD viewer_pid;
 
 static void set_status(const wchar_t *text)
 {
@@ -72,6 +83,14 @@ static void debug_log(const wchar_t *text)
     }
     fwprintf(fp, L"%s\n", text);
     fclose(fp);
+}
+
+static void debug_logf(const wchar_t *prefix, DWORD value)
+{
+    wchar_t text[256];
+    _snwprintf(text, 256, L"%s%lu", prefix, value);
+    text[255] = 0;
+    debug_log(text);
 }
 
 static void load_history(void)
@@ -204,6 +223,111 @@ static void find_viewer(wchar_t *viewer, size_t viewer_count)
     viewer[0] = 0;
 }
 
+static bool normalize_path(const wchar_t *path, wchar_t *out, size_t out_count)
+{
+    DWORD len;
+
+    if (!path || !*path || !out || out_count == 0) {
+        return false;
+    }
+    len = GetFullPathNameW(path, (DWORD)out_count, out, NULL);
+    if (len == 0 || len >= out_count) {
+        wcsncpy(out, path, out_count - 1);
+        out[out_count - 1] = 0;
+    }
+    return true;
+}
+
+static bool viewer_handle_running(void)
+{
+    DWORD exit_code;
+
+    if (!viewer_process) {
+        return false;
+    }
+    if (!GetExitCodeProcess(viewer_process, &exit_code)) {
+        return false;
+    }
+    return exit_code == STILL_ACTIVE;
+}
+
+static void close_tracked_viewer_handle(void)
+{
+    if (viewer_process) {
+        CloseHandle(viewer_process);
+        viewer_process = NULL;
+    }
+    viewer_pid = 0;
+}
+
+static void terminate_process_for_switch(HANDLE process, DWORD pid)
+{
+    if (!process) {
+        return;
+    }
+    debug_logf(L"terminating existing viewer pid=", pid);
+    TerminateProcess(process, 0);
+    WaitForSingleObject(process, 3000);
+}
+
+static void stop_tracked_viewer(void)
+{
+    if (!viewer_process) {
+        return;
+    }
+    if (viewer_handle_running()) {
+        terminate_process_for_switch(viewer_process, viewer_pid);
+    }
+    close_tracked_viewer_handle();
+}
+
+static void stop_existing_viewers(const wchar_t *viewer_path)
+{
+    wchar_t target[MAX_PATH];
+    HANDLE snapshot;
+    PROCESSENTRY32W entry;
+
+    stop_tracked_viewer();
+    if (!normalize_path(viewer_path, target, MAX_PATH)) {
+        return;
+    }
+
+    snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    entry.dwSize = sizeof(entry);
+    if (!Process32FirstW(snapshot, &entry)) {
+        CloseHandle(snapshot);
+        return;
+    }
+
+    do {
+        HANDLE process;
+        wchar_t image[MAX_PATH];
+        DWORD image_len = MAX_PATH;
+
+        if (_wcsicmp(entry.szExeFile, L"gvt_spice_viewer.exe") != 0) {
+            continue;
+        }
+        process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION |
+                              PROCESS_TERMINATE | SYNCHRONIZE,
+                              FALSE, entry.th32ProcessID);
+        if (!process) {
+            continue;
+        }
+        image[0] = 0;
+        if (QueryFullProcessImageNameW(process, 0, image, &image_len) &&
+            _wcsicmp(image, target) == 0) {
+            terminate_process_for_switch(process, entry.th32ProcessID);
+        }
+        CloseHandle(process);
+    } while (Process32NextW(snapshot, &entry));
+
+    CloseHandle(snapshot);
+}
+
 static void quote_append(wchar_t *cmd, size_t cmd_count, const wchar_t *value)
 {
     if (cmd[0]) {
@@ -252,6 +376,32 @@ static void append_flag_int(wchar_t *cmd, size_t cmd_count, const wchar_t *flag,
     wchar_t text[32];
     _snwprintf(text, 32, L"%d", value);
     append_flag_value(cmd, cmd_count, flag, text);
+}
+
+static void get_selected_codec(wchar_t *codec, size_t codec_count)
+{
+    LRESULT sel;
+
+    if (!codec || codec_count == 0) {
+        return;
+    }
+    codec[0] = 0;
+    sel = SendMessageW(codec_combo, CB_GETCURSEL, 0, 0);
+    if (sel != CB_ERR) {
+        SendMessageW(codec_combo, CB_GETLBTEXT, (WPARAM)sel, (LPARAM)codec);
+    } else {
+        GetWindowTextW(codec_combo, codec, (int)codec_count);
+    }
+    codec[codec_count - 1] = 0;
+    if (_wcsicmp(codec, L"h265") && _wcsicmp(codec, L"hevc") &&
+        _wcsicmp(codec, L"h264")) {
+        wcsncpy(codec, L"h264", codec_count - 1);
+        codec[codec_count - 1] = 0;
+    }
+    if (!_wcsicmp(codec, L"hevc")) {
+        wcsncpy(codec, L"h265", codec_count - 1);
+        codec[codec_count - 1] = 0;
+    }
 }
 
 static void append_portable_runtime_args(wchar_t *cmd, size_t cmd_count)
@@ -348,7 +498,7 @@ static void connect_now(void)
     spice_port = 5900 + slot;
     input_port = 5905 + slot;
 
-    GetWindowTextW(codec_combo, codec, 16);
+    get_selected_codec(codec, 16);
     GetWindowTextW(latency_edit, latency_text, 32);
     GetWindowTextW(width_edit, width_text, 32);
     GetWindowTextW(height_edit, height_text, 32);
@@ -377,15 +527,22 @@ static void connect_now(void)
     si.cb = sizeof(si);
     debug_log(cmd);
     set_viewer_low_latency_env();
+    stop_existing_viewers(viewer);
     if (!CreateProcessW(viewer, cmd, NULL, NULL, FALSE, 0, NULL, app_dir, &si, &pi)) {
         show_last_error(L"GVT Cloud Client",
                         L"Failed to start the desktop viewer.");
         return;
     }
     CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
+    close_tracked_viewer_handle();
+    viewer_process = pi.hProcess;
+    viewer_pid = pi.dwProcessId;
     save_history(endpoint);
-    set_status(L"Viewer started. Close the viewer window to disconnect.");
+    if (!_wcsicmp(codec, L"h265")) {
+        set_status(L"Viewer restarted with H.265. Close the viewer window to disconnect.");
+    } else {
+        set_status(L"Viewer restarted with H.264. Close the viewer window to disconnect.");
+    }
 }
 
 static HWND make_label(HWND parent, const wchar_t *text, int x, int y, int w, int h)
@@ -452,6 +609,7 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         break;
     case WM_DESTROY:
+        close_tracked_viewer_handle();
         if (ui_font) {
             DeleteObject(ui_font);
         }
