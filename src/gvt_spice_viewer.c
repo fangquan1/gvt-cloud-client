@@ -29,6 +29,9 @@
 #define SPICE_CHANNEL_OPENED 10
 #define SPICE_CHANNEL_CLOSED 12
 
+#define VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD 0
+#define VD_AGENT_CLIPBOARD_UTF8_TEXT 1
+
 #define SPICE_MOUSE_BUTTON_LEFT 1
 #define SPICE_MOUSE_BUTTON_MIDDLE 2
 #define SPICE_MOUSE_BUTTON_RIGHT 3
@@ -57,7 +60,7 @@ typedef void (*GCallback)(void);
 typedef void (*GClosureNotify)(gpointer data, void *closure);
 typedef void (*GDestroyNotify)(gpointer data);
 
-static HMODULE glib, gobject, spice, gtk, spicegtk;
+static HMODULE glib, gobject, gio, spice, gtk, spicegtk;
 static void *(*p_spice_session_new)(void);
 static gboolean (*p_spice_session_connect)(void *session);
 static void (*p_spice_session_disconnect)(void *session);
@@ -72,6 +75,34 @@ static void (*p_spice_inputs_channel_button_release)(void *channel, gint button,
                                                      gint button_state);
 static void (*p_spice_inputs_channel_key_press)(void *channel, guint scancode);
 static void (*p_spice_inputs_channel_key_release)(void *channel, guint scancode);
+static void (*p_spice_main_channel_clipboard_selection_grab)(void *channel,
+                                                            guint selection,
+                                                            uint32_t *types,
+                                                            int ntypes);
+static void (*p_spice_main_channel_clipboard_selection_notify)(void *channel,
+                                                              guint selection,
+                                                              uint32_t type,
+                                                              const unsigned char *data,
+                                                              size_t size);
+static void (*p_spice_main_channel_clipboard_selection_release)(void *channel,
+                                                               guint selection);
+static void (*p_spice_main_channel_clipboard_selection_request)(void *channel,
+                                                               guint selection,
+                                                               uint32_t type);
+static void (*p_spice_main_channel_file_copy_async)(void *channel,
+                                                   void **sources,
+                                                   int flags,
+                                                   void *cancellable,
+                                                   void *progress_callback,
+                                                   gpointer progress_callback_data,
+                                                   void (*callback)(gpointer source_object,
+                                                                    gpointer result,
+                                                                    gpointer user_data),
+                                                   gpointer user_data);
+static gboolean (*p_spice_main_channel_file_copy_finish)(void *channel,
+                                                        void *result,
+                                                        void **error);
+static void *(*p_g_file_new_for_path)(const char *path);
 
 static void (*p_g_object_set)(gpointer object, const char *first_property_name, ...);
 static void (*p_g_object_get)(gpointer object, const char *first_property_name, ...);
@@ -139,11 +170,14 @@ static HWND main_hwnd;
 static HWND video_hwnd;
 static HWND release_button;
 static RECT video_rect;
+static void *main_channel;
 static void *gst_pipeline;
 static void *gst_sink;
 static void *main_loop;
 static void *inputs_channel;
 static void *spice_audio_obj;
+static bool main_ready;
+static bool agent_connected;
 static bool inputs_ready;
 static volatile LONG shutting_down;
 static volatile LONG media_started;
@@ -189,6 +223,7 @@ static uint64_t audio_dump_data_bytes;
 static volatile LONG video_probe_counts[4];
 static HANDLE video_probe_thread;
 static HANDLE spice_thread_handle;
+static HANDLE clipboard_thread_handle;
 
 typedef enum InputCaptureState {
     INPUT_CAPTURE_LOCAL,
@@ -228,6 +263,12 @@ typedef struct InputEv {
     ULONGLONG event_ms;
     ULONGLONG wall_ms;
 } InputEv;
+
+typedef struct FileDropRequest {
+    int count;
+    char **paths;
+    void **files;
+} FileDropRequest;
 
 static ULONGLONG viewer_now_ms(void)
 {
@@ -536,6 +577,126 @@ static void audio_dump_finish(const char *reason)
              (unsigned long long)data_bytes, channels, frequency);
 }
 
+static char *clipboard_read_utf8(size_t *out_size)
+{
+    HANDLE handle;
+    wchar_t *wide;
+    char *utf8;
+    int bytes;
+
+    if (out_size) {
+        *out_size = 0;
+    }
+    if (!IsClipboardFormatAvailable(CF_UNICODETEXT) ||
+        !OpenClipboard(NULL)) {
+        return NULL;
+    }
+
+    handle = GetClipboardData(CF_UNICODETEXT);
+    if (!handle) {
+        CloseClipboard();
+        return NULL;
+    }
+    wide = GlobalLock(handle);
+    if (!wide) {
+        CloseClipboard();
+        return NULL;
+    }
+    bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+    if (bytes <= 1) {
+        GlobalUnlock(handle);
+        CloseClipboard();
+        return NULL;
+    }
+    utf8 = calloc((size_t)bytes, 1);
+    if (utf8) {
+        WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, bytes, NULL, NULL);
+        if (out_size) {
+            *out_size = strlen(utf8);
+        }
+    }
+    GlobalUnlock(handle);
+    CloseClipboard();
+    return utf8;
+}
+
+static bool clipboard_has_text(void)
+{
+    bool has_text;
+
+    if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+        return false;
+    }
+    if (!OpenClipboard(NULL)) {
+        return false;
+    }
+    has_text = GetClipboardData(CF_UNICODETEXT) != NULL;
+    CloseClipboard();
+    return has_text;
+}
+
+static bool clipboard_write_utf16(const wchar_t *wide)
+{
+    size_t bytes;
+    HGLOBAL handle;
+    void *dst;
+    bool ok = false;
+
+    if (!wide || !OpenClipboard(NULL)) {
+        return false;
+    }
+    bytes = (wcslen(wide) + 1) * sizeof(wchar_t);
+    handle = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!handle) {
+        CloseClipboard();
+        return false;
+    }
+    dst = GlobalLock(handle);
+    if (!dst) {
+        GlobalFree(handle);
+        CloseClipboard();
+        return false;
+    }
+    memcpy(dst, wide, bytes);
+    GlobalUnlock(handle);
+
+    if (EmptyClipboard() && SetClipboardData(CF_UNICODETEXT, handle)) {
+        ok = true;
+        handle = NULL;
+    }
+    if (handle) {
+        GlobalFree(handle);
+    }
+    CloseClipboard();
+    return ok;
+}
+
+static bool clipboard_write_utf8(const unsigned char *data, guint size)
+{
+    wchar_t *wide;
+    int chars;
+    bool ok;
+
+    if (!data || size == 0) {
+        return false;
+    }
+    chars = MultiByteToWideChar(CP_UTF8, 0, (const char *)data,
+                                (int)size, NULL, 0);
+    if (chars <= 0) {
+        return false;
+    }
+    wide = calloc((size_t)chars + 1, sizeof(wchar_t));
+    if (!wide) {
+        return false;
+    }
+    MultiByteToWideChar(CP_UTF8, 0, (const char *)data, (int)size,
+                        wide, chars);
+    wide[chars] = 0;
+    ok = clipboard_write_utf16(wide);
+    free(wide);
+    return ok;
+}
+
 static bool video_debug(void)
 {
     return env_is_set("GVT_SPICE_VIEWER_VIDEO_DEBUG");
@@ -712,18 +873,19 @@ static void load_spice_runtime(void)
 {
     log_line("load_spice_runtime %s", spice_runtime);
     runtime_load_enter();
-    if (glib && gobject && spice) {
+    if (glib && gobject && gio && spice) {
         runtime_load_leave();
         return;
     }
     SetDllDirectoryA(spice_runtime);
     glib = LoadLibraryA("libglib-2.0-0.dll");
     gobject = LoadLibraryA("libgobject-2.0-0.dll");
+    gio = LoadLibraryA("libgio-2.0-0.dll");
     spice = LoadLibraryA("libspice-client-glib-2.0-8.dll");
-    if (!glib || !gobject || !spice) {
+    if (!glib || !gobject || !gio || !spice) {
         DWORD err = GetLastError();
-        log_line("load_spice_runtime failed glib=%p gobject=%p spice=%p err=%lu",
-                 glib, gobject, spice, err);
+        log_line("load_spice_runtime failed glib=%p gobject=%p gio=%p spice=%p err=%lu",
+                 glib, gobject, gio, spice, err);
         runtime_load_leave();
         MessageBoxA(NULL, "Failed to load VirtViewer SPICE runtime DLLs",
                     "GVT SPICE Viewer", MB_ICONERROR);
@@ -741,6 +903,19 @@ static void load_spice_runtime(void)
     p_spice_inputs_channel_button_release = sym(spice, "spice_inputs_channel_button_release");
     p_spice_inputs_channel_key_press = sym(spice, "spice_inputs_channel_key_press");
     p_spice_inputs_channel_key_release = sym(spice, "spice_inputs_channel_key_release");
+    p_spice_main_channel_clipboard_selection_grab =
+        sym(spice, "spice_main_channel_clipboard_selection_grab");
+    p_spice_main_channel_clipboard_selection_notify =
+        sym(spice, "spice_main_channel_clipboard_selection_notify");
+    p_spice_main_channel_clipboard_selection_release =
+        sym(spice, "spice_main_channel_clipboard_selection_release");
+    p_spice_main_channel_clipboard_selection_request =
+        sym(spice, "spice_main_channel_clipboard_selection_request");
+    p_spice_main_channel_file_copy_async =
+        sym(spice, "spice_main_channel_file_copy_async");
+    p_spice_main_channel_file_copy_finish =
+        sym(spice, "spice_main_channel_file_copy_finish");
+    p_g_file_new_for_path = sym(gio, "g_file_new_for_path");
 
     p_g_object_set = sym(gobject, "g_object_set");
     p_g_object_get = sym(gobject, "g_object_get");
@@ -1596,6 +1771,341 @@ static void load_gst_runtime(void)
     runtime_load_leave();
 }
 
+static gboolean clipboard_advertise_idle(gpointer opaque)
+{
+    uint32_t types[1] = { VD_AGENT_CLIPBOARD_UTF8_TEXT };
+
+    (void)opaque;
+    if (!main_channel || !main_ready || !agent_connected ||
+        !p_spice_main_channel_clipboard_selection_grab ||
+        !p_spice_main_channel_clipboard_selection_release) {
+        return false;
+    }
+    if (clipboard_has_text()) {
+        p_spice_main_channel_clipboard_selection_grab(
+            main_channel, VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD, types, 1);
+        log_line("SPICE vdagent clipboard host-grab text");
+    } else {
+        p_spice_main_channel_clipboard_selection_release(
+            main_channel, VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD);
+        log_line("SPICE vdagent clipboard host-release");
+    }
+    return false;
+}
+
+static void queue_clipboard_advertise(void)
+{
+    if (p_g_idle_add &&
+        InterlockedCompareExchange(&shutting_down, 0, 0) == 0) {
+        p_g_idle_add(clipboard_advertise_idle, NULL);
+    }
+}
+
+static gboolean clipboard_notify_guest_idle(gpointer opaque)
+{
+    char *text;
+    size_t size = 0;
+
+    (void)opaque;
+    if (!main_channel || !main_ready || !agent_connected ||
+        !p_spice_main_channel_clipboard_selection_notify) {
+        return false;
+    }
+    text = clipboard_read_utf8(&size);
+    if (!text || size == 0) {
+        free(text);
+        return false;
+    }
+    p_spice_main_channel_clipboard_selection_notify(
+        main_channel, VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD,
+        VD_AGENT_CLIPBOARD_UTF8_TEXT, (const unsigned char *)text, size);
+    log_line("SPICE vdagent clipboard host-notify bytes=%u",
+             (unsigned)size);
+    free(text);
+    return false;
+}
+
+static gboolean main_clipboard_selection_grab_cb(void *channel,
+                                                 guint selection,
+                                                 gpointer types,
+                                                 guint ntypes,
+                                                 gpointer opaque)
+{
+    uint32_t *available = types;
+
+    (void)opaque;
+    log_line("SPICE vdagent clipboard guest-grab selection=%u ntypes=%u",
+             selection, ntypes);
+    if (!p_spice_main_channel_clipboard_selection_request ||
+        selection != VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD) {
+        return false;
+    }
+    for (guint i = 0; i < ntypes; i++) {
+        if (available[i] == VD_AGENT_CLIPBOARD_UTF8_TEXT) {
+            p_spice_main_channel_clipboard_selection_request(
+                channel, selection, VD_AGENT_CLIPBOARD_UTF8_TEXT);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void main_clipboard_selection_cb(void *channel,
+                                        guint selection,
+                                        guint type,
+                                        gpointer data,
+                                        guint size,
+                                        gpointer opaque)
+{
+    bool ok;
+
+    (void)channel;
+    (void)opaque;
+    if (selection != VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD ||
+        type != VD_AGENT_CLIPBOARD_UTF8_TEXT || !data || size == 0) {
+        return;
+    }
+    ok = clipboard_write_utf8((const unsigned char *)data, size);
+    log_line("SPICE vdagent clipboard guest-to-host bytes=%u ok=%d",
+             size, ok);
+}
+
+static void main_clipboard_selection_release_cb(void *channel,
+                                                guint selection,
+                                                gpointer opaque)
+{
+    (void)channel;
+    (void)opaque;
+    log_line("SPICE vdagent clipboard guest-release selection=%u", selection);
+}
+
+static gboolean main_clipboard_selection_request_cb(void *channel,
+                                                    guint selection,
+                                                    guint type,
+                                                    gpointer opaque)
+{
+    (void)channel;
+    (void)opaque;
+    if (selection != VD_AGENT_CLIPBOARD_SELECTION_CLIPBOARD ||
+        type != VD_AGENT_CLIPBOARD_UTF8_TEXT) {
+        return false;
+    }
+    if (p_g_idle_add) {
+        p_g_idle_add(clipboard_notify_guest_idle, NULL);
+    }
+    return true;
+}
+
+static void main_agent_update_cb(void *channel, gpointer opaque)
+{
+    gboolean connected = false;
+
+    (void)opaque;
+    if (p_g_object_get) {
+        p_g_object_get(channel, "agent-connected", &connected, NULL);
+    }
+    agent_connected = !!connected;
+    log_line("SPICE vdagent agent-update connected=%d", agent_connected);
+    if (agent_connected) {
+        queue_clipboard_advertise();
+    }
+}
+
+static void connect_main_channel_signals(void *channel)
+{
+    if (!channel || !p_g_signal_connect_data) {
+        return;
+    }
+    p_g_signal_connect_data(channel, "main-agent-update",
+                            (GCallback)main_agent_update_cb,
+                            NULL, NULL, 0);
+    p_g_signal_connect_data(channel, "main-clipboard-selection-grab",
+                            (GCallback)main_clipboard_selection_grab_cb,
+                            NULL, NULL, 0);
+    p_g_signal_connect_data(channel, "main-clipboard-selection",
+                            (GCallback)main_clipboard_selection_cb,
+                            NULL, NULL, 0);
+    p_g_signal_connect_data(channel, "main-clipboard-selection-release",
+                            (GCallback)main_clipboard_selection_release_cb,
+                            NULL, NULL, 0);
+    p_g_signal_connect_data(channel, "main-clipboard-selection-request",
+                            (GCallback)main_clipboard_selection_request_cb,
+                            NULL, NULL, 0);
+}
+
+static DWORD WINAPI clipboard_watch_thread(LPVOID opaque)
+{
+    DWORD last_seq = GetClipboardSequenceNumber();
+
+    (void)opaque;
+    queue_clipboard_advertise();
+    while (InterlockedCompareExchange(&shutting_down, 0, 0) == 0) {
+        DWORD seq;
+
+        Sleep(500);
+        seq = GetClipboardSequenceNumber();
+        if (seq != last_seq) {
+            last_seq = seq;
+            queue_clipboard_advertise();
+        }
+    }
+    return 0;
+}
+
+static void start_clipboard_watch_thread(void)
+{
+    if (clipboard_thread_handle) {
+        return;
+    }
+    clipboard_thread_handle =
+        CreateThread(NULL, 0, clipboard_watch_thread, NULL, 0, NULL);
+    if (!clipboard_thread_handle) {
+        log_line("SPICE vdagent clipboard watch thread create failed err=%lu",
+                 GetLastError());
+    }
+}
+
+static void free_file_drop_request(FileDropRequest *req)
+{
+    if (!req) {
+        return;
+    }
+    if (req->files && p_g_object_unref) {
+        for (int i = 0; i < req->count; i++) {
+            if (req->files[i]) {
+                p_g_object_unref(req->files[i]);
+            }
+        }
+    }
+    if (req->paths) {
+        for (int i = 0; i < req->count; i++) {
+            free(req->paths[i]);
+        }
+    }
+    free(req->files);
+    free(req->paths);
+    free(req);
+}
+
+static void file_copy_finish_cb(gpointer source_object,
+                                gpointer result,
+                                gpointer user_data)
+{
+    FileDropRequest *req = user_data;
+    gboolean ok = false;
+
+    if (p_spice_main_channel_file_copy_finish) {
+        ok = p_spice_main_channel_file_copy_finish(source_object,
+                                                   result, NULL);
+    }
+    log_line("SPICE vdagent file-copy finish count=%d ok=%d",
+             req ? req->count : 0, ok);
+    free_file_drop_request(req);
+}
+
+static gboolean file_copy_start_idle(gpointer opaque)
+{
+    FileDropRequest *req = opaque;
+
+    if (!req) {
+        return false;
+    }
+    if (!main_channel || !main_ready || !agent_connected ||
+        !p_g_file_new_for_path || !p_spice_main_channel_file_copy_async) {
+        log_line("SPICE vdagent file-copy skipped: agent not ready");
+        free_file_drop_request(req);
+        return false;
+    }
+
+    req->files = calloc((size_t)req->count + 1, sizeof(void *));
+    if (!req->files) {
+        free_file_drop_request(req);
+        return false;
+    }
+    for (int i = 0; i < req->count; i++) {
+        req->files[i] = p_g_file_new_for_path(req->paths[i]);
+        if (!req->files[i]) {
+            log_line("SPICE vdagent file-copy gfile failed path=%s",
+                     req->paths[i]);
+            free_file_drop_request(req);
+            return false;
+        }
+    }
+    req->files[req->count] = NULL;
+    p_spice_main_channel_file_copy_async(main_channel, req->files, 0,
+                                         NULL, NULL, NULL,
+                                         file_copy_finish_cb, req);
+    log_line("SPICE vdagent file-copy start count=%d", req->count);
+    return false;
+}
+
+static char *wide_to_utf8_path(const wchar_t *wide)
+{
+    int bytes;
+    char *utf8;
+
+    if (!wide || !*wide) {
+        return NULL;
+    }
+    bytes = WideCharToMultiByte(CP_UTF8, 0, wide, -1, NULL, 0, NULL, NULL);
+    if (bytes <= 1) {
+        return NULL;
+    }
+    utf8 = calloc((size_t)bytes, 1);
+    if (!utf8) {
+        return NULL;
+    }
+    WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, bytes, NULL, NULL);
+    return utf8;
+}
+
+static void handle_drop_files(HDROP drop)
+{
+    UINT total;
+    FileDropRequest *req;
+
+    if (!drop) {
+        return;
+    }
+    total = DragQueryFileW(drop, 0xffffffff, NULL, 0);
+    if (total == 0) {
+        return;
+    }
+    if (!p_g_idle_add || !main_channel || !main_ready || !agent_connected) {
+        MessageBoxA(main_hwnd,
+                    "SPICE guest agent is not ready for file transfer yet.",
+                    "GVT SPICE Viewer", MB_ICONWARNING);
+        return;
+    }
+    req = calloc(1, sizeof(*req));
+    if (!req) {
+        return;
+    }
+    req->paths = calloc(total, sizeof(char *));
+    if (!req->paths) {
+        free(req);
+        return;
+    }
+    for (UINT i = 0; i < total; i++) {
+        UINT chars = DragQueryFileW(drop, i, NULL, 0);
+        wchar_t *wide = calloc((size_t)chars + 1, sizeof(wchar_t));
+        if (!wide) {
+            continue;
+        }
+        DragQueryFileW(drop, i, wide, chars + 1);
+        req->paths[req->count] = wide_to_utf8_path(wide);
+        free(wide);
+        if (req->paths[req->count]) {
+            req->count++;
+        }
+    }
+    if (req->count == 0) {
+        free_file_drop_request(req);
+        return;
+    }
+    p_g_idle_add(file_copy_start_idle, req);
+}
+
 static void channel_event(void *channel, gint event, void *opaque)
 {
     gint type = 0;
@@ -1607,11 +2117,29 @@ static void channel_event(void *channel, gint event, void *opaque)
     name = p_spice_channel_type_to_string(type);
     log_line("SPICE channel-event type=%d(%s) id=%d event=%d",
              type, name ? name : "?", id, event);
-    if (type == SPICE_CHANNEL_INPUTS && event == SPICE_CHANNEL_OPENED) {
+    if (type == SPICE_CHANNEL_MAIN && event == SPICE_CHANNEL_OPENED) {
+        gboolean connected = false;
+
+        main_channel = channel;
+        main_ready = true;
+        if (p_g_object_get) {
+            p_g_object_get(channel, "agent-connected", &connected, NULL);
+        }
+        agent_connected = !!connected;
+        log_line("SPICE main ready agent_connected=%d", agent_connected);
+        if (agent_connected) {
+            queue_clipboard_advertise();
+        }
+    } else if (type == SPICE_CHANNEL_INPUTS && event == SPICE_CHANNEL_OPENED) {
         inputs_channel = channel;
         inputs_ready = true;
         SetWindowTextA(main_hwnd, "GVT SPICE Viewer - inputs ready");
     } else if (event >= SPICE_CHANNEL_CLOSED) {
+        if (type == SPICE_CHANNEL_MAIN) {
+            main_channel = NULL;
+            main_ready = false;
+            agent_connected = false;
+        }
         if (type == SPICE_CHANNEL_INPUTS) {
             inputs_channel = NULL;
             inputs_ready = false;
@@ -1793,6 +2321,14 @@ static void channel_new(void *session, void *channel, void *opaque)
     printf("SPICE channel-new type=%d(%s) id=%d\n", type, name ? name : "?", id);
     p_g_signal_connect_data(channel, "channel-event", (GCallback)channel_event,
                             NULL, NULL, 0);
+    if (type == SPICE_CHANNEL_MAIN) {
+        main_channel = channel;
+        main_ready = false;
+        agent_connected = false;
+        connect_main_channel_signals(channel);
+        log_line("SPICE main connect requested");
+        p_spice_channel_connect(channel);
+    }
     if (type == SPICE_CHANNEL_PLAYBACK) {
         p_g_signal_connect_data(channel, "playback-start",
                                 (GCallback)playback_start_cb, NULL, NULL, 0);
@@ -1824,7 +2360,13 @@ static void display_channel_new(void *session, void *channel, void *opaque)
              type, name ? name : "?", id);
     p_g_signal_connect_data(channel, "channel-event", (GCallback)channel_event,
                             NULL, NULL, 0);
-    if (type == SPICE_CHANNEL_INPUTS ||
+    if (type == SPICE_CHANNEL_MAIN) {
+        main_channel = channel;
+        main_ready = false;
+        agent_connected = false;
+        connect_main_channel_signals(channel);
+        p_spice_channel_connect(channel);
+    } else if (type == SPICE_CHANNEL_INPUTS ||
         type == SPICE_CHANNEL_DISPLAY ||
         type == SPICE_CHANNEL_CURSOR ||
         type == SPICE_CHANNEL_PLAYBACK ||
@@ -1846,6 +2388,9 @@ static DWORD WINAPI spice_thread(LPVOID opaque)
         void *session;
         void *loop;
 
+        main_channel = NULL;
+        main_ready = false;
+        agent_connected = false;
         inputs_channel = NULL;
         inputs_ready = false;
         spice_audio_obj = NULL;
@@ -1868,6 +2413,9 @@ static DWORD WINAPI spice_thread(LPVOID opaque)
         if (main_loop == loop) {
             main_loop = NULL;
         }
+        main_channel = NULL;
+        main_ready = false;
+        agent_connected = false;
         inputs_channel = NULL;
         inputs_ready = false;
         spice_audio_obj = NULL;
@@ -1923,6 +2471,7 @@ static int run_spice_display_mode(int argc, char **argv)
     int window_h = source_height > 0 ? source_height : 768;
 
     load_spice_gtk_runtime();
+    start_clipboard_watch_thread();
     log_line("spice display mode host=%s port=%s", spice_host, spice_port);
     p_gtk_init(&argc, &argv);
 
@@ -2534,6 +3083,7 @@ static void start_media_stack(HWND hwnd)
     log_line("media-stack begin");
     t_stage = viewer_now_ms();
     load_spice_runtime();
+    start_clipboard_watch_thread();
     log_line("media-stack load-spice-runtime dt=%I64ums",
              (unsigned long long)(viewer_now_ms() - t_stage));
     t_stage = viewer_now_ms();
@@ -2582,6 +3132,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
                                      (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE),
                                      NULL);
         EnableWindow(video_hwnd, FALSE);
+        DragAcceptFiles(hwnd, TRUE);
         layout_children(hwnd);
         SetWindowTextA(hwnd, "GVT SPICE Viewer - connecting");
         CreateThread(NULL, 0, stream_control_thread, NULL, 0, NULL);
@@ -2611,6 +3162,10 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
             return 0;
         }
         break;
+    case WM_DROPFILES:
+        handle_drop_files((HDROP)wparam);
+        DragFinish((HDROP)wparam);
+        return 0;
     case WM_MOUSEMOVE:
         if (!input_is_captured()) {
             break;
@@ -2790,6 +3345,14 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
             }
             CloseHandle(spice_thread_handle);
             spice_thread_handle = NULL;
+        }
+        if (clipboard_thread_handle) {
+            DWORD wait_rc = WaitForSingleObject(clipboard_thread_handle, 1000);
+            if (wait_rc == WAIT_TIMEOUT) {
+                log_line("clipboard thread did not exit within shutdown grace");
+            }
+            CloseHandle(clipboard_thread_handle);
+            clipboard_thread_handle = NULL;
         }
         audio_dump_finish("viewer-exit");
         PostQuitMessage(0);
