@@ -16,7 +16,9 @@ if (!(Test-Path $Gcc)) {
     -Wextra `
     -o (Join-Path $OutDir "GVT Cloud Client.exe") `
     (Join-Path $PSScriptRoot "gvt_cloud_client.c") `
-    -lcomctl32
+    -lcomctl32 `
+    -lshell32 `
+    -lws2_32
 
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE

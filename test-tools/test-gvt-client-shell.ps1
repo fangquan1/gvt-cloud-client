@@ -303,6 +303,8 @@ try {
         "$bitrateKbps",
         "--stream-keyint",
         "$StreamFps",
+        "--connection-id",
+        "--thumbnail-path",
         "--spice-host",
         $ServerHost,
         "--spice-port",

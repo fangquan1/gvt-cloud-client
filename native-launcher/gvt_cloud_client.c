@@ -2,6 +2,7 @@
 #define _WIN32_WINNT 0x0600
 #endif
 
+#include <winsock2.h>
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>
@@ -60,6 +61,9 @@
 #define SETTINGS_CLASS_NAME L"GVTCloudClientSettingsWindow"
 #define MAX_CONNECTIONS 64
 #define MAX_CARDS 64
+#define WM_TRAYICON (WM_APP + 1)
+#define TRAY_ICON_ID 1
+#define TIMER_RECONNECT_ID 10
 
 typedef struct {
     wchar_t id[64];
@@ -78,6 +82,10 @@ typedef struct {
     wchar_t thumbnail[MAX_PATH];
     HANDLE viewer_process;
     DWORD viewer_pid;
+    BOOL viewer_stop_requested;
+    BOOL reconnect_pending;
+    int reconnects_done;
+    ULONGLONG next_reconnect_tick;
 } Connection;
 
 typedef struct {
@@ -115,6 +123,7 @@ static ClientSettings settings;
 static int selected_connection = -1;
 static int edit_index = -1;
 static BOOL edit_is_new = FALSE;
+static BOOL tray_icon_added = FALSE;
 
 static HWND edit_endpoint;
 static HWND edit_name;
@@ -212,6 +221,84 @@ static void set_status(const wchar_t *text)
     if (status_label) {
         SetWindowTextW(status_label, text);
     }
+}
+
+static void update_tray_icon(BOOL add)
+{
+    NOTIFYICONDATAW nid;
+    ZeroMemory(&nid, sizeof(nid));
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = main_window;
+    nid.uID = TRAY_ICON_ID;
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    nid.uCallbackMessage = WM_TRAYICON;
+    nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    wcsncpy(nid.szTip, L"GVT Cloud Client", sizeof(nid.szTip) / sizeof(nid.szTip[0]) - 1);
+    if (add) {
+        if (!tray_icon_added && Shell_NotifyIconW(NIM_ADD, &nid)) {
+            tray_icon_added = TRUE;
+        } else if (tray_icon_added) {
+            Shell_NotifyIconW(NIM_MODIFY, &nid);
+        }
+    } else if (tray_icon_added) {
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+        tray_icon_added = FALSE;
+    }
+}
+
+static void show_from_tray(void)
+{
+    ShowWindow(main_window, SW_SHOW);
+    ShowWindow(main_window, SW_RESTORE);
+    SetForegroundWindow(main_window);
+}
+
+static BOOL probe_tcp_port(const wchar_t *host_w, int port, int timeout_ms)
+{
+    WSADATA wsa;
+    SOCKET sock = INVALID_SOCKET;
+    struct sockaddr_in addr;
+    char host[128];
+    u_long nonblock = 1;
+    fd_set writefds;
+    struct timeval tv;
+    int err = 0;
+    int err_len = sizeof(err);
+    BOOL ok = FALSE;
+
+    if (WideCharToMultiByte(CP_UTF8, 0, host_w, -1, host, sizeof(host), NULL, NULL) <= 0) {
+        return FALSE;
+    }
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        return FALSE;
+    }
+    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET) {
+        WSACleanup();
+        return FALSE;
+    }
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((u_short)port);
+    addr.sin_addr.s_addr = inet_addr(host);
+    if (addr.sin_addr.s_addr == INADDR_NONE) {
+        closesocket(sock);
+        WSACleanup();
+        return FALSE;
+    }
+    ioctlsocket(sock, FIONBIO, &nonblock);
+    connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+    FD_ZERO(&writefds);
+    FD_SET(sock, &writefds);
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    if (select(0, NULL, &writefds, NULL, &tv) > 0) {
+        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (char *)&err, &err_len) == 0 && err == 0) {
+            ok = TRUE;
+        }
+    }
+    closesocket(sock);
+    WSACleanup();
+    return ok;
 }
 
 static void default_settings(ClientSettings *out)
@@ -618,6 +705,38 @@ static bool parse_endpoint(const wchar_t *input, wchar_t *host, size_t host_coun
     return true;
 }
 
+static BOOL test_connection_endpoint(const wchar_t *endpoint, wchar_t *message, size_t message_count)
+{
+    wchar_t host[128];
+    int video_port;
+    int slot;
+    int spice_port;
+    int input_port;
+    BOOL control_ok;
+    BOOL spice_ok;
+    BOOL input_ok;
+
+    if (!parse_endpoint(endpoint, host, 128, &video_port)) {
+        wcsncpy(message, L"Invalid server address.", message_count - 1);
+        message[message_count - 1] = 0;
+        return FALSE;
+    }
+    slot = video_port >= 5004 ? (video_port - 5004) / 4 : 0;
+    if (slot < 0) slot = 0;
+    spice_port = 5900 + slot;
+    input_port = 5905 + slot;
+    control_ok = probe_tcp_port(host, video_port, 1500);
+    spice_ok = probe_tcp_port(host, spice_port, 1500);
+    input_ok = probe_tcp_port(host, input_port, 1500);
+    _snwprintf(message, message_count,
+               L"Control %d: %s\nSPICE %d: %s\nInput %d: %s",
+               video_port, control_ok ? L"OK" : L"failed",
+               spice_port, spice_ok ? L"OK" : L"failed",
+               input_port, input_ok ? L"OK" : L"failed");
+    message[message_count - 1] = 0;
+    return control_ok && spice_ok && input_ok;
+}
+
 static void find_viewer(wchar_t *viewer, size_t viewer_count)
 {
     wchar_t candidate[MAX_PATH];
@@ -719,6 +838,8 @@ static void close_viewer_handle(Connection *conn)
 
 static void stop_connection_viewer(Connection *conn)
 {
+    conn->viewer_stop_requested = TRUE;
+    conn->reconnect_pending = FALSE;
     if (viewer_handle_running(conn)) {
         TerminateProcess(conn->viewer_process, 0);
         WaitForSingleObject(conn->viewer_process, 3000);
@@ -754,7 +875,7 @@ static int find_connection_by_endpoint(const wchar_t *endpoint)
     return -1;
 }
 
-static BOOL start_viewer_for_connection(int index)
+static BOOL start_viewer_for_connection(int index, BOOL force_start, BOOL auto_reconnect)
 {
     Connection *conn;
     wchar_t host[128];
@@ -772,6 +893,13 @@ static BOOL start_viewer_for_connection(int index)
     if (index < 0 || index >= connection_count) return FALSE;
     conn = &connections[index];
     normalize_connection(conn);
+    if (!force_start && !conn->start_viewer) {
+        selected_connection = index;
+        fill_endpoint_combo();
+        refresh_cards();
+        set_status(L"Connection saved. Start viewer on connect is disabled.");
+        return TRUE;
+    }
 
     if (!parse_endpoint(conn->endpoint, host, 128, &video_port)) {
         MessageBoxW(main_window, L"Use an address like 192.168.0.188:5004.",
@@ -800,6 +928,8 @@ static BOOL start_viewer_for_connection(int index)
     append_flag_int(cmd, 8192, L"--stream-fps", conn->fps);
     append_flag_int(cmd, 8192, L"--stream-bitrate-kbps", bitrate_kbps);
     append_flag_int(cmd, 8192, L"--stream-keyint", conn->fps);
+    append_flag_value(cmd, 8192, L"--connection-id", conn->id);
+    append_flag_value(cmd, 8192, L"--thumbnail-path", conn->thumbnail);
     append_flag_value(cmd, 8192, L"--spice-host", host);
     append_flag_int(cmd, 8192, L"--spice-port", spice_port);
     append_flag_value(cmd, 8192, L"--input-host", host);
@@ -813,6 +943,7 @@ static BOOL start_viewer_for_connection(int index)
     debug_log(cmd);
     set_viewer_low_latency_env();
     stop_connection_viewer(conn);
+    conn->viewer_stop_requested = FALSE;
 
     si.cb = sizeof(si);
     if (!CreateProcessW(viewer, cmd, NULL, NULL, FALSE, 0, NULL, app_dir, &si, &pi)) {
@@ -822,6 +953,10 @@ static BOOL start_viewer_for_connection(int index)
     CloseHandle(pi.hThread);
     conn->viewer_process = pi.hProcess;
     conn->viewer_pid = pi.dwProcessId;
+    conn->reconnect_pending = FALSE;
+    if (!auto_reconnect) {
+        conn->reconnects_done = 0;
+    }
     selected_connection = index;
     save_connections();
     fill_endpoint_combo();
@@ -833,6 +968,7 @@ static BOOL start_viewer_for_connection(int index)
     status[255] = 0;
     set_status(status);
     if (conn->minimize_tray_on_connect) {
+        update_tray_icon(TRUE);
         ShowWindow(main_window, SW_MINIMIZE);
     }
     return TRUE;
@@ -866,7 +1002,7 @@ static void connect_from_address_bar(void)
         fill_endpoint_combo();
         refresh_cards();
     }
-    start_viewer_for_connection(index);
+    start_viewer_for_connection(index, FALSE, FALSE);
 }
 
 static HWND make_control(HWND parent, const wchar_t *cls, const wchar_t *text, DWORD style,
@@ -1070,7 +1206,7 @@ static LRESULT CALLBACK card_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return TRUE;
     case WM_LBUTTONUP:
         index = (int)(INT_PTR)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-        start_viewer_for_connection(index);
+        start_viewer_for_connection(index, FALSE, FALSE);
         return 0;
     case WM_RBUTTONUP:
     case WM_CONTEXTMENU: {
@@ -1091,7 +1227,7 @@ static LRESULT CALLBACK card_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
         DestroyMenu(menu);
         if (cmd == 1) {
-            start_viewer_for_connection(index);
+            start_viewer_for_connection(index, FALSE, FALSE);
         } else if (cmd == 2) {
             edit_index = index;
             edit_is_new = FALSE;
@@ -1294,7 +1430,7 @@ static void save_edit_window(HWND hwnd, BOOL reconnect)
     refresh_cards();
     DestroyWindow(hwnd);
     if (reconnect && target_index >= 0) {
-        start_viewer_for_connection(target_index);
+        start_viewer_for_connection(target_index, TRUE, FALSE);
     }
 }
 
@@ -1350,10 +1486,17 @@ static LRESULT CALLBACK edit_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     case WM_COMMAND:
         switch (LOWORD(wp)) {
-        case IDC_EDIT_TEST:
-            MessageBoxW(hwnd, L"Connection parameters are valid. The full stream test performs the live transport check.",
-                        L"GVT Cloud Client", MB_ICONINFORMATION);
+        case IDC_EDIT_TEST: {
+            wchar_t endpoint[256];
+            wchar_t result[512];
+            BOOL ok;
+            GetWindowTextW(edit_endpoint, endpoint, 256);
+            ok = test_connection_endpoint(endpoint, result, 512);
+            MessageBoxW(hwnd, result, ok ? L"GVT Cloud Client - Test Connection OK" :
+                        L"GVT Cloud Client - Test Connection Failed",
+                        ok ? MB_ICONINFORMATION : MB_ICONWARNING);
             return 0;
+        }
         case IDC_EDIT_SAVE:
             save_edit_window(hwnd, FALSE);
             return 0;
@@ -1488,6 +1631,48 @@ static void start_gst_warmup(void)
     }
 }
 
+static void poll_viewer_processes(void)
+{
+    ULONGLONG now = GetTickCount64();
+    BOOL any_changed = FALSE;
+    for (int i = 0; i < connection_count; i++) {
+        Connection *conn = &connections[i];
+        if (conn->viewer_process) {
+            DWORD exit_code = STILL_ACTIVE;
+            if (GetExitCodeProcess(conn->viewer_process, &exit_code) && exit_code != STILL_ACTIVE) {
+                CloseHandle(conn->viewer_process);
+                conn->viewer_process = NULL;
+                conn->viewer_pid = 0;
+                any_changed = TRUE;
+                if (!conn->viewer_stop_requested && conn->reconnect &&
+                    conn->reconnects_done < conn->reconnect_attempts) {
+                    conn->reconnect_pending = TRUE;
+                    conn->next_reconnect_tick = now + (ULONGLONG)conn->reconnect_interval_sec * 1000ULL;
+                    wchar_t status[256];
+                    _snwprintf(status, 256, L"Viewer exited. Reconnecting %s in %d second(s)...",
+                               conn->endpoint, conn->reconnect_interval_sec);
+                    status[255] = 0;
+                    set_status(status);
+                } else {
+                    conn->reconnect_pending = FALSE;
+                    conn->reconnects_done = 0;
+                    conn->viewer_stop_requested = FALSE;
+                    set_status(L"Viewer disconnected.");
+                }
+            }
+        }
+        if (conn->reconnect_pending && now >= conn->next_reconnect_tick) {
+            conn->reconnect_pending = FALSE;
+            conn->reconnects_done++;
+            start_viewer_for_connection(i, TRUE, TRUE);
+            any_changed = TRUE;
+        }
+    }
+    if (any_changed) {
+        refresh_cards();
+    }
+}
+
 static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
@@ -1514,12 +1699,45 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         status_label = make_label(hwnd, L"Ready", 900, 690, 140, 28);
         fill_endpoint_combo();
         refresh_cards();
+        SetTimer(hwnd, TIMER_RECONNECT_ID, 1000, NULL);
         start_gst_warmup();
         return 0;
     }
     case WM_SIZE:
+        if (wp == SIZE_MINIMIZED && tray_icon_added) {
+            ShowWindow(hwnd, SW_HIDE);
+            return 0;
+        }
         layout_main_window();
         return 0;
+    case WM_TIMER:
+        if (wp == TIMER_RECONNECT_ID) {
+            poll_viewer_processes();
+            return 0;
+        }
+        break;
+    case WM_TRAYICON:
+        if (lp == WM_LBUTTONDBLCLK) {
+            show_from_tray();
+            return 0;
+        }
+        if (lp == WM_RBUTTONUP || lp == WM_CONTEXTMENU) {
+            HMENU menu = CreatePopupMenu();
+            POINT pt;
+            AppendMenuW(menu, MF_STRING, 1, L"Show GVT Cloud Client");
+            AppendMenuW(menu, MF_STRING, 2, L"Exit");
+            GetCursorPos(&pt);
+            SetForegroundWindow(hwnd);
+            int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+            DestroyMenu(menu);
+            if (cmd == 1) {
+                show_from_tray();
+            } else if (cmd == 2) {
+                DestroyWindow(hwnd);
+            }
+            return 0;
+        }
+        break;
     case WM_PAINT: {
         PAINTSTRUCT ps;
         RECT rc;
@@ -1584,6 +1802,8 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DRAWITEM:
         return draw_button_item(lp);
     case WM_DESTROY:
+        KillTimer(hwnd, TIMER_RECONNECT_ID);
+        update_tray_icon(FALSE);
         for (int i = 0; i < connection_count; i++) {
             close_viewer_handle(&connections[i]);
         }
