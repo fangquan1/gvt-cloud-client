@@ -1303,8 +1303,6 @@ static void stream_control_apply_status(const char *status)
     int returned_input;
     int returned_width;
     int returned_height;
-    int returned_fps;
-    int returned_bitrate;
 
     if (!status || !*status) {
         return;
@@ -1319,8 +1317,6 @@ static void stream_control_apply_status(const char *status)
     returned_input = json_get_int_field(status, "input_tcp", 0);
     returned_width = json_get_int_field(status, "width", 0);
     returned_height = json_get_int_field(status, "height", 0);
-    returned_fps = json_get_int_field(status, "fps", 0);
-    returned_bitrate = json_get_int_field(status, "bitrate", 0);
 
     if (returned_video > 0 && returned_video <= 65535) {
         video_port = returned_video;
@@ -1336,12 +1332,6 @@ static void stream_control_apply_status(const char *status)
     }
     if (returned_width || returned_height) {
         update_source_size(returned_width, returned_height, "stream-control");
-    }
-    if (returned_fps >= 1 && returned_fps <= 120) {
-        stream_fps = returned_fps;
-    }
-    if (returned_bitrate >= 256 && returned_bitrate <= 100000) {
-        stream_bitrate_kbps = returned_bitrate;
     }
     log_line("stream-control using ports video_udp=%d spice_tcp=%s input_tcp=%d "
              "size=%dx%d fps=%d bitrate=%d",
@@ -1703,7 +1693,8 @@ static const char *qcode_from_scancode(guint scancode)
     case 0x33: return "comma";
     case 0x34: return "dot";
     case 0x35: return "slash";
-    case 0x36: return "shift_r";
+    /* Windows IME Shift-toggle treats the right Shift inconsistently in guest. */
+    case 0x36: return "shift";
     case 0x37: return "kp_multiply";
     case 0x38: return "alt";
     case 0x39: return "spc";
