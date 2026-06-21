@@ -164,6 +164,8 @@ static int source_height = 768;
 static bool auto_size_on_start = true;
 static bool spice_display_mode = false;
 static bool gst_warmup_mode = false;
+static const char *connection_id = NULL;
+static const char *thumbnail_path = NULL;
 static void *display_mode_session;
 
 static HWND main_hwnd;
@@ -328,6 +330,146 @@ static void log_line(const char *fmt, ...)
     fputc('\n', log_fp);
     fflush(log_fp);
     LeaveCriticalSection(&log_lock);
+}
+
+static bool ensure_parent_dir_utf8(const char *path)
+{
+    wchar_t wide[MAX_PATH * 2];
+    wchar_t *slash;
+    int len;
+    if (!path || !path[0]) {
+        return false;
+    }
+    len = MultiByteToWideChar(CP_UTF8, 0, path, -1, wide,
+                              (int)(sizeof(wide) / sizeof(wide[0])));
+    if (len <= 0) {
+        return false;
+    }
+    slash = wcsrchr(wide, L'\\');
+    if (!slash) {
+        slash = wcsrchr(wide, L'/');
+    }
+    if (slash) {
+        *slash = 0;
+        CreateDirectoryW(wide, NULL);
+    }
+    return true;
+}
+
+static void save_window_thumbnail(HWND hwnd)
+{
+    RECT rc;
+    int width;
+    int height;
+    HDC window_dc = NULL;
+    HDC mem_dc = NULL;
+    HBITMAP bitmap = NULL;
+    HGDIOBJ old_bitmap = NULL;
+    BITMAPINFO bmi;
+    BITMAPFILEHEADER file_header;
+    BITMAPINFOHEADER info_header;
+    unsigned char *pixels = NULL;
+    DWORD pixel_bytes;
+    DWORD written;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    wchar_t wide_path[MAX_PATH * 2];
+
+    if (!thumbnail_path || !thumbnail_path[0] || !hwnd) {
+        return;
+    }
+    if (!GetClientRect(hwnd, &rc)) {
+        log_line("thumbnail skipped get-client-rect failed");
+        return;
+    }
+    width = rc.right - rc.left;
+    height = rc.bottom - rc.top;
+    if (width <= 0 || height <= 0) {
+        log_line("thumbnail skipped empty client area width=%d height=%d", width, height);
+        return;
+    }
+    ensure_parent_dir_utf8(thumbnail_path);
+    if (MultiByteToWideChar(CP_UTF8, 0, thumbnail_path, -1, wide_path,
+                            (int)(sizeof(wide_path) / sizeof(wide_path[0]))) <= 0) {
+        log_line("thumbnail skipped path conversion failed");
+        return;
+    }
+
+    window_dc = GetDC(hwnd);
+    mem_dc = CreateCompatibleDC(window_dc);
+    bitmap = CreateCompatibleBitmap(window_dc, width, height);
+    if (!window_dc || !mem_dc || !bitmap) {
+        log_line("thumbnail skipped gdi allocation failed");
+        goto cleanup;
+    }
+    old_bitmap = SelectObject(mem_dc, bitmap);
+    if (!BitBlt(mem_dc, 0, 0, width, height, window_dc, 0, 0, SRCCOPY)) {
+        log_line("thumbnail skipped bitblt failed err=%lu", GetLastError());
+        goto cleanup;
+    }
+
+    ZeroMemory(&bmi, sizeof(bmi));
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    pixel_bytes = (DWORD)width * (DWORD)height * 4U;
+    pixels = (unsigned char *)malloc(pixel_bytes);
+    if (!pixels) {
+        log_line("thumbnail skipped pixel allocation failed bytes=%lu", pixel_bytes);
+        goto cleanup;
+    }
+    if (!GetDIBits(mem_dc, bitmap, 0, (UINT)height, pixels, &bmi, DIB_RGB_COLORS)) {
+        log_line("thumbnail skipped getdibits failed err=%lu", GetLastError());
+        goto cleanup;
+    }
+
+    ZeroMemory(&file_header, sizeof(file_header));
+    ZeroMemory(&info_header, sizeof(info_header));
+    file_header.bfType = 0x4d42;
+    file_header.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+    file_header.bfSize = file_header.bfOffBits + pixel_bytes;
+    info_header.biSize = sizeof(BITMAPINFOHEADER);
+    info_header.biWidth = width;
+    info_header.biHeight = -height;
+    info_header.biPlanes = 1;
+    info_header.biBitCount = 32;
+    info_header.biCompression = BI_RGB;
+    info_header.biSizeImage = pixel_bytes;
+
+    file = CreateFileW(wide_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                       FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        log_line("thumbnail open failed path=\"%s\" err=%lu", thumbnail_path, GetLastError());
+        goto cleanup;
+    }
+    WriteFile(file, &file_header, sizeof(file_header), &written, NULL);
+    WriteFile(file, &info_header, sizeof(info_header), &written, NULL);
+    WriteFile(file, pixels, pixel_bytes, &written, NULL);
+    log_line("thumbnail saved path=\"%s\" width=%d height=%d bytes=%lu connection_id=%s",
+             thumbnail_path, width, height, pixel_bytes,
+             connection_id ? connection_id : "");
+
+cleanup:
+    if (file != INVALID_HANDLE_VALUE) {
+        CloseHandle(file);
+    }
+    if (pixels) {
+        free(pixels);
+    }
+    if (old_bitmap && mem_dc) {
+        SelectObject(mem_dc, old_bitmap);
+    }
+    if (bitmap) {
+        DeleteObject(bitmap);
+    }
+    if (mem_dc) {
+        DeleteDC(mem_dc);
+    }
+    if (window_dc) {
+        ReleaseDC(hwnd, window_dc);
+    }
 }
 
 static bool input_debug(void)
@@ -3318,6 +3460,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
         input_release_capture("focus-lost");
         break;
     case WM_DESTROY:
+        save_window_thumbnail(hwnd);
         input_release_capture("destroy");
         InterlockedExchange(&shutting_down, 1);
         if (main_loop) {
@@ -3379,6 +3522,10 @@ static void parse_args(int argc, char **argv)
             stream_bitrate_kbps = clamp_int(atoi(argv[++i]), 256, 100000);
         } else if (!strcmp(argv[i], "--stream-keyint") && i + 1 < argc) {
             stream_keyint = clamp_int(atoi(argv[++i]), 1, 300);
+        } else if (!strcmp(argv[i], "--connection-id") && i + 1 < argc) {
+            connection_id = argv[++i];
+        } else if (!strcmp(argv[i], "--thumbnail-path") && i + 1 < argc) {
+            thumbnail_path = argv[++i];
         } else if (!strcmp(argv[i], "--stream-control-host") && i + 1 < argc) {
             stream_control_host = argv[++i];
         } else if (!strcmp(argv[i], "--stream-control-port") && i + 1 < argc) {

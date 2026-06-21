@@ -353,7 +353,7 @@ static void connection_thumbnail_path(Connection *conn)
     wchar_t dir[MAX_PATH];
     thumbnails_dir(dir, MAX_PATH);
     CreateDirectoryW(dir, NULL);
-    _snwprintf(conn->thumbnail, MAX_PATH, L"%s\\%s.png", dir, conn->id);
+    _snwprintf(conn->thumbnail, MAX_PATH, L"%s\\%s.bmp", dir, conn->id);
     conn->thumbnail[MAX_PATH - 1] = 0;
 }
 
@@ -1104,6 +1104,37 @@ static void draw_monitor_icon(HDC hdc, RECT rc, COLORREF color)
     DeleteObject(pen);
 }
 
+static BOOL draw_thumbnail_file(HDC hdc, const wchar_t *path, RECT rc)
+{
+    HBITMAP bitmap;
+    BITMAP bm;
+    HDC memdc;
+    HGDIOBJ old;
+    int old_mode;
+    if (!path || !path[0] || !file_exists(path)) {
+        return FALSE;
+    }
+    bitmap = (HBITMAP)LoadImageW(NULL, path, IMAGE_BITMAP, 0, 0,
+                                 LR_LOADFROMFILE | LR_CREATEDIBSECTION);
+    if (!bitmap) {
+        return FALSE;
+    }
+    if (!GetObjectW(bitmap, sizeof(bm), &bm) || bm.bmWidth <= 0 || bm.bmHeight <= 0) {
+        DeleteObject(bitmap);
+        return FALSE;
+    }
+    memdc = CreateCompatibleDC(hdc);
+    old = SelectObject(memdc, bitmap);
+    old_mode = SetStretchBltMode(hdc, HALFTONE);
+    StretchBlt(hdc, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
+               memdc, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
+    SetStretchBltMode(hdc, old_mode);
+    SelectObject(memdc, old);
+    DeleteDC(memdc);
+    DeleteObject(bitmap);
+    return TRUE;
+}
+
 static void draw_app_icon(HDC hdc, int x, int y, int size)
 {
     HBRUSH blue = CreateSolidBrush(color_blue);
@@ -1267,7 +1298,9 @@ static LRESULT CALLBACK card_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SelectObject(hdc, thumb);
         SelectObject(hdc, GetStockObject(NULL_PEN));
         RoundRect(hdc, tr.left, tr.top, tr.right, tr.bottom, 4, 4);
-        draw_monitor_icon(hdc, tr, color_blue);
+        if (!draw_thumbnail_file(hdc, c->thumbnail, tr)) {
+            draw_monitor_icon(hdc, tr, color_blue);
+        }
         SelectObject(hdc, dot);
         Ellipse(hdc, 13, 176, 33, 196);
         RECT name_rc = {18, 224, rc.right - 44, 252};
