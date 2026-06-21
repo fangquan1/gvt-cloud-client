@@ -45,12 +45,13 @@
 #define G_PRIORITY_HIGH (-100)
 #define G_PRIORITY_DEFAULT_IDLE 200
 
-#define ID_RELEASE_INPUT 1001
 #define IDI_APP_ICON 101
 #define WM_STREAM_READY (WM_APP + 1)
 #define WM_STREAM_RESIZE (WM_APP + 2)
-#define TOOLBAR_HEIGHT 32
-#define WINDOW_FIT_PERCENT 94
+#define TOOLBAR_HEIGHT 0
+#define STREAM_CONTROL_POLL_TIMEOUT_MS 500
+#define STREAM_CONTROL_SIZE_POLL_MS 500
+#define STREAM_CONTROL_SIZE_POLL_WINDOW_MS 10000
 
 typedef void *gpointer;
 typedef int gboolean;
@@ -137,6 +138,13 @@ static void (*p_gst_init)(int *argc, char ***argv);
 static void *(*p_gst_parse_launch)(const char *pipeline_description, void **error);
 static int (*p_gst_element_set_state)(void *element, int state);
 static void *(*p_gst_bin_get_by_name)(void *bin, const char *name);
+static void *(*p_gst_element_get_static_pad)(void *element, const char *name);
+static void *(*p_gst_pad_get_current_caps)(void *pad);
+static void *(*p_gst_caps_get_structure)(void *caps, guint index);
+static gboolean (*p_gst_structure_get_int)(void *structure,
+                                           const char *fieldname,
+                                           gint *value);
+static void (*p_gst_mini_object_unref)(void *object);
 static void (*p_gst_object_unref)(void *object);
 static void (*p_gst_video_overlay_set_window_handle)(void *overlay,
                                                      uintptr_t handle);
@@ -170,7 +178,6 @@ static void *display_mode_session;
 
 static HWND main_hwnd;
 static HWND video_hwnd;
-static HWND release_button;
 static HHOOK keyboard_hook;
 static HICON app_icon;
 static RECT video_rect;
@@ -211,6 +218,7 @@ static bool native_input_lock_ready;
 static SOCKET native_input_sock = INVALID_SOCKET;
 static SOCKET stream_control_sock = INVALID_SOCKET;
 static volatile LONG stream_control_start_sent;
+static volatile LONG stream_size_known;
 static bool stream_control_preconnected;
 static bool winsock_ready;
 static ULONGLONG log_start_ms;
@@ -1167,6 +1175,27 @@ static void stream_control_close(void)
     InterlockedExchange(&stream_control_start_sent, 0);
 }
 
+static bool stream_control_send_status_request(const char *reason)
+{
+    const char *hello = "{\"type\":\"status\"}\n";
+    ULONGLONG t_stage;
+
+    if (!stream_control_enabled || stream_control_sock == INVALID_SOCKET) {
+        return false;
+    }
+    t_stage = viewer_now_ms();
+    if (send(stream_control_sock, hello, (int)strlen(hello), 0) <= 0) {
+        log_line("stream-control status request send failed reason=%s err=%d",
+                 reason ? reason : "", WSAGetLastError());
+        return false;
+    }
+    log_line("stream-control status-request-sent reason=%s dt=%I64ums bytes=%u",
+             reason ? reason : "",
+             (unsigned long long)(viewer_now_ms() - t_stage),
+             (unsigned)strlen(hello));
+    return true;
+}
+
 static bool stream_control_send_start(const char *reason)
 {
     char start[512];
@@ -1246,6 +1275,27 @@ static bool stream_control_read_line(char *buffer, size_t size)
     return used > 0;
 }
 
+static bool update_source_size(int width, int height, const char *reason)
+{
+    bool changed;
+
+    if (width < 320 || width > 16384 || height < 180 || height > 16384) {
+        return false;
+    }
+    changed = (width != source_width || height != source_height);
+    source_width = width;
+    source_height = height;
+    InterlockedExchange(&stream_size_known, 1);
+    if (changed) {
+        log_line("source-size updated reason=%s size=%dx%d",
+                 reason ? reason : "unknown", source_width, source_height);
+        if (main_hwnd) {
+            PostMessageA(main_hwnd, WM_STREAM_RESIZE, 0, 0);
+        }
+    }
+    return true;
+}
+
 static void stream_control_apply_status(const char *status)
 {
     int returned_video;
@@ -1255,7 +1305,6 @@ static void stream_control_apply_status(const char *status)
     int returned_height;
     int returned_fps;
     int returned_bitrate;
-    bool size_changed = false;
 
     if (!status || !*status) {
         return;
@@ -1285,12 +1334,8 @@ static void stream_control_apply_status(const char *status)
         native_input_port = returned_input;
         native_input_enabled = true;
     }
-    if (returned_width >= 320 && returned_width <= 16384 &&
-        returned_height >= 180 && returned_height <= 16384 &&
-        (returned_width != source_width || returned_height != source_height)) {
-        source_width = returned_width;
-        source_height = returned_height;
-        size_changed = true;
+    if (returned_width || returned_height) {
+        update_source_size(returned_width, returned_height, "stream-control");
     }
     if (returned_fps >= 1 && returned_fps <= 120) {
         stream_fps = returned_fps;
@@ -1302,16 +1347,12 @@ static void stream_control_apply_status(const char *status)
              "size=%dx%d fps=%d bitrate=%d",
              video_port, spice_port, native_input_port,
              source_width, source_height, stream_fps, stream_bitrate_kbps);
-    if (size_changed && main_hwnd) {
-        PostMessageA(main_hwnd, WM_STREAM_RESIZE, 0, 0);
-    }
 }
 
 static bool stream_control_start_session(void)
 {
     struct sockaddr_in addr;
     const char *host = stream_control_host ? stream_control_host : spice_host;
-    char hello[256];
     char status[512];
     int one = 1;
     DWORD timeout_ms = 1500;
@@ -1366,16 +1407,11 @@ static bool stream_control_start_session(void)
              (unsigned long long)(viewer_now_ms() - t_stage));
 
     InterlockedExchange(&stream_control_start_sent, 0);
-    snprintf(hello, sizeof(hello), "{\"type\":\"status\"}\n");
-    t_stage = viewer_now_ms();
-    if (send(stream_control_sock, hello, (int)strlen(hello), 0) <= 0) {
-        log_line("stream-control status request send failed: %d", WSAGetLastError());
+    InterlockedExchange(&stream_size_known, 0);
+    if (!stream_control_send_status_request("initial")) {
         stream_control_close();
         return false;
     }
-    log_line("stream-control status-request-sent dt=%I64ums bytes=%u",
-             (unsigned long long)(viewer_now_ms() - t_stage),
-             (unsigned)strlen(hello));
     log_line("stream-control connected %s:%d video_port=%d codec=%s",
              host, stream_control_port, video_port,
              video_codec ? video_codec : "h265");
@@ -1400,7 +1436,14 @@ static bool stream_control_start_session(void)
 static DWORD WINAPI stream_control_thread(LPVOID opaque)
 {
     char byte;
+    char line[1024];
+    size_t line_used = 0;
     bool connected;
+    bool size_polling = false;
+    DWORD poll_timeout_ms = STREAM_CONTROL_POLL_TIMEOUT_MS;
+    DWORD no_timeout = 0;
+    ULONGLONG next_size_poll_ms = 0;
+    ULONGLONG size_poll_deadline_ms = 0;
 
     (void)opaque;
     if (stream_control_sock != INVALID_SOCKET && stream_control_preconnected) {
@@ -1414,6 +1457,15 @@ static DWORD WINAPI stream_control_thread(LPVOID opaque)
     }
     if (stream_control_sock == INVALID_SOCKET) {
         return 0;
+    }
+    if (InterlockedCompareExchange(&stream_size_known, 0, 0) == 0) {
+        ULONGLONG now = viewer_now_ms();
+
+        size_polling = true;
+        next_size_poll_ms = now + STREAM_CONTROL_SIZE_POLL_MS;
+        size_poll_deadline_ms = now + STREAM_CONTROL_SIZE_POLL_WINDOW_MS;
+        setsockopt(stream_control_sock, SOL_SOCKET, SO_RCVTIMEO,
+                   (const char *)&poll_timeout_ms, sizeof(poll_timeout_ms));
     }
 
     while (InterlockedCompareExchange(&shutting_down, 0, 0) == 0) {
@@ -1431,12 +1483,55 @@ static DWORD WINAPI stream_control_thread(LPVOID opaque)
             if (err == WSAEINTR) {
                 continue;
             }
+            if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) {
+                ULONGLONG now = viewer_now_ms();
+
+                if (size_polling &&
+                    (InterlockedCompareExchange(&stream_size_known, 0, 0) != 0 ||
+                     now > size_poll_deadline_ms)) {
+                    setsockopt(stream_control_sock, SOL_SOCKET, SO_RCVTIMEO,
+                               (const char *)&no_timeout, sizeof(no_timeout));
+                    size_polling = false;
+                    if (InterlockedCompareExchange(&stream_size_known, 0, 0) == 0) {
+                        log_line("stream-control size-poll stopped without remote size");
+                    }
+                    continue;
+                }
+                if (size_polling &&
+                    InterlockedCompareExchange(&stream_control_start_sent, 0, 0) != 0 &&
+                    now >= next_size_poll_ms) {
+                    stream_control_send_status_request("size-poll");
+                    next_size_poll_ms = now + STREAM_CONTROL_SIZE_POLL_MS;
+                }
+                continue;
+            }
             log_line("stream-control recv failed: %d", err);
             if (main_hwnd && InterlockedCompareExchange(&shutting_down, 0, 0) == 0) {
                 log_line("stream-control lost, closing viewer");
                 PostMessageA(main_hwnd, WM_CLOSE, 0, 0);
             }
             break;
+        }
+        if (byte == '\n') {
+            line[line_used] = '\0';
+            if (line_used > 0) {
+                stream_control_apply_status(line);
+                if (size_polling &&
+                    InterlockedCompareExchange(&stream_size_known, 0, 0) != 0) {
+                    setsockopt(stream_control_sock, SOL_SOCKET, SO_RCVTIMEO,
+                               (const char *)&no_timeout, sizeof(no_timeout));
+                    size_polling = false;
+                    log_line("stream-control size-poll complete");
+                }
+            }
+            line_used = 0;
+            continue;
+        }
+        if (line_used + 1 < sizeof(line)) {
+            line[line_used++] = byte;
+        } else {
+            log_line("stream-control dropping oversized status line");
+            line_used = 0;
         }
     }
     stream_control_close();
@@ -1835,6 +1930,11 @@ static gboolean send_pending_position_on_spice_thread(gpointer opaque)
 static void queue_input_event_priority(InputEv *ev, gint priority)
 {
     stamp_input_event(ev);
+    if (native_input_enabled) {
+        dispatch_native_input_event(ev);
+        free(ev);
+        return;
+    }
     if (!p_g_idle_add || !input_transport_ready()) {
         free(ev);
         return;
@@ -1923,6 +2023,11 @@ static void load_gst_runtime(void)
     p_gst_parse_launch = sym(gstlib, "gst_parse_launch");
     p_gst_element_set_state = sym(gstlib, "gst_element_set_state");
     p_gst_bin_get_by_name = sym(gstlib, "gst_bin_get_by_name");
+    p_gst_element_get_static_pad = sym(gstlib, "gst_element_get_static_pad");
+    p_gst_pad_get_current_caps = sym(gstlib, "gst_pad_get_current_caps");
+    p_gst_caps_get_structure = sym(gstlib, "gst_caps_get_structure");
+    p_gst_structure_get_int = sym(gstlib, "gst_structure_get_int");
+    p_gst_mini_object_unref = sym(gstlib, "gst_mini_object_unref");
     p_gst_object_unref = sym(gstlib, "gst_object_unref");
     p_gst_video_overlay_set_window_handle =
         sym(gstvideo, "gst_video_overlay_set_window_handle");
@@ -2294,7 +2399,7 @@ static void channel_event(void *channel, gint event, void *opaque)
     } else if (type == SPICE_CHANNEL_INPUTS && event == SPICE_CHANNEL_OPENED) {
         inputs_channel = channel;
         inputs_ready = true;
-        SetWindowTextA(main_hwnd, "GVT SPICE Viewer - inputs ready");
+        SetWindowTextA(main_hwnd, "GVT SPICE Viewer - input released | click desktop to capture");
     } else if (event >= SPICE_CHANNEL_CLOSED) {
         if (type == SPICE_CHANNEL_MAIN) {
             main_channel = NULL;
@@ -2881,6 +2986,60 @@ static bool start_gst_receiver(void)
     return true;
 }
 
+static bool gst_update_source_size_from_caps(const char *reason)
+{
+    void *pad = NULL;
+    void *caps = NULL;
+    void *structure = NULL;
+    gint width = 0;
+    gint height = 0;
+    bool ok = false;
+
+    if (!gst_sink || !p_gst_element_get_static_pad ||
+        !p_gst_pad_get_current_caps || !p_gst_caps_get_structure ||
+        !p_gst_structure_get_int) {
+        return false;
+    }
+    pad = p_gst_element_get_static_pad(gst_sink, "sink");
+    if (!pad) {
+        return false;
+    }
+    caps = p_gst_pad_get_current_caps(pad);
+    if (!caps) {
+        p_gst_object_unref(pad);
+        return false;
+    }
+    structure = p_gst_caps_get_structure(caps, 0);
+    if (structure &&
+        p_gst_structure_get_int(structure, "width", &width) &&
+        p_gst_structure_get_int(structure, "height", &height)) {
+        ok = update_source_size(width, height, reason);
+    }
+    p_gst_mini_object_unref(caps);
+    p_gst_object_unref(pad);
+    return ok;
+}
+
+static void gst_wait_for_source_size_from_caps(const char *reason)
+{
+    ULONGLONG deadline = viewer_now_ms() + STREAM_CONTROL_SIZE_POLL_WINDOW_MS;
+
+    if (InterlockedCompareExchange(&stream_size_known, 0, 0) != 0) {
+        return;
+    }
+    while (InterlockedCompareExchange(&shutting_down, 0, 0) == 0 &&
+           viewer_now_ms() <= deadline) {
+        if (gst_update_source_size_from_caps(reason)) {
+            log_line("gst caps source-size ready");
+            return;
+        }
+        Sleep(100);
+    }
+    if (InterlockedCompareExchange(&stream_size_known, 0, 0) == 0) {
+        log_line("gst caps source-size unavailable");
+    }
+}
+
 static int run_gst_warmup(void)
 {
     ULONGLONG t0 = viewer_now_ms();
@@ -2968,29 +3127,6 @@ static bool point_in_video(LPARAM lparam)
 
     return x >= video_rect.left && x < video_rect.right &&
            y >= video_rect.top && y < video_rect.bottom;
-}
-
-static bool point_in_release_button(LPARAM lparam)
-{
-    RECT rc;
-    POINT tl;
-    POINT br;
-    int x = GET_X_LPARAM(lparam);
-    int y = GET_Y_LPARAM(lparam);
-
-    if (!release_button || !IsWindowVisible(release_button)) {
-        return false;
-    }
-    if (!GetWindowRect(release_button, &rc)) {
-        return false;
-    }
-    tl.x = rc.left;
-    tl.y = rc.top;
-    br.x = rc.right;
-    br.y = rc.bottom;
-    ScreenToClient(main_hwnd, &tl);
-    ScreenToClient(main_hwnd, &br);
-    return x >= tl.x && x < br.x && y >= tl.y && y < br.y;
 }
 
 static void queue_key_scancode(guint scancode, bool down)
@@ -3184,7 +3320,7 @@ static void input_release_capture(const char *reason)
     ReleaseCapture();
     input_capture_state = INPUT_CAPTURE_LOCAL;
     right_ctrl_sent = false;
-    SetWindowTextA(main_hwnd, "GVT SPICE Viewer - input released");
+    SetWindowTextA(main_hwnd, "GVT SPICE Viewer - input released | click desktop to capture");
 }
 
 static bool input_enter_capture(LPARAM lparam)
@@ -3198,7 +3334,7 @@ static bool input_enter_capture(LPARAM lparam)
         SetCapture(main_hwnd);
         input_install_keyboard_hook();
         input_update_clip();
-        SetWindowTextA(main_hwnd, "GVT SPICE Viewer - input captured");
+        SetWindowTextA(main_hwnd, "GVT SPICE Viewer - input captured | Right Ctrl releases input");
         if (input_debug()) {
             log_line("input capture enter");
         }
@@ -3217,36 +3353,14 @@ static RECT initial_window_rect(void)
     RECT wr;
     int content_w = source_width;
     int content_h = source_height + TOOLBAR_HEIGHT;
-    int max_w;
-    int max_h;
-    double scale = 1.0;
 
     SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0);
-    max_w = max(320, (work.right - work.left) * WINDOW_FIT_PERCENT / 100);
-    max_h = max(240, (work.bottom - work.top) * WINDOW_FIT_PERCENT / 100);
 
     wr.left = 0;
     wr.top = 0;
     wr.right = content_w;
     wr.bottom = content_h;
     AdjustWindowRectEx(&wr, WS_OVERLAPPEDWINDOW, FALSE, 0);
-
-    if (wr.right - wr.left > max_w) {
-        scale = (double)max_w / (double)(wr.right - wr.left);
-    }
-    if ((wr.bottom - wr.top) * scale > max_h) {
-        scale = (double)max_h / (double)(wr.bottom - wr.top);
-    }
-    if (scale < 1.0) {
-        content_w = max(320, (int)(content_w * scale));
-        content_h = TOOLBAR_HEIGHT +
-                    max(180, (int)(source_height * scale));
-        wr.left = 0;
-        wr.top = 0;
-        wr.right = content_w;
-        wr.bottom = content_h;
-        AdjustWindowRectEx(&wr, WS_OVERLAPPEDWINDOW, FALSE, 0);
-    }
 
     OffsetRect(&wr,
                work.left + ((work.right - work.left) - (wr.right - wr.left)) / 2,
@@ -3264,8 +3378,6 @@ static void layout_children(HWND hwnd)
     int video_h;
     int video_x;
     int video_y;
-    int button_w = 184;
-    int button_h = 28;
 
     GetClientRect(hwnd, &rc);
     client_w = max(1, rc.right - rc.left);
@@ -3287,10 +3399,6 @@ static void layout_children(HWND hwnd)
     video_rect.right = video_x + video_w;
     video_rect.bottom = video_y + video_h;
 
-    if (release_button) {
-        MoveWindow(release_button, (client_w - button_w) / 2, 2,
-                   button_w, button_h, TRUE);
-    }
     if (video_hwnd) {
         MoveWindow(video_hwnd, video_rect.left, video_rect.top,
                    video_w, video_h, TRUE);
@@ -3304,9 +3412,6 @@ static void resize_window_to_source(HWND hwnd)
     RECT wr;
     int content_w = source_width;
     int content_h = source_height + TOOLBAR_HEIGHT;
-    int max_w;
-    int max_h;
-    double scale = 1.0;
 
     if (source_width <= 0 || source_height <= 0) {
         return;
@@ -3316,8 +3421,6 @@ static void resize_window_to_source(HWND hwnd)
     mi.cbSize = sizeof(mi);
     GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
     work = mi.rcWork;
-    max_w = max(320, (work.right - work.left) * WINDOW_FIT_PERCENT / 100);
-    max_h = max(240, (work.bottom - work.top) * WINDOW_FIT_PERCENT / 100);
 
     wr.left = 0;
     wr.top = 0;
@@ -3326,65 +3429,12 @@ static void resize_window_to_source(HWND hwnd)
     AdjustWindowRectEx(&wr, GetWindowLongA(hwnd, GWL_STYLE), FALSE,
                        GetWindowLongA(hwnd, GWL_EXSTYLE));
 
-    if (wr.right - wr.left > max_w) {
-        scale = (double)max_w / (double)(wr.right - wr.left);
-    }
-    if ((wr.bottom - wr.top) * scale > max_h) {
-        scale = (double)max_h / (double)(wr.bottom - wr.top);
-    }
-    if (scale < 1.0) {
-        content_w = max(320, (int)(source_width * scale));
-        content_h = TOOLBAR_HEIGHT +
-                    max(180, (int)(source_height * scale));
-        wr.left = 0;
-        wr.top = 0;
-        wr.right = content_w;
-        wr.bottom = content_h;
-        AdjustWindowRectEx(&wr, GetWindowLongA(hwnd, GWL_STYLE), FALSE,
-                           GetWindowLongA(hwnd, GWL_EXSTYLE));
-    }
-
     SetWindowPos(hwnd, NULL,
                  work.left + ((work.right - work.left) - (wr.right - wr.left)) / 2,
                  work.top + ((work.bottom - work.top) - (wr.bottom - wr.top)) / 2,
                  wr.right - wr.left, wr.bottom - wr.top,
                  SWP_NOZORDER | SWP_NOACTIVATE);
     layout_children(hwnd);
-}
-
-static BOOL draw_release_button(LPARAM lp)
-{
-    DRAWITEMSTRUCT *dis = (DRAWITEMSTRUCT *)lp;
-    HBRUSH brush;
-    HPEN pen;
-    HBRUSH old_brush;
-    HPEN old_pen;
-    RECT rc;
-    COLORREF fill;
-    COLORREF border;
-    COLORREF text;
-
-    if (!dis || dis->CtlID != ID_RELEASE_INPUT) {
-        return FALSE;
-    }
-    rc = dis->rcItem;
-    fill = (dis->itemState & ODS_SELECTED) ? RGB(0, 96, 180) : RGB(0, 120, 215);
-    border = RGB(0, 96, 180);
-    text = RGB(255, 255, 255);
-    brush = CreateSolidBrush(fill);
-    pen = CreatePen(PS_SOLID, 1, border);
-    old_brush = (HBRUSH)SelectObject(dis->hDC, brush);
-    old_pen = (HPEN)SelectObject(dis->hDC, pen);
-    RoundRect(dis->hDC, rc.left, rc.top, rc.right, rc.bottom, 8, 8);
-    SetBkMode(dis->hDC, TRANSPARENT);
-    SetTextColor(dis->hDC, text);
-    DrawTextA(dis->hDC, "Release input   Right Ctrl", -1, &rc,
-              DT_SINGLELINE | DT_CENTER | DT_VCENTER);
-    SelectObject(dis->hDC, old_brush);
-    SelectObject(dis->hDC, old_pen);
-    DeleteObject(brush);
-    DeleteObject(pen);
-    return TRUE;
 }
 
 static DWORD WINAPI gst_receiver_thread(LPVOID opaque)
@@ -3402,6 +3452,7 @@ static DWORD WINAPI gst_receiver_thread(LPVOID opaque)
     ready = start_gst_receiver();
     if (ready) {
         stream_control_send_start("gst-ready");
+        gst_wait_for_source_size_from_caps("gst-caps");
     }
     log_line("gst receiver thread ready total=%I64ums",
              (unsigned long long)(viewer_now_ms() - t0));
@@ -3458,12 +3509,6 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
             InitializeCriticalSection(&native_input_lock);
             native_input_lock_ready = true;
         }
-        release_button = CreateWindowExA(0, "BUTTON", "Release input   Right Ctrl",
-                                         WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-                                         0, 0, 1, 1, hwnd,
-                                         (HMENU)(INT_PTR)ID_RELEASE_INPUT,
-                                         (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE),
-                                         NULL);
         video_hwnd = CreateWindowExA(0, "STATIC", "",
                                      WS_CHILD | WS_VISIBLE | SS_BLACKRECT,
                                      0, 0, 1, 1, hwnd, NULL,
@@ -3491,17 +3536,6 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
     case WM_SIZE:
         layout_children(hwnd);
         return 0;
-    case WM_COMMAND:
-        if (LOWORD(wparam) == ID_RELEASE_INPUT) {
-            input_release_capture("button");
-            return 0;
-        }
-        break;
-    case WM_DRAWITEM:
-        if (draw_release_button(lparam)) {
-            return TRUE;
-        }
-        break;
     case WM_DROPFILES:
         handle_drop_files((HDROP)wparam);
         DragFinish((HDROP)wparam);
@@ -3519,10 +3553,6 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
     case WM_LBUTTONDOWN:
         if (input_debug()) {
             log_line("input local left down");
-        }
-        if (input_is_captured() && point_in_release_button(lparam)) {
-            input_release_capture("button");
-            return 0;
         }
         if (!input_enter_capture(lparam)) {
             break;

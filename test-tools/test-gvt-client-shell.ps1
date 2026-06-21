@@ -125,6 +125,22 @@ function Assert-ShellControl {
     return $control
 }
 
+function Set-StartEnvironment {
+    param(
+        [Diagnostics.ProcessStartInfo]$StartInfo,
+        [string]$Name,
+        [string]$Value
+    )
+
+    if ($null -ne $StartInfo.EnvironmentVariables) {
+        $StartInfo.EnvironmentVariables[$Name] = $Value
+    } elseif ($null -ne $StartInfo.Environment) {
+        $StartInfo.Environment[$Name] = $Value
+    } else {
+        throw "ProcessStartInfo does not expose an environment collection."
+    }
+}
+
 $launcherCandidates = @()
 if (-not [string]::IsNullOrWhiteSpace($LauncherPath)) {
     $launcherCandidates += $LauncherPath
@@ -179,10 +195,10 @@ try {
     $startInfo.FileName = $launcher
     $startInfo.WorkingDirectory = $launcherDir
     $startInfo.UseShellExecute = $false
-    $startInfo.EnvironmentVariables["GVT_VIEWER_EXE"] = $viewer
-    $startInfo.EnvironmentVariables["GVT_SPICE_VIEWER_VIDEO_DEBUG"] = "1"
-    $startInfo.EnvironmentVariables["GVT_SPICE_VIEWER_DROP_COMPLETE_FRAMES"] = "1"
-    $startInfo.EnvironmentVariables["GVT_SPICE_VIEWER_UDP_BUFFER_SIZE"] = "2097152"
+    Set-StartEnvironment -StartInfo $startInfo -Name "GVT_VIEWER_EXE" -Value $viewer
+    Set-StartEnvironment -StartInfo $startInfo -Name "GVT_SPICE_VIEWER_VIDEO_DEBUG" -Value "1"
+    Set-StartEnvironment -StartInfo $startInfo -Name "GVT_SPICE_VIEWER_DROP_COMPLETE_FRAMES" -Value "1"
+    Set-StartEnvironment -StartInfo $startInfo -Name "GVT_SPICE_VIEWER_UDP_BUFFER_SIZE" -Value "2097152"
 
     $launcherProcess = [Diagnostics.Process]::Start($startInfo)
     Write-ShellLog "started launcher pid=$($launcherProcess.Id)"
@@ -280,6 +296,30 @@ try {
             $viewerProcessId = [int]$child.ProcessId
             $viewerCommandLine = [string]$child.CommandLine
             break
+        }
+        $globalViewer = @(Get-CimInstance Win32_Process -Filter "Name='gvt_spice_viewer.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { ([string]$_.CommandLine) -like "*$viewer*" })
+        if ($globalViewer.Count -gt 0) {
+            $child = $globalViewer | Sort-Object ProcessId -Descending | Select-Object -First 1
+            $viewerProcessId = [int]$child.ProcessId
+            $viewerCommandLine = [string]$child.CommandLine
+            break
+        }
+        $debugLog = Join-Path $launcherDir "gvt_client_debug.log"
+        if (Test-Path -LiteralPath $debugLog) {
+            $loggedCommand = Get-Content -LiteralPath $debugLog -Tail 20 -ErrorAction SilentlyContinue |
+                Where-Object { $_ -like "*gvt_spice_viewer.exe*" } |
+                Select-Object -Last 1
+            if (-not [string]::IsNullOrWhiteSpace($loggedCommand)) {
+                $viewerCommandLine = [string]$loggedCommand
+                $viewerProcess = Get-Process -Name "gvt_spice_viewer" -ErrorAction SilentlyContinue |
+                    Sort-Object Id -Descending |
+                    Select-Object -First 1
+                if ($viewerProcess) {
+                    $viewerProcessId = [int]$viewerProcess.Id
+                }
+                break
+            }
         }
         Start-Sleep -Milliseconds 300
     }
