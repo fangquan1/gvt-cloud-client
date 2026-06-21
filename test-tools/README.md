@@ -25,9 +25,12 @@ Our scripts mirror that split:
   and samples the remote QEMU `update-stats` log over SSH when available.
 - `run-gvt-stream-smoke.ps1` wraps the measurement script with acceptance
   thresholds for steady depay/decode FPS, startup markers, and encode failures.
-- `test-gvt-client-shell.ps1` launches `GVT Cloud Client.exe`, drives its
-  Win32 controls, clicks Connect, and verifies the viewer command line includes
-  the expected codec, latency, stream, SPICE, input, and control arguments.
+- `test-gvt-client-shell.ps1` launches `GVT Cloud Client.exe` from an isolated
+  test app directory, seeds deterministic settings/connections JSON, drives its
+  Win32 controls, clicks Connect with a mock viewer by default, and verifies the
+  viewer command line includes the expected codec, latency, stream, SPICE,
+  input, and control arguments. Pass `-UseRealViewer` only when the shell test
+  should launch the real viewer process.
 - `measure-gvt-video-latency.ps1` measures video-after-input latency from a
   trigger to the first visible client-side frame change in a selected region.
 - `install-gvt-guest-test-agent.ps1` installs a small Windows guest helper
@@ -64,6 +67,30 @@ By default the performance scripts use project-local runtimes:
 tools\gstreamer-1.0-mingw-x86_64-1.18.6\gstreamer\1.0\mingw_x86_64
 runtime\virtviewer\bin
 ```
+
+## Client shell coverage
+
+`test-gvt-client-shell.ps1` covers the shell layer without depending on the
+current user-edited portable config:
+
+- Main window: endpoint combo, Connect, Settings, Help, Add Connection, and
+  More controls.
+- Add/Edit Connection dialog: endpoint, display name, codec, fps, bitrate,
+  latency, reconnect settings, Start viewer, minimize-to-tray, Test Connection,
+  Save, Save & Reconnect, and Cancel controls.
+- Settings dialog: default codec/fps/bitrate/latency, remote-resolution mode,
+  reconnect defaults, Start viewer, minimize-to-tray, recent addresses,
+  Restore Defaults, Save, Apply, and Cancel controls.
+- Config isolation: deterministic `gvt_client_settings.json` and
+  `gvt_client_connections.json` are created under the test launcher directory.
+- Address-bar behavior: a typed endpoint must resolve to the seeded connection
+  instead of silently creating a different default connection.
+- Viewer launch mapping: codec, latency, stream fps, bitrate kbps, keyint,
+  connection id, thumbnail path, derived SPICE/input/control ports, and native
+  input flags are asserted from the launcher debug command line.
+- Full-test integration: `run-gvt-full-test.ps1` runs the shell test before the
+  real stream smoke/audio/AV/latency stages and includes shell coverage/case
+  rows in `report.html`.
 
 ## Examples
 

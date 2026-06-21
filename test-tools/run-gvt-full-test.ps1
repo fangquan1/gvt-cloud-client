@@ -817,6 +817,13 @@ function Write-FullReports {
     $qemuSnapshot = Get-FullNestedMember -Object $audioDiag -Names @("qemu_cmdline")
     $av = $Summary.artifacts.av_sync_summary
     $lat = $Summary.artifacts.latency
+    $shell = $Summary.artifacts.client_shell_summary
+    $shellFeatures = @(Get-FullMember -Object $shell -Name "feature_matrix" -Default @())
+    $shellCases = @(Get-FullMember -Object $shell -Name "cases" -Default @())
+    $shellFeatureCount = $shellFeatures.Count
+    $shellCaseCount = $shellCases.Count
+    $shellCasePassed = @($shellCases | Where-Object { [bool](Get-FullMember -Object $_ -Name "ok" -Default $false) }).Count
+    $shellCoverageText = if ($shell) { "$shellFeatureCount features / $shellCasePassed of $shellCaseCount cases" } else { "NA" }
 
     $overall = if ($Summary.overall_ok) { "通过" } else { "失败" }
     $popPass = if ($wave) { Format-FullStageState (Get-FullMember -Object $wave -Name "pass") } else { "NA" }
@@ -864,6 +871,7 @@ function Write-FullReports {
     $latencyTriggerDescription = Get-FullLatencyTriggerDescription $LatencyTriggerProfile
 
     $overallGrade = if ($Summary.overall_ok) { New-FullGrade "好" "grade-good" } else { New-FullGrade "差" "grade-bad" }
+    $shellGrade = if ($shell -and [bool](Get-FullMember -Object $shell -Name "ok" -Default $false)) { New-FullGrade "好" "grade-good" } elseif ($shell) { New-FullGrade "差" "grade-bad" } else { New-FullGrade "NA" "grade-na" }
     $decodeGrade = Get-FullHigherBetterGrade -Value $decodeFps -Good 55 -Fair 45
     $serverFpsGrade = Get-FullHigherBetterGrade -Value $serverFps -Good 55 -Fair 45
     $encodeGrade = Get-FullLowerBetterGrade -Value $encodeFailures -Good 0 -Fair 3
@@ -895,6 +903,7 @@ function Write-FullReports {
         "- guest 重启: $(Format-FullStageState $Summary.stages.reboot.ok)",
         "- guest 桌面和 helper: $(Format-FullStageState $Summary.stages.'guest-desktop'.ok)",
         "- 客户端壳启动: $(Format-FullStageState $Summary.stages.client_shell.ok)",
+        "- 客户端壳覆盖: $shellCoverageText",
         "- 视频 smoke: $(Format-FullStageState $Summary.stages.smoke.ok)",
         "- 桌面 marker ready: $(Format-FullStageState $Summary.stages.marker.ok)",
         "- 音频质量/爆音: $(Format-FullStageState $Summary.stages.audio.ok)",
@@ -946,6 +955,7 @@ function Write-FullReports {
 
     $cardHtml = @(
         (New-FullMetricCard -Label "总体结果" -Value $overall -Unit "" -Grade $overallGrade -Help "全量脚本按阶段退出码和关键数据有效性汇总。" -Detail "失败时优先看下方红色评级项。"),
+        (New-FullMetricCard -Label "客户端壳" -Value $shellCasePassed -Unit "/ $shellCaseCount cases" -Grade $shellGrade -Help "Win32 壳自动化覆盖主窗口、设置/编辑弹窗、配置加载和 viewer 启动参数。" -Detail "$shellFeatureCount features"),
         (New-FullMetricCard -Label "视频解码 FPS" -Value (Format-FullNumber $decodeFps 2) -Unit "fps" -Grade $decodeGrade -Help "客户端解码输出帧率，越接近 60Hz 越好；>=55 好，>=45 良好。" -Detail "客户端画面流畅度主指标。"),
         (New-FullMetricCard -Label "音频爆音" -Value $(if ($pop) { "$($pop.event_count) / $($pop.severe_event_count)" } else { "NA" }) -Unit "候选/严重" -Grade $popGrade -Help "逐采样扫描短促高频瞬态；0 个候选为好，少量非严重候选为良好。" -Detail "用于判断微小爆音、破音尖峰。"),
         (New-FullMetricCard -Label "频域差异" -Value (Format-FullNumber $spectrumDeltaDb 2) -Unit "dB" -Grade $spectrumGrade -Help "输入参考和录制输出的平均频谱差异 RMS；<=6dB 好，<=12dB 良好。" -Detail "辅助观察高频噪声和音色变化。"),
@@ -1006,6 +1016,28 @@ function Write-FullReports {
         (New-FullMetricRow -Label "AV sync relative drift max" -Value (Format-FullNumber $avRelDriftMs 2) -Unit "ms" -Grade $avGrade -Help "最近配对后，以中位 audio-minus-video 偏移为基准的最大相对漂移；比绝对偏移更可信。" -Detail $avDetail),
         (New-FullMetricRow -Label "输入到画面延迟 median" -Value (Format-FullNumber $latMedianMs 1) -Unit "ms" -Grade $latencyGrade -Help "发送输入触发后，到画面 ROI 首次明显变化的中位耗时；Win+R profile 的接受线为 <=$([int]$LatencyPassMs)ms。" -Detail $latencyTriggerDescription)
     ) -join "`n"
+    $shellFeatureRows = if ($shellFeatures.Count -gt 0) {
+        @($shellFeatures | ForEach-Object {
+            $featureName = ConvertTo-FullHtmlText (Get-FullMember -Object $_ -Name "feature" -Default "")
+            $featureCoverage = ConvertTo-FullHtmlText (Get-FullMember -Object $_ -Name "coverage" -Default "")
+            $featureChecks = ConvertTo-FullHtmlText (Get-FullMember -Object $_ -Name "checks" -Default "")
+            "<tr><td>$featureName</td><td>$featureCoverage</td><td>$featureChecks</td></tr>"
+        }) -join "`n"
+    } else {
+        "<tr><td colspan=`"3`">无客户端壳覆盖数据</td></tr>"
+    }
+    $shellCaseRows = if ($shellCases.Count -gt 0) {
+        @($shellCases | ForEach-Object {
+            $caseOk = [bool](Get-FullMember -Object $_ -Name "ok" -Default $false)
+            $caseClass = if ($caseOk) { "ok" } else { "bad" }
+            $caseName = ConvertTo-FullHtmlText (Get-FullMember -Object $_ -Name "name" -Default "")
+            $caseState = Format-FullStageState $caseOk
+            $caseDetail = ConvertTo-FullHtmlText (Get-FullMember -Object $_ -Name "detail" -Default "")
+            "<tr><td>$caseName</td><td class=`"$caseClass`">$caseState</td><td>$caseDetail</td></tr>"
+        }) -join "`n"
+    } else {
+        "<tr><td colspan=`"3`">无客户端壳用例数据</td></tr>"
+    }
 
     $html = @"
 <!doctype html>
@@ -1057,6 +1089,17 @@ $cardHtml
 <h2>阶段结果</h2>
 <table><thead><tr><th>阶段</th><th>结果</th><th>耗时</th><th>超时</th><th>日志</th></tr></thead><tbody>
 $stageRows
+</tbody></table>
+</section>
+<section>
+<h2>客户端壳覆盖</h2>
+<p class="note">该阶段默认使用隔离配置和 mock viewer，只验证 Win32 壳是否把用户配置正确转成 viewer 启动参数；真实串流连接由后续 smoke、音频、AV sync 和输入延迟阶段覆盖。</p>
+<table><thead><tr><th>功能</th><th>覆盖方式</th><th>检查点</th></tr></thead><tbody>
+$shellFeatureRows
+</tbody></table>
+<h2>客户端壳用例</h2>
+<table><thead><tr><th>用例</th><th>结果</th><th>详情</th></tr></thead><tbody>
+$shellCaseRows
 </tbody></table>
 </section>
 <section>

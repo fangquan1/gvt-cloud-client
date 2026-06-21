@@ -275,6 +275,70 @@ function Copy-TextLines {
     Set-Content -LiteralPath $Path -Value $Lines -Encoding UTF8
 }
 
+$script:CleanupWarnings = New-Object System.Collections.Generic.List[string]
+
+function Stop-GvtViewerProcessGracefully {
+    param(
+        [Diagnostics.Process]$Process,
+        [string]$Role,
+        [int]$TimeoutMs = 2000
+    )
+
+    if ($null -eq $Process) {
+        return $true
+    }
+    try {
+        $Process.Refresh()
+        if ($Process.HasExited) {
+            return $true
+        }
+    } catch {
+    }
+
+    try {
+        [void]$Process.CloseMainWindow()
+    } catch {
+        $msg = "$Role viewer pid=$($Process.Id) CloseMainWindow failed: $($_.Exception.Message)"
+        Write-Warning $msg
+        [void]$script:CleanupWarnings.Add($msg)
+    }
+
+    try {
+        if ($Process.WaitForExit($TimeoutMs)) {
+            return $true
+        }
+    } catch {
+    }
+
+    try {
+        $Process.Kill()
+        [void]$Process.WaitForExit(3000)
+        return $Process.HasExited
+    } catch {
+        $killError = $_.Exception.Message
+        try {
+            if ($Process.WaitForExit(3000)) {
+                $msg = "$Role viewer pid=$($Process.Id) Kill failed after CloseMainWindow, but the process exited: $killError"
+                Write-Warning $msg
+                [void]$script:CleanupWarnings.Add($msg)
+                return $true
+            }
+            $Process.Refresh()
+            if ($Process.HasExited) {
+                $msg = "$Role viewer pid=$($Process.Id) Kill failed after CloseMainWindow, but the process exited: $killError"
+                Write-Warning $msg
+                [void]$script:CleanupWarnings.Add($msg)
+                return $true
+            }
+        } catch {
+        }
+        $msg = "$Role viewer pid=$($Process.Id) Kill failed: $killError"
+        Write-Warning $msg
+        [void]$script:CleanupWarnings.Add($msg)
+        return $false
+    }
+}
+
 New-Item -ItemType Directory -Force -Path (Join-Path $ClientRoot $OutDir) | Out-Null
 $OutDirPath = (Resolve-Path -LiteralPath (Join-Path $ClientRoot $OutDir)).Path
 
@@ -341,41 +405,37 @@ $localLines = @(Get-LocalLogTail -Path $ViewerLog -StartLine $localStartLine)
 $serverLines = @(Get-RemoteLogTail -StartLine $remoteStartLine)
 
 if ($LeaveWindowOpen -and -not $KeepProbeViewerOpen) {
-    if (-not $probeProcess.HasExited) {
-        $probeProcess.CloseMainWindow() | Out-Null
-        if (-not $probeProcess.WaitForExit(2000)) {
-            $probeProcess.Kill()
-            $probeProcess.WaitForExit()
-        }
+    $probeStopped = Stop-GvtViewerProcessGracefully -Process $probeProcess -Role "probe"
+    if ($probeStopped) {
+        Start-Sleep -Milliseconds 1500
+
+        $steadyStartInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $steadyStartInfo.FileName = $ViewerPath
+        $steadyStartInfo.WorkingDirectory = $ViewerDir
+        $steadyStartInfo.UseShellExecute = $false
+        $steadyStartInfo.Arguments = Join-ProcessArgs $viewerArgs
+        $steadyStartInfo.EnvironmentVariables["GVT_SPICE_VIEWER_DROP_COMPLETE_FRAMES"] = "1"
+        $steadyStartInfo.EnvironmentVariables["GVT_SPICE_VIEWER_UDP_BUFFER_SIZE"] = "2097152"
+        $steadyStartInfo.EnvironmentVariables["GVT_SPICE_VIEWER_JITTER_DROPOUT_MS"] = "60"
+        $steadyStartInfo.EnvironmentVariables["GVT_SPICE_VIEWER_JITTER_MISORDER_MS"] = "20"
+        $steadyStartInfo.EnvironmentVariables["GVT_SPICE_VIEWER_AUDIO_DEBUG"] = "1"
+        $steadyStartInfo.EnvironmentVariables["GVT_SPICE_VIEWER_VIDEO_TAIL"] = $startInfo.EnvironmentVariables["GVT_SPICE_VIEWER_VIDEO_TAIL"]
+        $steadyStartInfo.EnvironmentVariables["PATH"] = $startInfo.EnvironmentVariables["PATH"]
+
+        $steadyProcess = New-Object System.Diagnostics.Process
+        $steadyProcess.StartInfo = $steadyStartInfo
+        [void]$steadyProcess.Start()
+        $process = $steadyProcess
+        $probeViewerReplaced = $true
+        Start-Sleep -Seconds 3
+    } else {
+        $KeepProbeViewerOpen = $true
+        $process = $probeProcess
+        Start-Sleep -Milliseconds 500
     }
-    Start-Sleep -Milliseconds 1500
-
-    $steadyStartInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $steadyStartInfo.FileName = $ViewerPath
-    $steadyStartInfo.WorkingDirectory = $ViewerDir
-    $steadyStartInfo.UseShellExecute = $false
-    $steadyStartInfo.Arguments = Join-ProcessArgs $viewerArgs
-    $steadyStartInfo.EnvironmentVariables["GVT_SPICE_VIEWER_DROP_COMPLETE_FRAMES"] = "1"
-    $steadyStartInfo.EnvironmentVariables["GVT_SPICE_VIEWER_UDP_BUFFER_SIZE"] = "2097152"
-    $steadyStartInfo.EnvironmentVariables["GVT_SPICE_VIEWER_JITTER_DROPOUT_MS"] = "60"
-    $steadyStartInfo.EnvironmentVariables["GVT_SPICE_VIEWER_JITTER_MISORDER_MS"] = "20"
-    $steadyStartInfo.EnvironmentVariables["GVT_SPICE_VIEWER_AUDIO_DEBUG"] = "1"
-    $steadyStartInfo.EnvironmentVariables["GVT_SPICE_VIEWER_VIDEO_TAIL"] = $startInfo.EnvironmentVariables["GVT_SPICE_VIEWER_VIDEO_TAIL"]
-    $steadyStartInfo.EnvironmentVariables["PATH"] = $startInfo.EnvironmentVariables["PATH"]
-
-    $steadyProcess = New-Object System.Diagnostics.Process
-    $steadyProcess.StartInfo = $steadyStartInfo
-    [void]$steadyProcess.Start()
-    $process = $steadyProcess
-    $probeViewerReplaced = $true
-    Start-Sleep -Seconds 3
 }
 elseif (-not $LeaveWindowOpen -and -not $process.HasExited) {
-    $process.CloseMainWindow() | Out-Null
-    if (-not $process.WaitForExit(2000)) {
-        $process.Kill()
-        $process.WaitForExit()
-    }
+    [void](Stop-GvtViewerProcessGracefully -Process $process -Role "measurement")
 }
 
 Start-Sleep -Milliseconds 500
@@ -455,6 +515,7 @@ $summary = [ordered]@{
     probe_viewer_pid = $probeProcess.Id
     probe_viewer_replaced = $probeViewerReplaced
     keep_probe_viewer_open = [bool]$KeepProbeViewerOpen
+    cleanup_warnings = @($script:CleanupWarnings.ToArray())
     duration_sec = $DurationSec
     warmup_sec = $WarmupSec
     codec = $Codec
