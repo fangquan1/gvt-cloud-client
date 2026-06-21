@@ -25,6 +25,9 @@ Our scripts mirror that split:
   and samples the remote QEMU `update-stats` log over SSH when available.
 - `run-gvt-stream-smoke.ps1` wraps the measurement script with acceptance
   thresholds for steady depay/decode FPS, startup markers, and encode failures.
+- `test-gvt-client-shell.ps1` launches `GVT Cloud Client.exe`, drives its
+  Win32 controls, clicks Connect, and verifies the viewer command line includes
+  the expected codec, latency, stream, SPICE, input, and control arguments.
 - `measure-gvt-video-latency.ps1` measures video-after-input latency from a
   trigger to the first visible client-side frame change in a selected region.
 - `install-gvt-guest-test-agent.ps1` installs a small Windows guest helper
@@ -43,8 +46,9 @@ Our scripts mirror that split:
   audio. Treat its absolute offset as diagnostic because audio sample-zero is
   estimated from the local recorder start time.
 - `run-gvt-full-test.ps1` orchestrates the complete local acceptance run:
-  optional helper install, optional guest reboot, QGA desktop readiness, stream
-  smoke, marker readiness, audio quality, AV sync, and input-to-video latency.
+  optional helper install, optional guest reboot, QGA desktop readiness, client
+  shell launch validation, stream smoke, marker readiness, audio quality, AV
+  sync, and input-to-video latency.
   It writes `full.log`, `status.json`, per-stage logs, a Chinese Markdown
   report, and a Chinese HTML report under
   `test_output\data\full-YYYYMMDD-HHMMSS`. Each stage has an explicit timeout
@@ -86,6 +90,7 @@ Useful full-run knobs:
 powershell -ExecutionPolicy Bypass -File test-tools\run-gvt-full-test.ps1 `
   -BatchMode `
   -DesktopTimeoutSec 180 `
+  -ShellTimeoutSec 60 `
   -SmokeTimeoutSec 180 `
   -AudioTimeoutSec 180 `
   -AvSyncTimeoutSec 180 `

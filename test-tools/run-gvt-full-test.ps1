@@ -24,6 +24,7 @@ param(
     [int]$RebootCommandTimeoutSec = 20,
     [int]$MarkerTimeoutSec = 60,
     [int]$MarkerStageTimeoutSec = 120,
+    [int]$ShellTimeoutSec = 60,
     [int]$SmokeTimeoutSec = 180,
     [int]$AudioTimeoutSec = 180,
     [int]$AvSyncTimeoutSec = 180,
@@ -58,6 +59,7 @@ $summaryPath = Join-Path $runDir "summary.json"
 $statusPath = Join-Path $runDir "status.json"
 $reportZhPath = Join-Path $runDir "report.md"
 $reportHtmlPath = Join-Path $runDir "report.html"
+$shellOutDirRel = Join-Path $runRelDir "client-shell"
 $smokeOutDirRel = Join-Path $runRelDir "video-performance"
 $audioOutDirRel = Join-Path $runRelDir "audio-quality"
 $avOutDirRel = Join-Path $runRelDir "av-sync"
@@ -67,6 +69,7 @@ $stageTimeoutPlan = [ordered]@{
     install = $InstallTimeoutSec
     reboot = $RebootCommandTimeoutSec
     "guest-desktop" = $DesktopTimeoutSec
+    client_shell = $ShellTimeoutSec
     smoke = $SmokeTimeoutSec
     marker = $MarkerStageTimeoutSec
     audio = $AudioTimeoutSec
@@ -775,6 +778,7 @@ function Get-FullStageHtmlRows {
         @("install", "安装 guest helper"),
         @("reboot", "guest 重启"),
         @("guest-desktop", "guest 桌面和 helper"),
+        @("client_shell", "客户端壳启动"),
         @("smoke", "视频 smoke"),
         @("marker", "桌面 marker ready"),
         @("audio", "音频质量/爆音"),
@@ -890,6 +894,7 @@ function Write-FullReports {
         "- 安装 guest helper: $(Format-FullStageState $Summary.stages.install.ok)",
         "- guest 重启: $(Format-FullStageState $Summary.stages.reboot.ok)",
         "- guest 桌面和 helper: $(Format-FullStageState $Summary.stages.'guest-desktop'.ok)",
+        "- 客户端壳启动: $(Format-FullStageState $Summary.stages.client_shell.ok)",
         "- 视频 smoke: $(Format-FullStageState $Summary.stages.smoke.ok)",
         "- 桌面 marker ready: $(Format-FullStageState $Summary.stages.marker.ok)",
         "- 音频质量/爆音: $(Format-FullStageState $Summary.stages.audio.ok)",
@@ -931,6 +936,7 @@ function Write-FullReports {
         "## 产物",
         "",
         "- full summary: $summaryPath",
+        "- client shell summary: $($Summary.artifacts.client_shell_summary_path)",
         "- smoke summary: $($Summary.artifacts.smoke_summary_path)",
         "- audio summary: $($Summary.artifacts.audio_summary_path)",
         "- AV sync summary: $($Summary.artifacts.av_sync_summary_path)",
@@ -952,6 +958,7 @@ function Write-FullReports {
         @("总 summary", $summaryPath),
         @("状态 JSON", $statusPath),
         @("完整日志", (Join-Path $runDir "full.log")),
+        @("客户端壳 summary", $Summary.artifacts.client_shell_summary_path),
         @("视频 summary", $Summary.artifacts.smoke_summary_path),
         @("音频 summary", $Summary.artifacts.audio_summary_path),
         @("音频波形分析 JSON", $(Get-FullMember -Object $audio -Name "waveform_analysis_path" -Default "")),
@@ -1151,6 +1158,20 @@ if ($SkipReboot) {
 [void](Wait-FullGuestDesktop -TimeoutSec $DesktopTimeoutSec)
 
 [void](Invoke-FullScriptStage `
+    -Stage "client_shell" `
+    -ScriptPath (Join-Path $PSScriptRoot "test-gvt-client-shell.ps1") `
+    -Arguments @(
+        "-ServerHost", $ServerHost,
+        "-VideoPort", $VideoPort.ToString(),
+        "-Latency", "15",
+        "-StreamFps", "59",
+        "-BitrateMbps", "18",
+        "-OutDir", $shellOutDirRel,
+        "-TimeoutSec", $ShellTimeoutSec.ToString()
+    ) `
+    -TimeoutSec $ShellTimeoutSec)
+
+[void](Invoke-FullScriptStage `
     -Stage "smoke" `
     -ScriptPath (Join-Path $PSScriptRoot "run-gvt-stream-smoke.ps1") `
     -Arguments @(
@@ -1252,17 +1273,22 @@ Write-FullLog ("latency trigger profile: {0}; {1}" -f $LatencyTriggerProfile, (G
     -Arguments $latencyStageArgs `
     -TimeoutSec $LatencyTimeoutSec)
 
+$shellDir = Get-FullLatestDirectory $shellOutDirRel
 $smokeDir = Get-FullLatestDirectory $smokeOutDirRel
 $audioDir = Get-FullLatestDirectory $audioOutDirRel
 $avDir = Get-FullLatestDirectory $avOutDirRel
 $latencyDir = Get-FullLatestDirectory $latencyOutDirRel
 
+$shellSummaryPath = if ($shellDir) { Join-Path $shellDir.FullName "summary.json" } else { $null }
 $smokeSummaryPath = if ($smokeDir) { Join-Path $smokeDir.FullName "summary.json" } else { $null }
 $audioSummaryPath = if ($audioDir) { Join-Path $audioDir.FullName "summary.json" } else { $null }
 $avSummaryPath = if ($avDir) { Join-Path $avDir.FullName "summary.json" } else { $null }
 $latencyCsvPath = if ($latencyDir) { Join-Path $latencyDir.FullName "results.csv" } else { $null }
 
 $artifacts = [ordered]@{
+    client_shell_dir = if ($shellDir) { $shellDir.FullName } else { $null }
+    client_shell_summary_path = $shellSummaryPath
+    client_shell_summary = Read-FullJsonFile $shellSummaryPath
     smoke_dir = if ($smokeDir) { $smokeDir.FullName } else { $null }
     smoke_summary_path = $smokeSummaryPath
     smoke_summary = Read-FullJsonFile $smokeSummaryPath
