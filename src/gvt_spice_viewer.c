@@ -57,9 +57,23 @@ typedef void *gpointer;
 typedef int gboolean;
 typedef unsigned int guint;
 typedef int gint;
+typedef size_t gsize;
+typedef unsigned char guint8;
 typedef void (*GCallback)(void);
 typedef void (*GClosureNotify)(gpointer data, void *closure);
 typedef void (*GDestroyNotify)(gpointer data);
+
+#define GST_MAP_READ 1
+
+typedef struct GstMapInfoCompat {
+    void *memory;
+    int flags;
+    guint8 *data;
+    gsize size;
+    gsize maxsize;
+    gpointer user_data[4];
+    gpointer reserved[4];
+} GstMapInfoCompat;
 
 static HMODULE glib, gobject, gio, spice, gtk, spicegtk;
 static void *(*p_spice_session_new)(void);
@@ -133,7 +147,7 @@ static void (*p_gtk_widget_set_size_request)(void *widget, gint width, gint heig
 static void (*p_gtk_widget_queue_draw)(void *widget);
 static void *(*p_spice_display_new)(void *session, gint id);
 
-static HMODULE gstlib, gstvideo;
+static HMODULE gstlib, gstvideo, gstapp;
 static void (*p_gst_init)(int *argc, char ***argv);
 static void *(*p_gst_parse_launch)(const char *pipeline_description, void **error);
 static int (*p_gst_element_set_state)(void *element, int state);
@@ -148,6 +162,12 @@ static void (*p_gst_mini_object_unref)(void *object);
 static void (*p_gst_object_unref)(void *object);
 static void (*p_gst_video_overlay_set_window_handle)(void *overlay,
                                                      uintptr_t handle);
+static void *(*p_gst_app_sink_pull_sample)(void *appsink);
+static void *(*p_gst_sample_get_buffer)(void *sample);
+static void *(*p_gst_sample_get_caps)(void *sample);
+static gboolean (*p_gst_buffer_map)(void *buffer, GstMapInfoCompat *info,
+                                    int flags);
+static void (*p_gst_buffer_unmap)(void *buffer, GstMapInfoCompat *info);
 
 static const char *spice_runtime = "C:\\Program Files\\VirtViewer v11.0-256\\bin";
 static const char *gst_root = NULL;
@@ -178,6 +198,7 @@ static void *display_mode_session;
 
 static HWND main_hwnd;
 static HWND video_hwnd;
+static WNDPROC video_prev_wndproc;
 static HHOOK keyboard_hook;
 static HICON app_icon;
 static RECT video_rect;
@@ -219,6 +240,23 @@ static SOCKET native_input_sock = INVALID_SOCKET;
 static SOCKET stream_control_sock = INVALID_SOCKET;
 static volatile LONG stream_control_start_sent;
 static volatile LONG stream_size_known;
+typedef struct StreamFrameMeta {
+    uint64_t seq;
+    uint64_t background;
+    int roi;
+    int x;
+    int y;
+    int w;
+    int h;
+    int width;
+    int height;
+    int dirty_ppm;
+    char mode[16];
+} StreamFrameMeta;
+static StreamFrameMeta stream_frame_meta;
+static volatile LONG stream_frame_meta_valid;
+static CRITICAL_SECTION stream_frame_meta_lock;
+static volatile LONG stream_frame_meta_lock_state;
 static bool stream_control_preconnected;
 static bool winsock_ready;
 static ULONGLONG log_start_ms;
@@ -237,6 +275,20 @@ static volatile LONG video_probe_counts[4];
 static HANDLE video_probe_thread;
 static HANDLE spice_thread_handle;
 static HANDLE clipboard_thread_handle;
+static bool roi_compositor_enabled;
+static CRITICAL_SECTION roi_frame_lock;
+static volatile LONG roi_frame_lock_state;
+static unsigned char *roi_framebuffer;
+static int roi_framebuffer_width;
+static int roi_framebuffer_height;
+static int roi_framebuffer_stride;
+static BITMAPINFO roi_framebuffer_bmi;
+static uint64_t roi_compositor_frames;
+static uint64_t roi_compositor_drops;
+static ULONGLONG roi_compositor_last_log_ms;
+
+static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
+                                      LPARAM lparam);
 
 typedef enum InputCaptureState {
     INPUT_CAPTURE_LOCAL,
@@ -1033,6 +1085,14 @@ static void *sym(HMODULE module, const char *name)
     return ptr;
 }
 
+static void *try_sym(HMODULE module, const char *name)
+{
+    if (!module) {
+        return NULL;
+    }
+    return (void *)GetProcAddress(module, name);
+}
+
 static void load_spice_runtime(void)
 {
     log_line("load_spice_runtime %s", spice_runtime);
@@ -1256,6 +1316,107 @@ static int json_get_int_field(const char *json, const char *key, int defval)
     return atoi(p);
 }
 
+static uint64_t json_get_u64_field(const char *json, const char *key,
+                                   uint64_t defval)
+{
+    char pattern[64];
+    const char *p;
+
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    p = strstr(json, pattern);
+    if (!p) {
+        return defval;
+    }
+    p = strchr(p, ':');
+    if (!p) {
+        return defval;
+    }
+    p++;
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    return (uint64_t)strtoull(p, NULL, 10);
+}
+
+static bool json_get_string_field(const char *json, const char *key,
+                                  char *out, size_t out_size)
+{
+    char pattern[64];
+    const char *p;
+    const char *end;
+    size_t len;
+
+    if (!out || out_size == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    p = strstr(json, pattern);
+    if (!p) {
+        return false;
+    }
+    p = strchr(p, ':');
+    if (!p) {
+        return false;
+    }
+    p++;
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    if (*p != '"') {
+        return false;
+    }
+    p++;
+    end = strchr(p, '"');
+    if (!end) {
+        return false;
+    }
+    len = (size_t)(end - p);
+    if (len >= out_size) {
+        len = out_size - 1;
+    }
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return true;
+}
+
+static void ensure_stream_frame_meta_lock(void)
+{
+    LONG state = InterlockedCompareExchange(&stream_frame_meta_lock_state, 1, 0);
+
+    if (state == 0) {
+        InitializeCriticalSection(&stream_frame_meta_lock);
+        InterlockedExchange(&stream_frame_meta_lock_state, 2);
+        return;
+    }
+    while (InterlockedCompareExchange(&stream_frame_meta_lock_state, 2, 2) != 2) {
+        Sleep(0);
+    }
+}
+
+static void stream_frame_meta_store(const StreamFrameMeta *meta)
+{
+    ensure_stream_frame_meta_lock();
+    EnterCriticalSection(&stream_frame_meta_lock);
+    stream_frame_meta = *meta;
+    InterlockedExchange(&stream_frame_meta_valid, 1);
+    LeaveCriticalSection(&stream_frame_meta_lock);
+}
+
+static bool stream_frame_meta_snapshot(StreamFrameMeta *meta)
+{
+    if (!meta ||
+        InterlockedCompareExchange(&stream_frame_meta_valid, 0, 0) == 0) {
+        return false;
+    }
+
+    ensure_stream_frame_meta_lock();
+    EnterCriticalSection(&stream_frame_meta_lock);
+    *meta = stream_frame_meta;
+    LeaveCriticalSection(&stream_frame_meta_lock);
+    return true;
+}
+
 static bool stream_control_read_line(char *buffer, size_t size)
 {
     size_t used = 0;
@@ -1296,6 +1457,43 @@ static bool update_source_size(int width, int height, const char *reason)
     return true;
 }
 
+static bool stream_control_apply_frame_meta(const char *status)
+{
+    StreamFrameMeta meta = { 0 };
+
+    if (!strstr(status, "\"type\":\"frame\"")) {
+        return false;
+    }
+
+    memset(&meta, 0, sizeof(meta));
+    meta.seq = json_get_u64_field(status, "seq", 0);
+    meta.background = json_get_u64_field(status, "background", 0);
+    meta.roi = json_get_int_field(status, "roi", 0);
+    meta.x = json_get_int_field(status, "x", 0);
+    meta.y = json_get_int_field(status, "y", 0);
+    meta.w = json_get_int_field(status, "w", 0);
+    meta.h = json_get_int_field(status, "h", 0);
+    meta.width = json_get_int_field(status, "width", 0);
+    meta.height = json_get_int_field(status, "height", 0);
+    meta.dirty_ppm = json_get_int_field(status, "dirty_ppm", 0);
+    if (!json_get_string_field(status, "mode", meta.mode,
+                               sizeof(meta.mode))) {
+        snprintf(meta.mode, sizeof(meta.mode), "unknown");
+    }
+
+    if (meta.width > 0 && meta.height > 0) {
+        update_source_size(meta.width, meta.height, "stream-frame-meta");
+    }
+    stream_frame_meta_store(&meta);
+
+    log_line("stream-control frame-meta seq=%I64u mode=%s roi=%d "
+             "rect=%d,%d %dx%d source=%dx%d dirty_ppm=%d background=%I64u",
+             (unsigned long long)meta.seq, meta.mode, meta.roi,
+             meta.x, meta.y, meta.w, meta.h, meta.width, meta.height,
+             meta.dirty_ppm, (unsigned long long)meta.background);
+    return true;
+}
+
 static void stream_control_apply_status(const char *status)
 {
     int returned_video;
@@ -1308,6 +1506,9 @@ static void stream_control_apply_status(const char *status)
         return;
     }
     log_line("stream-control status %s", status);
+    if (stream_control_apply_frame_meta(status)) {
+        return;
+    }
     if (strstr(status, "\"ok\":false")) {
         return;
     }
@@ -1337,6 +1538,288 @@ static void stream_control_apply_status(const char *status)
              "size=%dx%d fps=%d bitrate=%d",
              video_port, spice_port, native_input_port,
              source_width, source_height, stream_fps, stream_bitrate_kbps);
+}
+
+static void ensure_roi_frame_lock(void)
+{
+    LONG state = InterlockedCompareExchange(&roi_frame_lock_state, 1, 0);
+
+    if (state == 0) {
+        InitializeCriticalSection(&roi_frame_lock);
+        InterlockedExchange(&roi_frame_lock_state, 2);
+        return;
+    }
+    while (InterlockedCompareExchange(&roi_frame_lock_state, 2, 2) != 2) {
+        Sleep(0);
+    }
+}
+
+static bool roi_compositor_requested(void)
+{
+    return env_is_set("GVT_SPICE_VIEWER_ROI_COMPOSITOR");
+}
+
+static bool roi_compositor_runtime_ready(void)
+{
+    return p_gst_app_sink_pull_sample && p_gst_sample_get_buffer &&
+           p_gst_sample_get_caps && p_gst_buffer_map && p_gst_buffer_unmap &&
+           p_g_signal_connect_data;
+}
+
+static const char *roi_compositor_video_tail(void)
+{
+    return "queue name=post_decode_q leaky=downstream max-size-buffers=1 "
+           "max-size-time=0 max-size-bytes=0 ! "
+           "d3d11download ! videoconvert ! "
+           "video/x-raw,format=BGRA ! "
+           "appsink name=vsink emit-signals=true sync=false async=false "
+           "max-buffers=1 drop=true";
+}
+
+static void roi_framebuffer_reset(void)
+{
+    ensure_roi_frame_lock();
+    EnterCriticalSection(&roi_frame_lock);
+    free(roi_framebuffer);
+    roi_framebuffer = NULL;
+    roi_framebuffer_width = 0;
+    roi_framebuffer_height = 0;
+    roi_framebuffer_stride = 0;
+    memset(&roi_framebuffer_bmi, 0, sizeof(roi_framebuffer_bmi));
+    LeaveCriticalSection(&roi_frame_lock);
+}
+
+static bool roi_framebuffer_ensure_locked(int width, int height)
+{
+    unsigned char *new_pixels;
+    size_t size;
+    int stride;
+
+    if (width <= 0 || height <= 0 || width > 16384 || height > 16384) {
+        return false;
+    }
+    stride = width * 4;
+    if (roi_framebuffer && roi_framebuffer_width == width &&
+        roi_framebuffer_height == height &&
+        roi_framebuffer_stride == stride) {
+        return true;
+    }
+
+    size = (size_t)stride * (size_t)height;
+    new_pixels = calloc(1, size);
+    if (!new_pixels) {
+        return false;
+    }
+    free(roi_framebuffer);
+    roi_framebuffer = new_pixels;
+    roi_framebuffer_width = width;
+    roi_framebuffer_height = height;
+    roi_framebuffer_stride = stride;
+    memset(&roi_framebuffer_bmi, 0, sizeof(roi_framebuffer_bmi));
+    roi_framebuffer_bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    roi_framebuffer_bmi.bmiHeader.biWidth = width;
+    roi_framebuffer_bmi.bmiHeader.biHeight = -height;
+    roi_framebuffer_bmi.bmiHeader.biPlanes = 1;
+    roi_framebuffer_bmi.bmiHeader.biBitCount = 32;
+    roi_framebuffer_bmi.bmiHeader.biCompression = BI_RGB;
+    log_line("roi-compositor framebuffer size=%dx%d bytes=%I64u",
+             width, height, (unsigned long long)size);
+    return true;
+}
+
+static bool roi_compositor_copy_sample(const guint8 *data, size_t data_size,
+                                       int sample_w, int sample_h)
+{
+    StreamFrameMeta meta = { 0 };
+    bool have_meta;
+    bool full_sample;
+    bool roi_sample;
+    int full_w;
+    int full_h;
+    int sample_stride;
+    uint64_t frame_index;
+
+    if (!data || sample_w <= 0 || sample_h <= 0) {
+        return false;
+    }
+    sample_stride = sample_w * 4;
+    if (data_size < (size_t)sample_stride * (size_t)sample_h) {
+        log_line("roi-compositor drop short-sample size=%I64u need=%I64u "
+                 "sample=%dx%d",
+                 (unsigned long long)data_size,
+                 (unsigned long long)((size_t)sample_stride *
+                                      (size_t)sample_h),
+                 sample_w, sample_h);
+        return false;
+    }
+
+    have_meta = stream_frame_meta_snapshot(&meta);
+    full_w = (have_meta && meta.width > 0) ? meta.width : source_width;
+    full_h = (have_meta && meta.height > 0) ? meta.height : source_height;
+    full_sample = (sample_w == full_w && sample_h == full_h);
+    roi_sample = have_meta && meta.roi &&
+                 sample_w == meta.w && sample_h == meta.h &&
+                 meta.x >= 0 && meta.y >= 0 &&
+                 meta.w > 0 && meta.h > 0 &&
+                 meta.x + meta.w <= full_w &&
+                 meta.y + meta.h <= full_h;
+
+    ensure_roi_frame_lock();
+    EnterCriticalSection(&roi_frame_lock);
+    if (full_sample) {
+        if (!roi_framebuffer_ensure_locked(full_w, full_h)) {
+            LeaveCriticalSection(&roi_frame_lock);
+            return false;
+        }
+        for (int y = 0; y < sample_h; y++) {
+            memcpy(roi_framebuffer + (size_t)y * roi_framebuffer_stride,
+                   data + (size_t)y * sample_stride,
+                   (size_t)sample_stride);
+        }
+    } else if (roi_sample) {
+        if (!roi_framebuffer ||
+            roi_framebuffer_width != full_w ||
+            roi_framebuffer_height != full_h) {
+            LeaveCriticalSection(&roi_frame_lock);
+            roi_compositor_drops++;
+            log_line("roi-compositor drop roi-without-background "
+                     "sample=%dx%d rect=%d,%d %dx%d source=%dx%d "
+                     "drops=%I64u",
+                     sample_w, sample_h, meta.x, meta.y, meta.w, meta.h,
+                     full_w, full_h,
+                     (unsigned long long)roi_compositor_drops);
+            return false;
+        }
+        for (int y = 0; y < sample_h; y++) {
+            memcpy(roi_framebuffer +
+                       (size_t)(meta.y + y) * roi_framebuffer_stride +
+                       (size_t)meta.x * 4,
+                   data + (size_t)y * sample_stride,
+                   (size_t)sample_stride);
+        }
+    } else {
+        LeaveCriticalSection(&roi_frame_lock);
+        roi_compositor_drops++;
+        log_line("roi-compositor drop unmatched-sample sample=%dx%d "
+                 "meta=%d roi=%d rect=%d,%d %dx%d source=%dx%d drops=%I64u",
+                 sample_w, sample_h, have_meta ? 1 : 0,
+                 have_meta ? meta.roi : 0,
+                 have_meta ? meta.x : 0, have_meta ? meta.y : 0,
+                 have_meta ? meta.w : 0, have_meta ? meta.h : 0,
+                 full_w, full_h, (unsigned long long)roi_compositor_drops);
+        return false;
+    }
+
+    roi_compositor_frames++;
+    frame_index = roi_compositor_frames;
+    LeaveCriticalSection(&roi_frame_lock);
+
+    if (video_hwnd) {
+        InvalidateRect(video_hwnd, NULL, FALSE);
+    }
+    if (frame_index <= 8 || frame_index % 120 == 0 ||
+        viewer_now_ms() - roi_compositor_last_log_ms > 5000) {
+        roi_compositor_last_log_ms = viewer_now_ms();
+        log_line("roi-compositor frame=%I64u kind=%s sample=%dx%d "
+                 "rect=%d,%d %dx%d source=%dx%d drops=%I64u",
+                 (unsigned long long)frame_index,
+                 full_sample ? "full" : "roi",
+                 sample_w, sample_h,
+                 roi_sample ? meta.x : 0, roi_sample ? meta.y : 0,
+                 roi_sample ? meta.w : sample_w,
+                 roi_sample ? meta.h : sample_h,
+                 full_w, full_h,
+                 (unsigned long long)roi_compositor_drops);
+    }
+    return true;
+}
+
+static int roi_appsink_new_sample(void *sink, gpointer data)
+{
+    void *sample;
+    void *buffer;
+    void *caps;
+    void *structure;
+    gint width = 0;
+    gint height = 0;
+    GstMapInfoCompat map;
+
+    (void)data;
+    if (!roi_compositor_enabled || !p_gst_app_sink_pull_sample) {
+        return 0;
+    }
+
+    sample = p_gst_app_sink_pull_sample(sink);
+    if (!sample) {
+        return 0;
+    }
+    buffer = p_gst_sample_get_buffer(sample);
+    caps = p_gst_sample_get_caps(sample);
+    structure = caps ? p_gst_caps_get_structure(caps, 0) : NULL;
+    if (!buffer || !structure ||
+        !p_gst_structure_get_int(structure, "width", &width) ||
+        !p_gst_structure_get_int(structure, "height", &height)) {
+        roi_compositor_drops++;
+        p_gst_mini_object_unref(sample);
+        return 0;
+    }
+
+    memset(&map, 0, sizeof(map));
+    if (p_gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+        roi_compositor_copy_sample(map.data, map.size, width, height);
+        p_gst_buffer_unmap(buffer, &map);
+    } else {
+        roi_compositor_drops++;
+        log_line("roi-compositor drop map-failed sample=%dx%d drops=%I64u",
+                 width, height, (unsigned long long)roi_compositor_drops);
+    }
+    p_gst_mini_object_unref(sample);
+    return 0;
+}
+
+static void roi_compositor_paint(HWND hwnd, HDC hdc)
+{
+    RECT rc;
+
+    GetClientRect(hwnd, &rc);
+    ensure_roi_frame_lock();
+    EnterCriticalSection(&roi_frame_lock);
+    if (roi_framebuffer) {
+        StretchDIBits(hdc,
+                      0, 0, max(1, rc.right - rc.left),
+                      max(1, rc.bottom - rc.top),
+                      0, 0, roi_framebuffer_width, roi_framebuffer_height,
+                      roi_framebuffer, &roi_framebuffer_bmi,
+                      DIB_RGB_COLORS, SRCCOPY);
+    } else {
+        FillRect(hdc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    }
+    LeaveCriticalSection(&roi_frame_lock);
+}
+
+static LRESULT CALLBACK video_wndproc(HWND hwnd, UINT msg, WPARAM wparam,
+                                      LPARAM lparam)
+{
+    if (roi_compositor_enabled) {
+        switch (msg) {
+        case WM_PAINT:
+        {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hwnd, &ps);
+            roi_compositor_paint(hwnd, hdc);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_ERASEBKGND:
+            return 1;
+        default:
+            break;
+        }
+    }
+    if (video_prev_wndproc) {
+        return CallWindowProcA(video_prev_wndproc, hwnd, msg, wparam, lparam);
+    }
+    return DefWindowProcA(hwnd, msg, wparam, lparam);
 }
 
 static bool stream_control_start_session(void)
@@ -1997,6 +2480,7 @@ static void load_gst_runtime(void)
     SetDllDirectoryA(bin);
     gstlib = LoadLibraryA("libgstreamer-1.0-0.dll");
     gstvideo = LoadLibraryA("libgstvideo-1.0-0.dll");
+    gstapp = LoadLibraryA("libgstapp-1.0-0.dll");
     if (!gobject) {
         gobject = LoadLibraryA("libgobject-2.0-0.dll");
     }
@@ -2020,8 +2504,14 @@ static void load_gst_runtime(void)
     p_gst_structure_get_int = sym(gstlib, "gst_structure_get_int");
     p_gst_mini_object_unref = sym(gstlib, "gst_mini_object_unref");
     p_gst_object_unref = sym(gstlib, "gst_object_unref");
+    p_gst_sample_get_buffer = sym(gstlib, "gst_sample_get_buffer");
+    p_gst_sample_get_caps = sym(gstlib, "gst_sample_get_caps");
+    p_gst_buffer_map = sym(gstlib, "gst_buffer_map");
+    p_gst_buffer_unmap = sym(gstlib, "gst_buffer_unmap");
     p_gst_video_overlay_set_window_handle =
         sym(gstvideo, "gst_video_overlay_set_window_handle");
+    p_gst_app_sink_pull_sample =
+        (void *(*)(void *))try_sym(gstapp, "gst_app_sink_pull_sample");
     if (!p_g_signal_connect_data && gobject) {
         p_g_signal_connect_data = sym(gobject, "g_signal_connect_data");
     }
@@ -2898,10 +3388,11 @@ static bool start_gst_receiver(void)
         vdebug ? "! identity name=probe_parse silent=true signal-handoffs=true " : "";
     const char *decode_probe =
         vdebug ? "! identity name=probe_decode silent=true signal-handoffs=true " : "";
-    const char *sink_tail = video_sink_tail();
+    const char *sink_tail;
     const char *frame_drop_queue = video_drop_complete_frames() ?
         "! queue name=frame_drop_q leaky=downstream max-size-buffers=1 "
         "max-size-time=0 max-size-bytes=0 " : "";
+    bool use_roi_compositor = roi_compositor_requested();
     int udp_buffer = video_udp_buffer_size();
     int jitter_dropout_ms = video_jitter_dropout_ms();
     int jitter_misorder_ms = video_jitter_misorder_ms();
@@ -2915,6 +3406,21 @@ static bool start_gst_receiver(void)
     load_gst_runtime();
     log_line("gst receiver load-runtime dt=%I64ums",
              (unsigned long long)(viewer_now_ms() - t_stage));
+    if (use_roi_compositor && !roi_compositor_runtime_ready()) {
+        log_line("roi-compositor unavailable: gstapp=%p pull-sample=%p "
+                 "buffer-map=%p signal-connect=%p",
+                 gstapp, p_gst_app_sink_pull_sample, p_gst_buffer_map,
+                 p_g_signal_connect_data);
+        use_roi_compositor = false;
+    }
+    roi_compositor_enabled = use_roi_compositor;
+    if (!roi_compositor_enabled) {
+        roi_framebuffer_reset();
+    }
+    sink_tail = roi_compositor_enabled ?
+                roi_compositor_video_tail() : video_sink_tail();
+    log_line("video sink mode=%s",
+             roi_compositor_enabled ? "roi-compositor" : "d3d11-overlay");
     log_line("gst_init");
     t_stage = viewer_now_ms();
     p_gst_init(NULL, NULL);
@@ -2968,8 +3474,19 @@ static bool start_gst_receiver(void)
         return false;
     }
     start_video_probes();
-    p_gst_video_overlay_set_window_handle(gst_sink, (uintptr_t)video_hwnd);
-    log_line("gst set window=%p", video_hwnd);
+    if (roi_compositor_enabled) {
+        p_g_signal_connect_data(gst_sink, "new-sample",
+                                (GCallback)roi_appsink_new_sample,
+                                NULL, NULL, 0);
+        log_line("roi-compositor appsink connected window=%p", video_hwnd);
+        if (video_hwnd) {
+            InvalidateRect(video_hwnd, NULL, TRUE);
+        }
+    } else {
+        p_gst_video_overlay_set_window_handle(gst_sink,
+                                              (uintptr_t)video_hwnd);
+        log_line("gst set window=%p", video_hwnd);
+    }
     t_stage = viewer_now_ms();
     log_line("gst set playing ret=%d", p_gst_element_set_state(gst_pipeline, 4));
     log_line("gst receiver set-playing dt=%I64ums",
@@ -3505,6 +4022,11 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
                                      0, 0, 1, 1, hwnd, NULL,
                                      (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE),
                                      NULL);
+        if (video_hwnd) {
+            video_prev_wndproc =
+                (WNDPROC)SetWindowLongPtrA(video_hwnd, GWLP_WNDPROC,
+                                           (LONG_PTR)video_wndproc);
+        }
         EnableWindow(video_hwnd, FALSE);
         DragAcceptFiles(hwnd, TRUE);
         layout_children(hwnd);
@@ -3678,6 +4200,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
             p_gst_object_unref(gst_pipeline);
             gst_pipeline = NULL;
         }
+        roi_framebuffer_reset();
         if (spice_thread_handle) {
             DWORD wait_rc = WaitForSingleObject(spice_thread_handle, 1500);
             if (wait_rc == WAIT_TIMEOUT) {

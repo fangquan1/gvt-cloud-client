@@ -210,6 +210,21 @@ Logs:
 - `gvt_client_debug.log`: launcher log.
 - `app\viewer\gvt_spice_viewer.log`: viewer, GStreamer, SPICE, and control log.
 
+### Low-Bandwidth ROI Compositor
+
+The default viewer path is still the low-latency D3D11 video sink. For the
+server-side `LOW_BANDWIDTH_ROI=1` experiment, enable the client compositor
+explicitly:
+
+```powershell
+$env:GVT_SPICE_VIEWER_ROI_COMPOSITOR = "1"
+```
+
+In that mode, the viewer decodes RTP into BGRA appsink samples, caches the last
+full/global frame in memory, and composites dirty-rectangle H.265 samples using
+the frame metadata sent over the stream-control TCP connection. Use it only with
+the matching server ROI mode; otherwise keep the default D3D11 sink path.
+
 ## Video Performance Smoke Test
 
 `test-tools\run-gvt-stream-smoke.ps1` follows the Sunshine/Moonlight-style
