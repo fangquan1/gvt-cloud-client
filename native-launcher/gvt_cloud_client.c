@@ -18,16 +18,16 @@
 #define IDC_STATUS 1003
 #define IDC_CODEC 1004
 #define IDC_LATENCY 1005
-#define IDC_WIDTH 1006
-#define IDC_HEIGHT 1007
+#define IDC_FPS 1006
+#define IDC_BITRATE 1007
 
 static HWND endpoint_combo;
 static HWND connect_button;
 static HWND status_label;
 static HWND codec_combo;
 static HWND latency_edit;
-static HWND width_edit;
-static HWND height_edit;
+static HWND fps_edit;
+static HWND bitrate_edit;
 static HINSTANCE app_instance;
 static wchar_t app_dir[MAX_PATH];
 static HFONT ui_font;
@@ -466,8 +466,8 @@ static void connect_now(void)
     wchar_t viewer[MAX_PATH];
     wchar_t codec[16];
     wchar_t latency_text[32];
-    wchar_t width_text[32];
-    wchar_t height_text[32];
+    wchar_t fps_text[32];
+    wchar_t bitrate_text[32];
     wchar_t cmd[8192] = L"";
     STARTUPINFOW si = {0};
     PROCESS_INFORMATION pi = {0};
@@ -476,8 +476,8 @@ static void connect_now(void)
     int spice_port;
     int input_port;
     int latency;
-    int width;
-    int height;
+    int fps;
+    int bitrate_kbps;
 
     GetWindowTextW(endpoint_combo, endpoint, 256);
     if (!parse_endpoint(endpoint, host, 128, &video_port)) {
@@ -500,27 +500,30 @@ static void connect_now(void)
 
     get_selected_codec(codec, 16);
     GetWindowTextW(latency_edit, latency_text, 32);
-    GetWindowTextW(width_edit, width_text, 32);
-    GetWindowTextW(height_edit, height_text, 32);
+    GetWindowTextW(fps_edit, fps_text, 32);
+    GetWindowTextW(bitrate_edit, bitrate_text, 32);
     latency = _wtoi(latency_text);
-    width = _wtoi(width_text);
-    height = _wtoi(height_text);
+    fps = _wtoi(fps_text);
+    bitrate_kbps = _wtoi(bitrate_text) * 1000;
     if (latency <= 0) latency = 15;
-    if (width <= 0) width = 1920;
-    if (height <= 0) height = 1200;
+    if (fps < 1) fps = 59;
+    if (fps > 120) fps = 120;
+    if (bitrate_kbps < 256) bitrate_kbps = 18000;
+    if (bitrate_kbps > 100000) bitrate_kbps = 100000;
 
     quote_append(cmd, 8192, viewer);
     append_flag_value(cmd, 8192, L"--video-codec", codec[0] ? codec : L"h265");
     append_flag_int(cmd, 8192, L"--video-port", video_port);
     append_flag_int(cmd, 8192, L"--latency", latency);
+    append_flag_int(cmd, 8192, L"--stream-fps", fps);
+    append_flag_int(cmd, 8192, L"--stream-bitrate-kbps", bitrate_kbps);
+    append_flag_int(cmd, 8192, L"--stream-keyint", fps);
     append_flag_value(cmd, 8192, L"--spice-host", host);
     append_flag_int(cmd, 8192, L"--spice-port", spice_port);
     append_flag_value(cmd, 8192, L"--input-host", host);
     append_flag_int(cmd, 8192, L"--input-port", input_port);
     append_flag_value(cmd, 8192, L"--stream-control-host", host);
     append_flag_int(cmd, 8192, L"--stream-control-port", video_port);
-    append_flag_int(cmd, 8192, L"--source-width", width);
-    append_flag_int(cmd, 8192, L"--source-height", height);
     wcsncat(cmd, L" --native-input --invert-case --spice-input-tablet --no-drop-on-latency --auto-size", 8192 - wcslen(cmd) - 1);
     append_portable_runtime_args(cmd, 8192);
 
@@ -593,10 +596,10 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         make_label(hwnd, L"Latency ms", 154, 168, 90, 22);
         latency_edit = make_edit(hwnd, IDC_LATENCY, L"15", 154, 192, 82, 26);
-        make_label(hwnd, L"Width", 256, 168, 70, 22);
-        width_edit = make_edit(hwnd, IDC_WIDTH, L"1920", 256, 192, 82, 26);
-        make_label(hwnd, L"Height", 358, 168, 70, 22);
-        height_edit = make_edit(hwnd, IDC_HEIGHT, L"1200", 358, 192, 82, 26);
+        make_label(hwnd, L"Frame rate", 256, 168, 90, 22);
+        fps_edit = make_edit(hwnd, IDC_FPS, L"59", 256, 192, 82, 26);
+        make_label(hwnd, L"Bitrate Mbps", 358, 168, 110, 22);
+        bitrate_edit = make_edit(hwnd, IDC_BITRATE, L"18", 358, 192, 82, 26);
 
         status_label = make_label(hwnd, L"Ready.", 24, 248, 500, 28);
         start_gst_warmup();

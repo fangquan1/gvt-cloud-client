@@ -43,7 +43,9 @@
 #define G_PRIORITY_DEFAULT_IDLE 200
 
 #define ID_AUTO_SIZE 1001
+#define ID_RELEASE_INPUT 1002
 #define WM_STREAM_READY (WM_APP + 1)
+#define WM_STREAM_RESIZE (WM_APP + 2)
 #define TOOLBAR_HEIGHT 32
 #define WINDOW_FIT_PERCENT 94
 
@@ -120,11 +122,14 @@ static int video_port = 5004;
 static int video_latency = 15;
 static bool video_drop_on_latency = false;
 static const char *video_codec = "h265";
+static int stream_fps = 59;
+static int stream_bitrate_kbps = 18000;
+static int stream_keyint = 59;
 static const char *stream_control_host = NULL;
 static int stream_control_port = 5004;
 static bool stream_control_enabled = true;
-static int source_width = 1920;
-static int source_height = 1200;
+static int source_width = 1024;
+static int source_height = 768;
 static bool auto_size_on_start = true;
 static bool spice_display_mode = false;
 static bool gst_warmup_mode = false;
@@ -132,7 +137,7 @@ static void *display_mode_session;
 
 static HWND main_hwnd;
 static HWND video_hwnd;
-static HWND auto_button;
+static HWND release_button;
 static RECT video_rect;
 static void *gst_pipeline;
 static void *gst_sink;
@@ -184,6 +189,17 @@ static uint64_t audio_dump_data_bytes;
 static volatile LONG video_probe_counts[4];
 static HANDLE video_probe_thread;
 static HANDLE spice_thread_handle;
+
+typedef enum InputCaptureState {
+    INPUT_CAPTURE_LOCAL,
+    INPUT_CAPTURE_CAPTURED,
+    INPUT_CAPTURE_RELEASING,
+} InputCaptureState;
+
+static InputCaptureState input_capture_state = INPUT_CAPTURE_LOCAL;
+static bool key_down[512];
+static bool right_ctrl_pending;
+static bool right_ctrl_sent;
 
 static char *dup_app_dir(void);
 static void set_gst_environment(void);
@@ -822,7 +838,7 @@ static void stream_control_close(void)
 
 static bool stream_control_send_start(const char *reason)
 {
-    char start[256];
+    char start[512];
     ULONGLONG t_stage;
 
     if (!stream_control_enabled || stream_control_sock == INVALID_SOCKET) {
@@ -838,8 +854,10 @@ static bool stream_control_send_start(const char *reason)
     }
 
     snprintf(start, sizeof(start),
-             "{\"type\":\"start\",\"video_port\":%d,\"codec\":\"%s\"}\n",
-             video_port, video_codec ? video_codec : "h265");
+             "{\"type\":\"start\",\"video_port\":%d,\"codec\":\"%s\","
+             "\"fps\":%d,\"bitrate\":%d,\"keyint\":%d}\n",
+             video_port, video_codec ? video_codec : "h265",
+             stream_fps, stream_bitrate_kbps, stream_keyint);
     t_stage = viewer_now_ms();
     if (send(stream_control_sock, start, (int)strlen(start), 0) <= 0) {
         log_line("stream-control start send failed reason=%s err=%d",
@@ -848,11 +866,12 @@ static bool stream_control_send_start(const char *reason)
         return false;
     }
     log_line("stream-control start-sent reason=%s dt=%I64ums bytes=%u "
-             "video_port=%d codec=%s",
+             "video_port=%d codec=%s fps=%d bitrate=%d keyint=%d",
              reason ? reason : "",
              (unsigned long long)(viewer_now_ms() - t_stage),
              (unsigned)strlen(start), video_port,
-             video_codec ? video_codec : "h265");
+             video_codec ? video_codec : "h265",
+             stream_fps, stream_bitrate_kbps, stream_keyint);
     return true;
 }
 
@@ -901,6 +920,11 @@ static void stream_control_apply_status(const char *status)
     int returned_video;
     int returned_spice;
     int returned_input;
+    int returned_width;
+    int returned_height;
+    int returned_fps;
+    int returned_bitrate;
+    bool size_changed = false;
 
     if (!status || !*status) {
         return;
@@ -913,6 +937,10 @@ static void stream_control_apply_status(const char *status)
     returned_video = json_get_int_field(status, "video_udp", 0);
     returned_spice = json_get_int_field(status, "spice_tcp", 0);
     returned_input = json_get_int_field(status, "input_tcp", 0);
+    returned_width = json_get_int_field(status, "width", 0);
+    returned_height = json_get_int_field(status, "height", 0);
+    returned_fps = json_get_int_field(status, "fps", 0);
+    returned_bitrate = json_get_int_field(status, "bitrate", 0);
 
     if (returned_video > 0 && returned_video <= 65535) {
         video_port = returned_video;
@@ -926,8 +954,26 @@ static void stream_control_apply_status(const char *status)
         native_input_port = returned_input;
         native_input_enabled = true;
     }
-    log_line("stream-control using ports video_udp=%d spice_tcp=%s input_tcp=%d",
-             video_port, spice_port, native_input_port);
+    if (returned_width >= 320 && returned_width <= 16384 &&
+        returned_height >= 180 && returned_height <= 16384 &&
+        (returned_width != source_width || returned_height != source_height)) {
+        source_width = returned_width;
+        source_height = returned_height;
+        size_changed = true;
+    }
+    if (returned_fps >= 1 && returned_fps <= 120) {
+        stream_fps = returned_fps;
+    }
+    if (returned_bitrate >= 256 && returned_bitrate <= 100000) {
+        stream_bitrate_kbps = returned_bitrate;
+    }
+    log_line("stream-control using ports video_udp=%d spice_tcp=%s input_tcp=%d "
+             "size=%dx%d fps=%d bitrate=%d",
+             video_port, spice_port, native_input_port,
+             source_width, source_height, stream_fps, stream_bitrate_kbps);
+    if (size_changed && main_hwnd) {
+        PostMessageA(main_hwnd, WM_STREAM_RESIZE, 0, 0);
+    }
 }
 
 static bool stream_control_start_session(void)
@@ -1241,12 +1287,30 @@ static const char *qcode_from_scancode(guint scancode)
     case 0x42: return "f8";
     case 0x43: return "f9";
     case 0x44: return "f10";
+    case 0x45: return "num_lock";
+    case 0x46: return "scroll_lock";
+    case 0x47: return "kp_7";
+    case 0x48: return "kp_8";
+    case 0x49: return "kp_9";
+    case 0x4a: return "kp_subtract";
+    case 0x4b: return "kp_4";
+    case 0x4c: return "kp_5";
+    case 0x4d: return "kp_6";
+    case 0x4e: return "kp_add";
+    case 0x4f: return "kp_1";
+    case 0x50: return "kp_2";
+    case 0x51: return "kp_3";
+    case 0x52: return "kp_0";
+    case 0x53: return "kp_decimal";
     case 0x57: return "f11";
     case 0x58: return "f12";
     case 0x11c: return "kp_enter";
     case 0x11d: return "ctrl_r";
     case 0x135: return "kp_divide";
     case 0x138: return "alt_r";
+    case 0x15b: return "meta_l";
+    case 0x15c: return "meta_r";
+    case 0x15d: return "menu";
     case 0x147: return "home";
     case 0x148: return "up";
     case 0x149: return "pgup";
@@ -2176,6 +2240,126 @@ static guint scancode_from_lparam(LPARAM lparam)
     return scancode;
 }
 
+static int clamp_int(int value, int minval, int maxval)
+{
+    if (value < minval) {
+        return minval;
+    }
+    if (value > maxval) {
+        return maxval;
+    }
+    return value;
+}
+
+static bool point_in_video(LPARAM lparam)
+{
+    int x = GET_X_LPARAM(lparam);
+    int y = GET_Y_LPARAM(lparam);
+
+    return x >= video_rect.left && x < video_rect.right &&
+           y >= video_rect.top && y < video_rect.bottom;
+}
+
+static void queue_key_scancode(guint scancode, bool down)
+{
+    if (input_transport_ready()) {
+        InputEv *ev = calloc(1, sizeof(*ev));
+        ev->type = INPUT_EV_KEY;
+        ev->scancode = scancode;
+        ev->down = down;
+        queue_input_event_priority(ev, G_PRIORITY_HIGH);
+    }
+}
+
+static void queue_button_event(int button, bool down)
+{
+    if (input_transport_ready()) {
+        InputEv *ev = calloc(1, sizeof(*ev));
+        ev->type = INPUT_EV_BUTTON;
+        ev->button = button;
+        ev->button_state = button_state;
+        ev->down = down;
+        queue_input_event_priority(ev, G_PRIORITY_HIGH);
+    }
+}
+
+static void input_flush_pending_right_ctrl(void)
+{
+    if (!right_ctrl_pending) {
+        return;
+    }
+    queue_key_scancode(0x11d, true);
+    key_down[0x11d] = true;
+    right_ctrl_pending = false;
+    right_ctrl_sent = true;
+    if (input_debug()) {
+        log_line("input capture right-ctrl flushed as guest key");
+    }
+}
+
+static void input_release_capture(const char *reason)
+{
+    int old_buttons = button_state;
+
+    if (input_capture_state == INPUT_CAPTURE_LOCAL) {
+        return;
+    }
+    input_capture_state = INPUT_CAPTURE_RELEASING;
+    if (input_debug()) {
+        log_line("input capture release reason=%s buttons=0x%lx",
+                 reason ? reason : "unknown", (long)button_state);
+    }
+
+    if (right_ctrl_pending) {
+        right_ctrl_pending = false;
+        right_ctrl_sent = false;
+    }
+    if (old_buttons & SPICE_MOUSE_BUTTON_MASK_LEFT) {
+        button_state &= ~SPICE_MOUSE_BUTTON_MASK_LEFT;
+        queue_button_event(SPICE_MOUSE_BUTTON_LEFT, false);
+    }
+    if (old_buttons & SPICE_MOUSE_BUTTON_MASK_RIGHT) {
+        button_state &= ~SPICE_MOUSE_BUTTON_MASK_RIGHT;
+        queue_button_event(SPICE_MOUSE_BUTTON_RIGHT, false);
+    }
+    if (old_buttons & SPICE_MOUSE_BUTTON_MASK_MIDDLE) {
+        button_state &= ~SPICE_MOUSE_BUTTON_MASK_MIDDLE;
+        queue_button_event(SPICE_MOUSE_BUTTON_MIDDLE, false);
+    }
+    for (int i = 0; i < (int)(sizeof(key_down) / sizeof(key_down[0])); i++) {
+        if (key_down[i]) {
+            key_down[i] = false;
+            queue_key_scancode((guint)i, false);
+        }
+    }
+    ReleaseCapture();
+    input_capture_state = INPUT_CAPTURE_LOCAL;
+    right_ctrl_sent = false;
+    SetWindowTextA(main_hwnd, "GVT SPICE Viewer - input released");
+}
+
+static bool input_enter_capture(LPARAM lparam)
+{
+    if (!point_in_video(lparam)) {
+        return false;
+    }
+    if (input_capture_state != INPUT_CAPTURE_CAPTURED) {
+        input_capture_state = INPUT_CAPTURE_CAPTURED;
+        SetFocus(main_hwnd);
+        SetCapture(main_hwnd);
+        SetWindowTextA(main_hwnd, "GVT SPICE Viewer - input captured");
+        if (input_debug()) {
+            log_line("input capture enter");
+        }
+    }
+    return true;
+}
+
+static bool input_is_captured(void)
+{
+    return input_capture_state == INPUT_CAPTURE_CAPTURED;
+}
+
 static RECT initial_window_rect(void)
 {
     RECT work;
@@ -2229,7 +2413,7 @@ static void layout_children(HWND hwnd)
     int video_h;
     int video_x;
     int video_y;
-    int button_w = 64;
+    int button_w = 112;
     int button_h = 24;
 
     GetClientRect(hwnd, &rc);
@@ -2252,8 +2436,8 @@ static void layout_children(HWND hwnd)
     video_rect.right = video_x + video_w;
     video_rect.bottom = video_y + video_h;
 
-    if (auto_button) {
-        MoveWindow(auto_button, client_w - button_w - 8, 4,
+    if (release_button) {
+        MoveWindow(release_button, (client_w - button_w) / 2, 4,
                    button_w, button_h, TRUE);
     }
     if (video_hwnd) {
@@ -2386,12 +2570,12 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
             InitializeCriticalSection(&native_input_lock);
             native_input_lock_ready = true;
         }
-        auto_button = CreateWindowExA(0, "BUTTON", "Auto",
-                                      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                      0, 0, 1, 1, hwnd,
-                                      (HMENU)(INT_PTR)ID_AUTO_SIZE,
-                                      (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE),
-                                      NULL);
+        release_button = CreateWindowExA(0, "BUTTON", "Release input",
+                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                         0, 0, 1, 1, hwnd,
+                                         (HMENU)(INT_PTR)ID_RELEASE_INPUT,
+                                         (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE),
+                                         NULL);
         video_hwnd = CreateWindowExA(0, "STATIC", "",
                                      WS_CHILD | WS_VISIBLE | SS_BLACKRECT,
                                      0, 0, 1, 1, hwnd, NULL,
@@ -2412,6 +2596,9 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
         log_line("WM_STREAM_READY connected=%d", (int)wparam);
         start_media_stack(hwnd);
         return 0;
+    case WM_STREAM_RESIZE:
+        resize_window_to_source(hwnd);
+        return 0;
     case WM_SIZE:
         layout_children(hwnd);
         return 0;
@@ -2419,113 +2606,97 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
         if (LOWORD(wparam) == ID_AUTO_SIZE) {
             resize_window_to_source(hwnd);
             return 0;
+        } else if (LOWORD(wparam) == ID_RELEASE_INPUT) {
+            input_release_capture("button");
+            return 0;
         }
         break;
     case WM_MOUSEMOVE:
+        if (!input_is_captured()) {
+            break;
+        }
+        input_flush_pending_right_ctrl();
         send_position_from_lparam(lparam);
         return 0;
     case WM_LBUTTONDOWN:
         if (input_debug()) {
             log_line("input local left down");
         }
-        SetFocus(hwnd);
-        SetCapture(hwnd);
+        if (!input_enter_capture(lparam)) {
+            break;
+        }
+        input_flush_pending_right_ctrl();
         button_state |= SPICE_MOUSE_BUTTON_MASK_LEFT;
         send_position_from_lparam_priority(lparam, G_PRIORITY_HIGH, false);
-        if (input_transport_ready()) {
-            InputEv *ev = calloc(1, sizeof(*ev));
-            ev->type = INPUT_EV_BUTTON;
-            ev->button = SPICE_MOUSE_BUTTON_LEFT;
-            ev->button_state = button_state;
-            ev->down = true;
-            queue_input_event_priority(ev, G_PRIORITY_HIGH);
-        }
+        queue_button_event(SPICE_MOUSE_BUTTON_LEFT, true);
         return 0;
     case WM_LBUTTONUP:
         if (input_debug()) {
             log_line("input local left up");
         }
+        if (!input_is_captured()) {
+            break;
+        }
+        input_flush_pending_right_ctrl();
         button_state &= ~SPICE_MOUSE_BUTTON_MASK_LEFT;
         send_position_from_lparam_priority(lparam, G_PRIORITY_HIGH, false);
-        if (input_transport_ready()) {
-            InputEv *ev = calloc(1, sizeof(*ev));
-            ev->type = INPUT_EV_BUTTON;
-            ev->button = SPICE_MOUSE_BUTTON_LEFT;
-            ev->button_state = button_state;
-            ev->down = false;
-            queue_input_event_priority(ev, G_PRIORITY_HIGH);
-        }
-        ReleaseCapture();
+        queue_button_event(SPICE_MOUSE_BUTTON_LEFT, false);
         return 0;
     case WM_RBUTTONDOWN:
         if (input_debug()) {
             log_line("input local right down");
         }
-        SetFocus(hwnd);
-        SetCapture(hwnd);
+        if (!input_enter_capture(lparam)) {
+            break;
+        }
+        input_flush_pending_right_ctrl();
         button_state |= SPICE_MOUSE_BUTTON_MASK_RIGHT;
         send_position_from_lparam_priority(lparam, G_PRIORITY_HIGH, false);
-        if (input_transport_ready()) {
-            InputEv *ev = calloc(1, sizeof(*ev));
-            ev->type = INPUT_EV_BUTTON;
-            ev->button = SPICE_MOUSE_BUTTON_RIGHT;
-            ev->button_state = button_state;
-            ev->down = true;
-            queue_input_event_priority(ev, G_PRIORITY_HIGH);
-        }
+        queue_button_event(SPICE_MOUSE_BUTTON_RIGHT, true);
         return 0;
     case WM_RBUTTONUP:
         if (input_debug()) {
             log_line("input local right up");
         }
+        if (!input_is_captured()) {
+            break;
+        }
+        input_flush_pending_right_ctrl();
         button_state &= ~SPICE_MOUSE_BUTTON_MASK_RIGHT;
         send_position_from_lparam_priority(lparam, G_PRIORITY_HIGH, false);
-        if (input_transport_ready()) {
-            InputEv *ev = calloc(1, sizeof(*ev));
-            ev->type = INPUT_EV_BUTTON;
-            ev->button = SPICE_MOUSE_BUTTON_RIGHT;
-            ev->button_state = button_state;
-            ev->down = false;
-            queue_input_event_priority(ev, G_PRIORITY_HIGH);
-        }
-        ReleaseCapture();
+        queue_button_event(SPICE_MOUSE_BUTTON_RIGHT, false);
         return 0;
     case WM_MBUTTONDOWN:
         if (input_debug()) {
             log_line("input local middle down");
         }
-        SetFocus(hwnd);
-        SetCapture(hwnd);
-        button_state |= SPICE_MOUSE_BUTTON_MASK_MIDDLE;
-        if (input_transport_ready()) {
-            InputEv *ev = calloc(1, sizeof(*ev));
-            ev->type = INPUT_EV_BUTTON;
-            ev->button = SPICE_MOUSE_BUTTON_MIDDLE;
-            ev->button_state = button_state;
-            ev->down = true;
-            queue_input_event_priority(ev, G_PRIORITY_HIGH);
+        if (!input_enter_capture(lparam)) {
+            break;
         }
+        input_flush_pending_right_ctrl();
+        button_state |= SPICE_MOUSE_BUTTON_MASK_MIDDLE;
+        queue_button_event(SPICE_MOUSE_BUTTON_MIDDLE, true);
         return 0;
     case WM_MBUTTONUP:
         if (input_debug()) {
             log_line("input local middle up");
         }
-        button_state &= ~SPICE_MOUSE_BUTTON_MASK_MIDDLE;
-        if (input_transport_ready()) {
-            InputEv *ev = calloc(1, sizeof(*ev));
-            ev->type = INPUT_EV_BUTTON;
-            ev->button = SPICE_MOUSE_BUTTON_MIDDLE;
-            ev->button_state = button_state;
-            ev->down = false;
-            queue_input_event_priority(ev, G_PRIORITY_HIGH);
+        if (!input_is_captured()) {
+            break;
         }
-        ReleaseCapture();
+        input_flush_pending_right_ctrl();
+        button_state &= ~SPICE_MOUSE_BUTTON_MASK_MIDDLE;
+        queue_button_event(SPICE_MOUSE_BUTTON_MIDDLE, false);
         return 0;
     case WM_MOUSEWHEEL:
         if (input_debug()) {
             log_line("input local wheel delta=%d",
                      GET_WHEEL_DELTA_WPARAM(wparam));
         }
+        if (!input_is_captured()) {
+            break;
+        }
+        input_flush_pending_right_ctrl();
         if (input_transport_ready()) {
             int button = GET_WHEEL_DELTA_WPARAM(wparam) > 0 ?
                          SPICE_MOUSE_BUTTON_UP : SPICE_MOUSE_BUTTON_DOWN;
@@ -2543,12 +2714,21 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
                      (unsigned long)wparam, scancode_from_lparam(lparam),
                      !!(HIWORD(lparam) & KF_REPEAT));
         }
-        if (input_transport_ready() && !(HIWORD(lparam) & KF_REPEAT)) {
-            InputEv *ev = calloc(1, sizeof(*ev));
-            ev->type = INPUT_EV_KEY;
-            ev->scancode = scancode_from_lparam(lparam);
-            ev->down = true;
-            queue_input_event_priority(ev, G_PRIORITY_HIGH);
+        if (!input_is_captured()) {
+            break;
+        }
+        if (!(HIWORD(lparam) & KF_REPEAT)) {
+            guint scancode = scancode_from_lparam(lparam);
+            if (scancode == 0x11d) {
+                right_ctrl_pending = true;
+                right_ctrl_sent = false;
+            } else {
+                input_flush_pending_right_ctrl();
+                if (scancode < sizeof(key_down) / sizeof(key_down[0])) {
+                    key_down[scancode] = true;
+                }
+                queue_key_scancode(scancode, true);
+            }
         }
         return 0;
     case WM_KEYUP:
@@ -2557,15 +2737,33 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
             log_line("input local key up vk=0x%lx scan=0x%x",
                      (unsigned long)wparam, scancode_from_lparam(lparam));
         }
-        if (input_transport_ready()) {
-            InputEv *ev = calloc(1, sizeof(*ev));
-            ev->type = INPUT_EV_KEY;
-            ev->scancode = scancode_from_lparam(lparam);
-            ev->down = false;
-            queue_input_event_priority(ev, G_PRIORITY_HIGH);
+        if (!input_is_captured()) {
+            break;
+        }
+        {
+            guint scancode = scancode_from_lparam(lparam);
+            if (scancode == 0x11d && right_ctrl_pending && !right_ctrl_sent) {
+                input_release_capture("right-ctrl");
+            } else {
+                if (scancode == 0x11d && right_ctrl_pending) {
+                    input_flush_pending_right_ctrl();
+                }
+                if (scancode < sizeof(key_down) / sizeof(key_down[0])) {
+                    key_down[scancode] = false;
+                }
+                queue_key_scancode(scancode, false);
+                if (scancode == 0x11d) {
+                    right_ctrl_pending = false;
+                    right_ctrl_sent = false;
+                }
+            }
         }
         return 0;
+    case WM_KILLFOCUS:
+        input_release_capture("focus-lost");
+        break;
     case WM_DESTROY:
+        input_release_capture("destroy");
         InterlockedExchange(&shutting_down, 1);
         if (main_loop) {
             p_g_main_loop_quit(main_loop);
@@ -2609,6 +2807,15 @@ static void parse_args(int argc, char **argv)
             video_port = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--video-codec") && i + 1 < argc) {
             video_codec = argv[++i];
+        } else if (!strcmp(argv[i], "--stream-fps") && i + 1 < argc) {
+            stream_fps = clamp_int(atoi(argv[++i]), 1, 120);
+            if (stream_keyint <= 0 || stream_keyint == 59) {
+                stream_keyint = stream_fps;
+            }
+        } else if (!strcmp(argv[i], "--stream-bitrate-kbps") && i + 1 < argc) {
+            stream_bitrate_kbps = clamp_int(atoi(argv[++i]), 256, 100000);
+        } else if (!strcmp(argv[i], "--stream-keyint") && i + 1 < argc) {
+            stream_keyint = clamp_int(atoi(argv[++i]), 1, 300);
         } else if (!strcmp(argv[i], "--stream-control-host") && i + 1 < argc) {
             stream_control_host = argv[++i];
         } else if (!strcmp(argv[i], "--stream-control-port") && i + 1 < argc) {
