@@ -45,8 +45,8 @@
 #define G_PRIORITY_HIGH (-100)
 #define G_PRIORITY_DEFAULT_IDLE 200
 
-#define ID_AUTO_SIZE 1001
-#define ID_RELEASE_INPUT 1002
+#define ID_RELEASE_INPUT 1001
+#define IDI_APP_ICON 101
 #define WM_STREAM_READY (WM_APP + 1)
 #define WM_STREAM_RESIZE (WM_APP + 2)
 #define TOOLBAR_HEIGHT 32
@@ -171,6 +171,8 @@ static void *display_mode_session;
 static HWND main_hwnd;
 static HWND video_hwnd;
 static HWND release_button;
+static HHOOK keyboard_hook;
+static HICON app_icon;
 static RECT video_rect;
 static void *main_channel;
 static void *gst_pipeline;
@@ -209,6 +211,7 @@ static bool native_input_lock_ready;
 static SOCKET native_input_sock = INVALID_SOCKET;
 static SOCKET stream_control_sock = INVALID_SOCKET;
 static volatile LONG stream_control_start_sent;
+static bool stream_control_preconnected;
 static bool winsock_ready;
 static ULONGLONG log_start_ms;
 static int audio_channels;
@@ -245,6 +248,9 @@ static void resize_window_to_source(HWND hwnd);
 static void native_input_close(void);
 static void start_media_stack(HWND hwnd);
 static int run_spice_display_mode(int argc, char **argv);
+static bool input_is_captured(void);
+static void input_release_capture(const char *reason);
+static LRESULT CALLBACK low_level_keyboard_proc(int code, WPARAM wparam, LPARAM lparam);
 
 typedef enum {
     INPUT_EV_POSITION,
@@ -286,6 +292,14 @@ static ULONGLONG viewer_wall_ms(void)
     value.LowPart = ft.dwLowDateTime;
     value.HighPart = ft.dwHighDateTime;
     return value.QuadPart / 10000ULL - 11644473600000ULL;
+}
+
+static HICON get_app_icon(void)
+{
+    if (!app_icon) {
+        app_icon = LoadIconA(GetModuleHandleA(NULL), MAKEINTRESOURCEA(IDI_APP_ICON));
+    }
+    return app_icon ? app_icon : LoadIcon(NULL, IDI_APPLICATION);
 }
 
 static void ensure_log_lock(void)
@@ -1389,7 +1403,12 @@ static DWORD WINAPI stream_control_thread(LPVOID opaque)
     bool connected;
 
     (void)opaque;
-    connected = stream_control_start_session();
+    if (stream_control_sock != INVALID_SOCKET && stream_control_preconnected) {
+        connected = true;
+        log_line("stream-control using preconnected session");
+    } else {
+        connected = stream_control_start_session();
+    }
     if (main_hwnd) {
         PostMessageA(main_hwnd, WM_STREAM_READY, connected ? 1 : 0, 0);
     }
@@ -1590,7 +1609,7 @@ static const char *qcode_from_scancode(guint scancode)
     case 0x34: return "dot";
     case 0x35: return "slash";
     case 0x36: return "shift_r";
-    case 0x37: return "asterisk";
+    case 0x37: return "kp_multiply";
     case 0x38: return "alt";
     case 0x39: return "spc";
     case 0x3a: return "caps_lock";
@@ -2951,6 +2970,29 @@ static bool point_in_video(LPARAM lparam)
            y >= video_rect.top && y < video_rect.bottom;
 }
 
+static bool point_in_release_button(LPARAM lparam)
+{
+    RECT rc;
+    POINT tl;
+    POINT br;
+    int x = GET_X_LPARAM(lparam);
+    int y = GET_Y_LPARAM(lparam);
+
+    if (!release_button || !IsWindowVisible(release_button)) {
+        return false;
+    }
+    if (!GetWindowRect(release_button, &rc)) {
+        return false;
+    }
+    tl.x = rc.left;
+    tl.y = rc.top;
+    br.x = rc.right;
+    br.y = rc.bottom;
+    ScreenToClient(main_hwnd, &tl);
+    ScreenToClient(main_hwnd, &br);
+    return x >= tl.x && x < br.x && y >= tl.y && y < br.y;
+}
+
 static void queue_key_scancode(guint scancode, bool down)
 {
     if (input_transport_ready()) {
@@ -2974,6 +3016,51 @@ static void queue_button_event(int button, bool down)
     }
 }
 
+static void input_update_clip(void)
+{
+    RECT rc;
+    POINT tl;
+    POINT br;
+
+    if (!main_hwnd || input_capture_state != INPUT_CAPTURE_CAPTURED) {
+        return;
+    }
+    if (!GetClientRect(main_hwnd, &rc)) {
+        return;
+    }
+    tl.x = rc.left;
+    tl.y = rc.top;
+    br.x = rc.right;
+    br.y = rc.bottom;
+    ClientToScreen(main_hwnd, &tl);
+    ClientToScreen(main_hwnd, &br);
+    rc.left = tl.x;
+    rc.top = tl.y;
+    rc.right = br.x;
+    rc.bottom = br.y;
+    ClipCursor(&rc);
+}
+
+static void input_install_keyboard_hook(void)
+{
+    if (keyboard_hook) {
+        return;
+    }
+    keyboard_hook = SetWindowsHookExA(WH_KEYBOARD_LL, low_level_keyboard_proc,
+                                      GetModuleHandleA(NULL), 0);
+    if (!keyboard_hook) {
+        log_line("input capture keyboard hook failed err=%lu", GetLastError());
+    }
+}
+
+static void input_uninstall_keyboard_hook(void)
+{
+    if (keyboard_hook) {
+        UnhookWindowsHookEx(keyboard_hook);
+        keyboard_hook = NULL;
+    }
+}
+
 static void input_flush_pending_right_ctrl(void)
 {
     if (!right_ctrl_pending) {
@@ -2986,6 +3073,75 @@ static void input_flush_pending_right_ctrl(void)
     if (input_debug()) {
         log_line("input capture right-ctrl flushed as guest key");
     }
+}
+
+static bool input_handle_key_scancode(guint scancode, bool down, bool repeat,
+                                      const char *source)
+{
+    if (!input_is_captured()) {
+        return false;
+    }
+    if (input_debug()) {
+        log_line("input capture key %s scan=0x%x down=%d repeat=%d",
+                 source ? source : "unknown", scancode, down, repeat);
+    }
+
+    if (down) {
+        if (scancode == 0x11d && !right_ctrl_pending && !right_ctrl_sent) {
+            right_ctrl_pending = true;
+            return true;
+        }
+        if (scancode < sizeof(key_down) / sizeof(key_down[0]) && key_down[scancode]) {
+            return true;
+        }
+        input_flush_pending_right_ctrl();
+        if (scancode < sizeof(key_down) / sizeof(key_down[0])) {
+            key_down[scancode] = true;
+        }
+        queue_key_scancode(scancode, true);
+        return true;
+    }
+
+    if (scancode == 0x11d && right_ctrl_pending && !right_ctrl_sent) {
+        input_release_capture("right-ctrl");
+        return true;
+    }
+    if (scancode == 0x11d && right_ctrl_pending) {
+        input_flush_pending_right_ctrl();
+    }
+    if (scancode < sizeof(key_down) / sizeof(key_down[0])) {
+        key_down[scancode] = false;
+    }
+    queue_key_scancode(scancode, false);
+    if (scancode == 0x11d) {
+        right_ctrl_pending = false;
+        right_ctrl_sent = false;
+    }
+    return true;
+}
+
+static LRESULT CALLBACK low_level_keyboard_proc(int code, WPARAM wparam, LPARAM lparam)
+{
+    KBDLLHOOKSTRUCT *kbd = (KBDLLHOOKSTRUCT *)lparam;
+    guint scancode;
+    bool down;
+    bool repeat = false;
+
+    if (code == HC_ACTION && kbd && input_is_captured()) {
+        down = (wparam == WM_KEYDOWN || wparam == WM_SYSKEYDOWN);
+        if (down || wparam == WM_KEYUP || wparam == WM_SYSKEYUP) {
+            scancode = (guint)(kbd->scanCode & 0xff);
+            if (kbd->flags & LLKHF_EXTENDED) {
+                scancode |= 0x100;
+            }
+            if (down && scancode < sizeof(key_down) / sizeof(key_down[0])) {
+                repeat = key_down[scancode];
+            }
+            input_handle_key_scancode(scancode, down, repeat, "hook");
+            return 1;
+        }
+    }
+    return CallNextHookEx(keyboard_hook, code, wparam, lparam);
 }
 
 static void input_release_capture(const char *reason)
@@ -3005,6 +3161,8 @@ static void input_release_capture(const char *reason)
         right_ctrl_pending = false;
         right_ctrl_sent = false;
     }
+    input_uninstall_keyboard_hook();
+    ClipCursor(NULL);
     if (old_buttons & SPICE_MOUSE_BUTTON_MASK_LEFT) {
         button_state &= ~SPICE_MOUSE_BUTTON_MASK_LEFT;
         queue_button_event(SPICE_MOUSE_BUTTON_LEFT, false);
@@ -3038,6 +3196,8 @@ static bool input_enter_capture(LPARAM lparam)
         input_capture_state = INPUT_CAPTURE_CAPTURED;
         SetFocus(main_hwnd);
         SetCapture(main_hwnd);
+        input_install_keyboard_hook();
+        input_update_clip();
         SetWindowTextA(main_hwnd, "GVT SPICE Viewer - input captured");
         if (input_debug()) {
             log_line("input capture enter");
@@ -3104,8 +3264,8 @@ static void layout_children(HWND hwnd)
     int video_h;
     int video_x;
     int video_y;
-    int button_w = 112;
-    int button_h = 24;
+    int button_w = 184;
+    int button_h = 28;
 
     GetClientRect(hwnd, &rc);
     client_w = max(1, rc.right - rc.left);
@@ -3128,13 +3288,14 @@ static void layout_children(HWND hwnd)
     video_rect.bottom = video_y + video_h;
 
     if (release_button) {
-        MoveWindow(release_button, (client_w - button_w) / 2, 4,
+        MoveWindow(release_button, (client_w - button_w) / 2, 2,
                    button_w, button_h, TRUE);
     }
     if (video_hwnd) {
         MoveWindow(video_hwnd, video_rect.left, video_rect.top,
                    video_w, video_h, TRUE);
     }
+    input_update_clip();
 }
 
 static void resize_window_to_source(HWND hwnd)
@@ -3191,6 +3352,41 @@ static void resize_window_to_source(HWND hwnd)
     layout_children(hwnd);
 }
 
+static BOOL draw_release_button(LPARAM lp)
+{
+    DRAWITEMSTRUCT *dis = (DRAWITEMSTRUCT *)lp;
+    HBRUSH brush;
+    HPEN pen;
+    HBRUSH old_brush;
+    HPEN old_pen;
+    RECT rc;
+    COLORREF fill;
+    COLORREF border;
+    COLORREF text;
+
+    if (!dis || dis->CtlID != ID_RELEASE_INPUT) {
+        return FALSE;
+    }
+    rc = dis->rcItem;
+    fill = (dis->itemState & ODS_SELECTED) ? RGB(0, 96, 180) : RGB(0, 120, 215);
+    border = RGB(0, 96, 180);
+    text = RGB(255, 255, 255);
+    brush = CreateSolidBrush(fill);
+    pen = CreatePen(PS_SOLID, 1, border);
+    old_brush = (HBRUSH)SelectObject(dis->hDC, brush);
+    old_pen = (HPEN)SelectObject(dis->hDC, pen);
+    RoundRect(dis->hDC, rc.left, rc.top, rc.right, rc.bottom, 8, 8);
+    SetBkMode(dis->hDC, TRANSPARENT);
+    SetTextColor(dis->hDC, text);
+    DrawTextA(dis->hDC, "Release input   Right Ctrl", -1, &rc,
+              DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+    SelectObject(dis->hDC, old_brush);
+    SelectObject(dis->hDC, old_pen);
+    DeleteObject(brush);
+    DeleteObject(pen);
+    return TRUE;
+}
+
 static DWORD WINAPI gst_receiver_thread(LPVOID opaque)
 {
     ULONGLONG t0 = viewer_now_ms();
@@ -3239,7 +3435,7 @@ static void start_media_stack(HWND hwnd)
     CreateThread(NULL, 0, gst_receiver_thread, NULL, 0, NULL);
     SetWindowTextA(hwnd, "GVT SPICE Viewer - video embedded, waiting for inputs");
     if (auto_size_on_start) {
-        PostMessageA(hwnd, WM_COMMAND, ID_AUTO_SIZE, 0);
+        resize_window_to_source(hwnd);
     }
     log_line("media-stack ready total=%I64ums",
              (unsigned long long)(viewer_now_ms() - t0));
@@ -3262,8 +3458,8 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
             InitializeCriticalSection(&native_input_lock);
             native_input_lock_ready = true;
         }
-        release_button = CreateWindowExA(0, "BUTTON", "Release input",
-                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        release_button = CreateWindowExA(0, "BUTTON", "Release input   Right Ctrl",
+                                         WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                                          0, 0, 1, 1, hwnd,
                                          (HMENU)(INT_PTR)ID_RELEASE_INPUT,
                                          (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE),
@@ -3296,12 +3492,14 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
         layout_children(hwnd);
         return 0;
     case WM_COMMAND:
-        if (LOWORD(wparam) == ID_AUTO_SIZE) {
-            resize_window_to_source(hwnd);
-            return 0;
-        } else if (LOWORD(wparam) == ID_RELEASE_INPUT) {
+        if (LOWORD(wparam) == ID_RELEASE_INPUT) {
             input_release_capture("button");
             return 0;
+        }
+        break;
+    case WM_DRAWITEM:
+        if (draw_release_button(lparam)) {
+            return TRUE;
         }
         break;
     case WM_DROPFILES:
@@ -3312,12 +3510,19 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
         if (!input_is_captured()) {
             break;
         }
+        if (!point_in_video(lparam)) {
+            return 0;
+        }
         input_flush_pending_right_ctrl();
         send_position_from_lparam(lparam);
         return 0;
     case WM_LBUTTONDOWN:
         if (input_debug()) {
             log_line("input local left down");
+        }
+        if (input_is_captured() && point_in_release_button(lparam)) {
+            input_release_capture("button");
+            return 0;
         }
         if (!input_enter_capture(lparam)) {
             break;
@@ -3411,51 +3616,22 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
                      (unsigned long)wparam, scancode_from_lparam(lparam),
                      !!(HIWORD(lparam) & KF_REPEAT));
         }
-        if (!input_is_captured()) {
-            break;
+        if (input_handle_key_scancode(scancode_from_lparam(lparam), true,
+                                      !!(HIWORD(lparam) & KF_REPEAT), "window")) {
+            return 0;
         }
-        if (!(HIWORD(lparam) & KF_REPEAT)) {
-            guint scancode = scancode_from_lparam(lparam);
-            if (scancode == 0x11d) {
-                right_ctrl_pending = true;
-                right_ctrl_sent = false;
-            } else {
-                input_flush_pending_right_ctrl();
-                if (scancode < sizeof(key_down) / sizeof(key_down[0])) {
-                    key_down[scancode] = true;
-                }
-                queue_key_scancode(scancode, true);
-            }
-        }
-        return 0;
+        break;
     case WM_KEYUP:
     case WM_SYSKEYUP:
         if (input_debug()) {
             log_line("input local key up vk=0x%lx scan=0x%x",
                      (unsigned long)wparam, scancode_from_lparam(lparam));
         }
-        if (!input_is_captured()) {
-            break;
+        if (input_handle_key_scancode(scancode_from_lparam(lparam), false,
+                                      false, "window")) {
+            return 0;
         }
-        {
-            guint scancode = scancode_from_lparam(lparam);
-            if (scancode == 0x11d && right_ctrl_pending && !right_ctrl_sent) {
-                input_release_capture("right-ctrl");
-            } else {
-                if (scancode == 0x11d && right_ctrl_pending) {
-                    input_flush_pending_right_ctrl();
-                }
-                if (scancode < sizeof(key_down) / sizeof(key_down[0])) {
-                    key_down[scancode] = false;
-                }
-                queue_key_scancode(scancode, false);
-                if (scancode == 0x11d) {
-                    right_ctrl_pending = false;
-                    right_ctrl_sent = false;
-                }
-            }
-        }
-        return 0;
+        break;
     case WM_KILLFOCUS:
         input_release_capture("focus-lost");
         break;
@@ -3600,7 +3776,13 @@ int WINAPI WinMain(HINSTANCE hinst, HINSTANCE prev, LPSTR cmdline, int show)
     wc.lpszClassName = "GVTSpiceViewerWindow";
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hIcon = get_app_icon();
     RegisterClassA(&wc);
+
+    if (stream_control_enabled) {
+        log_line("stream-control preconnect before window");
+        stream_control_preconnected = stream_control_start_session();
+    }
 
     RECT wr = initial_window_rect();
     main_hwnd = CreateWindowExA(0, wc.lpszClassName,

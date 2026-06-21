@@ -319,8 +319,7 @@ try {
         "$VideoPort",
         "--native-input",
         "--spice-input-tablet",
-        "--no-drop-on-latency",
-        "--auto-size"
+        "--no-drop-on-latency"
     )
     $missing = @(Test-CommandLineContains -CommandLine $viewerCommandLine -Needles $needles)
     if ($missing.Count -gt 0) {

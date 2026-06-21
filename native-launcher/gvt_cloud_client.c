@@ -14,6 +14,9 @@
 #ifndef PROCESS_QUERY_LIMITED_INFORMATION
 #define PROCESS_QUERY_LIMITED_INFORMATION 0x1000
 #endif
+#ifndef CB_SETCUEBANNER
+#define CB_SETCUEBANNER 0x1703
+#endif
 
 #define IDC_ENDPOINT 1001
 #define IDC_CONNECT 1002
@@ -64,6 +67,7 @@
 #define WM_TRAYICON (WM_APP + 1)
 #define TRAY_ICON_ID 1
 #define TIMER_RECONNECT_ID 10
+#define IDI_APP_ICON 101
 
 typedef struct {
     wchar_t id[64];
@@ -124,6 +128,7 @@ static int selected_connection = -1;
 static int edit_index = -1;
 static BOOL edit_is_new = FALSE;
 static BOOL tray_icon_added = FALSE;
+static HICON app_icon;
 
 static HWND edit_endpoint;
 static HWND edit_name;
@@ -154,6 +159,14 @@ static COLORREF color_blue = RGB(0, 120, 215);
 static COLORREF color_text = RGB(18, 32, 64);
 static COLORREF color_muted = RGB(103, 116, 142);
 static COLORREF color_border = RGB(210, 218, 230);
+
+static LRESULT paint_control_background(WPARAM wp)
+{
+    HDC hdc = (HDC)wp;
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, color_text);
+    return (LRESULT)GetStockObject(WHITE_BRUSH);
+}
 
 static void path_join(wchar_t *out, size_t out_count, const wchar_t *a, const wchar_t *b)
 {
@@ -223,6 +236,14 @@ static void set_status(const wchar_t *text)
     }
 }
 
+static HICON get_app_icon(void)
+{
+    if (!app_icon && app_instance) {
+        app_icon = LoadIconW(app_instance, MAKEINTRESOURCEW(IDI_APP_ICON));
+    }
+    return app_icon ? app_icon : LoadIcon(NULL, IDI_APPLICATION);
+}
+
 static void update_tray_icon(BOOL add)
 {
     NOTIFYICONDATAW nid;
@@ -232,7 +253,7 @@ static void update_tray_icon(BOOL add)
     nid.uID = TRAY_ICON_ID;
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
-    nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    nid.hIcon = get_app_icon();
     wcsncpy(nid.szTip, L"GVT Cloud Client", sizeof(nid.szTip) / sizeof(nid.szTip[0]) - 1);
     if (add) {
         if (!tray_icon_added && Shell_NotifyIconW(NIM_ADD, &nid)) {
@@ -335,6 +356,7 @@ static void normalize_connection(Connection *conn)
         wcsncpy(conn->codec, settings.codec, 15);
         conn->codec[15] = 0;
     }
+    conn->use_remote_resolution = TRUE;
 }
 
 static void make_connection_id(wchar_t *out, size_t out_count, const wchar_t *endpoint)
@@ -532,6 +554,7 @@ static void load_settings(void)
     ensure_range_int(&settings.fps, 1, 120, 59);
     ensure_range_int(&settings.bitrate_mbps, 1, 100, 18);
     ensure_range_int(&settings.latency_ms, 1, 500, 15);
+    settings.use_remote_resolution = TRUE;
     free(text);
 }
 
@@ -936,7 +959,7 @@ static BOOL start_viewer_for_connection(int index, BOOL force_start, BOOL auto_r
     append_flag_int(cmd, 8192, L"--input-port", input_port);
     append_flag_value(cmd, 8192, L"--stream-control-host", host);
     append_flag_int(cmd, 8192, L"--stream-control-port", video_port);
-    wcsncat(cmd, L" --native-input --invert-case --spice-input-tablet --no-drop-on-latency --auto-size",
+    wcsncat(cmd, L" --native-input --invert-case --spice-input-tablet --no-drop-on-latency",
             8192 - wcslen(cmd) - 1);
     append_portable_runtime_args(cmd, 8192);
 
@@ -962,9 +985,7 @@ static BOOL start_viewer_for_connection(int index, BOOL force_start, BOOL auto_r
     fill_endpoint_combo();
     refresh_cards();
 
-    _snwprintf(status, 256, L"Connected to %s with %s, %d fps, %d Mbps.",
-               conn->endpoint, !_wcsicmp(conn->codec, L"h265") ? L"H.265" : L"H.264",
-               conn->fps, conn->bitrate_mbps);
+    _snwprintf(status, 256, L"Connected");
     status[255] = 0;
     set_status(status);
     if (conn->minimize_tray_on_connect) {
@@ -1137,6 +1158,11 @@ static BOOL draw_thumbnail_file(HDC hdc, const wchar_t *path, RECT rc)
 
 static void draw_app_icon(HDC hdc, int x, int y, int size)
 {
+    HICON icon = get_app_icon();
+    if (icon) {
+        DrawIconEx(hdc, x, y, icon, size, size, 0, NULL, DI_NORMAL);
+        return;
+    }
     HBRUSH blue = CreateSolidBrush(color_blue);
     HPEN pen = CreatePen(PS_SOLID, 1, color_blue);
     HBRUSH old_brush = (HBRUSH)SelectObject(hdc, blue);
@@ -1150,6 +1176,40 @@ static void draw_app_icon(HDC hdc, int x, int y, int size)
     SelectObject(hdc, old_brush);
     SelectObject(hdc, old_pen);
     DeleteObject(blue);
+    DeleteObject(pen);
+}
+
+static void draw_button_monitor_icon(HDC hdc, int x, int y, int size, COLORREF color)
+{
+    HPEN pen = CreatePen(PS_SOLID, 2, color);
+    HPEN old_pen = (HPEN)SelectObject(hdc, pen);
+    HBRUSH old_brush = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    int left = x + size / 8;
+    int top = y + size / 5;
+    int right = x + size - size / 8;
+    int bottom = y + size * 3 / 5;
+    RoundRect(hdc, left, top, right, bottom, 3, 3);
+    MoveToEx(hdc, x + size / 2, bottom, NULL);
+    LineTo(hdc, x + size / 2, y + size * 4 / 5);
+    MoveToEx(hdc, x + size / 3, y + size * 4 / 5, NULL);
+    LineTo(hdc, x + size * 2 / 3, y + size * 4 / 5);
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
+    DeleteObject(pen);
+}
+
+static void draw_button_plus_icon(HDC hdc, int x, int y, int size, COLORREF color)
+{
+    HPEN pen = CreatePen(PS_SOLID, 2, color);
+    HPEN old_pen = (HPEN)SelectObject(hdc, pen);
+    HBRUSH old_brush = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    Ellipse(hdc, x + 2, y + 2, x + size - 2, y + size - 2);
+    MoveToEx(hdc, x + size / 2, y + size / 4, NULL);
+    LineTo(hdc, x + size / 2, y + size * 3 / 4);
+    MoveToEx(hdc, x + size / 4, y + size / 2, NULL);
+    LineTo(hdc, x + size * 3 / 4, y + size / 2);
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
     DeleteObject(pen);
 }
 
@@ -1197,8 +1257,28 @@ static BOOL draw_button_item(LPARAM lp)
         Ellipse(dis->hDC, cx - 2, cy + 8, cx + 3, cy + 13);
         DeleteObject(dots);
     } else {
-        draw_text_color(dis->hDC, text, rc, ui_font, text_color,
-                        DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+        RECT text_rc = rc;
+        if (dis->CtlID == IDC_CONNECT) {
+            int icon = 26;
+            int icon_x = rc.left + 28;
+            int icon_y = rc.top + ((rc.bottom - rc.top) - icon) / 2;
+            draw_button_monitor_icon(dis->hDC, icon_x, icon_y, icon,
+                                     primary ? RGB(255, 255, 255) : text_color);
+            text_rc.left += 56;
+            draw_text_color(dis->hDC, text, text_rc, ui_font, text_color,
+                            DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+        } else if (dis->CtlID == IDC_ADD_CONNECTION) {
+            int icon = 25;
+            int icon_x = rc.left + 28;
+            int icon_y = rc.top + ((rc.bottom - rc.top) - icon) / 2;
+            draw_button_plus_icon(dis->hDC, icon_x, icon_y, icon, color_blue);
+            text_rc.left += 54;
+            draw_text_color(dis->hDC, text, text_rc, ui_font, text_color,
+                            DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+        } else {
+            draw_text_color(dis->hDC, text, rc, ui_font, text_color,
+                            DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+        }
     }
     SelectObject(dis->hDC, old_brush);
     SelectObject(dis->hDC, old_pen);
@@ -1213,16 +1293,16 @@ static void draw_main_background(HDC hdc, RECT rc)
     HBRUSH band = CreateSolidBrush(RGB(246, 248, 252));
     HPEN border = CreatePen(PS_SOLID, 1, color_border);
     FillRect(hdc, &rc, white);
-    RECT top = {0, 0, rc.right, 86};
+    RECT top = {0, 0, rc.right, 92};
     FillRect(hdc, &top, white);
-    RECT toolbar = {0, 86, rc.right, 176};
+    RECT toolbar = {0, 92, rc.right, 220};
     FillRect(hdc, &toolbar, band);
-    RECT bottom = {0, rc.bottom - 48, rc.right, rc.bottom};
+    RECT bottom = {0, rc.bottom - 64, rc.right, rc.bottom};
     FillRect(hdc, &bottom, band);
     SelectObject(hdc, border);
-    MoveToEx(hdc, 0, 86, NULL); LineTo(hdc, rc.right, 86);
-    MoveToEx(hdc, 0, 176, NULL); LineTo(hdc, rc.right, 176);
-    MoveToEx(hdc, 0, rc.bottom - 48, NULL); LineTo(hdc, rc.right, rc.bottom - 48);
+    MoveToEx(hdc, 0, 92, NULL); LineTo(hdc, rc.right, 92);
+    MoveToEx(hdc, 0, 220, NULL); LineTo(hdc, rc.right, 220);
+    MoveToEx(hdc, 0, rc.bottom - 64, NULL); LineTo(hdc, rc.right, rc.bottom - 64);
     DeleteObject(border);
     DeleteObject(white);
     DeleteObject(band);
@@ -1264,7 +1344,7 @@ static LRESULT CALLBACK card_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             edit_is_new = FALSE;
             CreateWindowExW(WS_EX_DLGMODALFRAME, EDIT_CLASS_NAME, L"GVT Cloud Client | Edit Connection",
                             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                            CW_USEDEFAULT, CW_USEDEFAULT, 880, 760,
+                            CW_USEDEFAULT, CW_USEDEFAULT, 1088, 920,
                             main_window, NULL, app_instance, NULL);
         } else if (cmd == 3 && index >= 0 && index < connection_count) {
             stop_connection_viewer(&connections[index]);
@@ -1348,9 +1428,9 @@ static void refresh_cards(void)
 {
     RECT rc;
     int left = 26;
-    int top = 216;
-    int card_w = 260;
-    int card_h = 316;
+    int top = 260;
+    int card_w = 262;
+    int card_h = 318;
     int gap = 20;
     int columns;
     if (!main_window) return;
@@ -1385,13 +1465,13 @@ static void layout_main_window(void)
     if (!main_window) return;
     GetClientRect(main_window, &rc);
     w = rc.right;
-    MoveWindow(settings_button, 20, 50, 78, 28, TRUE);
-    MoveWindow(help_button, 112, 50, 60, 28, TRUE);
-    MoveWindow(endpoint_combo, 30, 126, w - 560, 38, TRUE);
-    MoveWindow(connect_button, w - 520, 126, 150, 38, TRUE);
-    MoveWindow(add_button, w - 340, 126, 170, 38, TRUE);
-    MoveWindow(more_button, w - 136, 126, 54, 38, TRUE);
-    MoveWindow(status_label, w - 180, rc.bottom - 38, 150, 28, TRUE);
+    MoveWindow(settings_button, 20, 52, 78, 30, TRUE);
+    MoveWindow(help_button, 112, 52, 60, 30, TRUE);
+    MoveWindow(endpoint_combo, 31, 130, max(260, w - 589), 220, TRUE);
+    MoveWindow(connect_button, w - 522, 128, 172, 56, TRUE);
+    MoveWindow(add_button, w - 303, 128, 209, 56, TRUE);
+    MoveWindow(more_button, w - 77, 128, 50, 56, TRUE);
+    MoveWindow(status_label, w - 112, rc.bottom - 44, 92, 28, TRUE);
     refresh_cards();
 }
 
@@ -1418,7 +1498,7 @@ static BOOL collect_edit_connection(Connection *out)
     out->fps = get_int_from_edit(edit_fps, settings.fps);
     out->bitrate_mbps = get_int_from_edit(edit_bitrate, settings.bitrate_mbps);
     out->latency_ms = get_int_from_edit(edit_latency, settings.latency_ms);
-    out->use_remote_resolution = get_check(edit_remote_res);
+    out->use_remote_resolution = TRUE;
     out->reconnect = get_check(edit_reconnect);
     out->reconnect_attempts = get_int_from_edit(edit_reconnect_attempts, settings.reconnect_attempts);
     out->reconnect_interval_sec = get_int_from_edit(edit_reconnect_interval, settings.reconnect_interval_sec);
@@ -1494,7 +1574,8 @@ static LRESULT CALLBACK edit_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         make_label(hwnd, L"Latency target (ms):", 78, 440, 190, 28);
         edit_latency = make_number_edit(hwnd, IDC_EDIT_LATENCY, temp.latency_ms, 270, 434, 170, 34);
         edit_remote_res = make_checkbox(hwnd, IDC_EDIT_REMOTE_RES, L"Use remote desktop resolution",
-                                        temp.use_remote_resolution, 500, 344, 280, 28);
+                                        TRUE, 500, 344, 280, 28);
+        EnableWindow(edit_remote_res, FALSE);
         make_label(hwnd, L"Higher bitrate may improve image quality.", 78, 492, 420, 26);
         make_label(hwnd, L"Connection behavior", 58, 548, 260, 28);
         make_label(hwnd, L"Transport:     RTP + TCP", 78, 594, 260, 28);
@@ -1543,6 +1624,9 @@ static LRESULT CALLBACK edit_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         break;
     case WM_DRAWITEM:
         return draw_button_item(lp);
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+        return paint_control_background(wp);
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
@@ -1556,7 +1640,7 @@ static void collect_settings_window(void)
     settings.fps = get_int_from_edit(set_fps, 59);
     settings.bitrate_mbps = get_int_from_edit(set_bitrate, 18);
     settings.latency_ms = get_int_from_edit(set_latency, 15);
-    settings.use_remote_resolution = get_check(set_remote_res);
+    settings.use_remote_resolution = TRUE;
     settings.reconnect = get_check(set_reconnect);
     settings.reconnect_attempts = get_int_from_edit(set_reconnect_attempts, 3);
     settings.reconnect_interval_sec = get_int_from_edit(set_reconnect_interval, 5);
@@ -1586,7 +1670,8 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         make_label(hwnd, L"Default latency target (ms):", 84, 400, 240, 28);
         set_latency = make_number_edit(hwnd, IDC_SET_LATENCY, settings.latency_ms, 320, 394, 220, 34);
         set_remote_res = make_checkbox(hwnd, IDC_SET_REMOTE_RES, L"Use remote desktop resolution",
-                                       settings.use_remote_resolution, 84, 456, 320, 28);
+                                       TRUE, 84, 456, 320, 28);
+        EnableWindow(set_remote_res, FALSE);
         make_label(hwnd, L"These defaults are applied when creating a new connection.", 84, 500, 520, 26);
         make_label(hwnd, L"Default session behavior", 66, 562, 320, 28);
         make_label(hwnd, L"Transport:     RTP + TCP", 84, 612, 280, 28);
@@ -1617,7 +1702,7 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             DestroyWindow(hwnd);
             CreateWindowExW(WS_EX_DLGMODALFRAME, SETTINGS_CLASS_NAME, L"GVT Cloud Client | Settings",
                             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                            CW_USEDEFAULT, CW_USEDEFAULT, 900, 920,
+                            CW_USEDEFAULT, CW_USEDEFAULT, 1088, 1060,
                             main_window, NULL, app_instance, NULL);
             return 0;
         case IDC_SET_SAVE:
@@ -1637,6 +1722,9 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         break;
     case WM_DRAWITEM:
         return draw_button_item(lp);
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+        return paint_control_background(wp);
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
@@ -1726,10 +1814,12 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         endpoint_combo = make_control(hwnd, L"COMBOBOX", L"",
                                       CBS_DROPDOWN | CBS_AUTOHSCROLL, WS_EX_CLIENTEDGE,
                                       IDC_ENDPOINT, 30, 126, 600, 180);
+        SendMessageW(endpoint_combo, CB_SETCUEBANNER, 0,
+                     (LPARAM)L"Enter a server address (e.g. 192.168.0.188:5004) or search");
         connect_button = make_button(hwnd, L"Connect", IDC_CONNECT, 660, 126, 150, 38);
         add_button = make_button(hwnd, L"Add Connection", IDC_ADD_CONNECTION, 830, 126, 170, 38);
         more_button = make_button(hwnd, L"...", IDC_MORE, 1020, 126, 54, 38);
-        status_label = make_label(hwnd, L"Ready", 900, 690, 140, 28);
+        status_label = make_label(hwnd, L"Ready", 900, 690, 92, 28);
         fill_endpoint_combo();
         refresh_cards();
         SetTimer(hwnd, TIMER_RECONNECT_ID, 1000, NULL);
@@ -1781,13 +1871,13 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         RECT title = {54, 12, 320, 44};
         draw_text_color(hdc, L"GVT Cloud Client", title, title_font, RGB(24, 24, 24),
                         DT_SINGLELINE | DT_VCENTER);
-        RECT bottom = {26, rc.bottom - 34, 180, rc.bottom - 8};
+        RECT bottom = {26, rc.bottom - 46, 180, rc.bottom - 18};
         wchar_t count_text[64];
         _snwprintf(count_text, 64, L"%d device%s", connection_count, connection_count == 1 ? L"" : L"s");
         draw_text_color(hdc, count_text, bottom, ui_font, color_text, DT_SINGLELINE | DT_VCENTER);
         HBRUSH green = CreateSolidBrush(RGB(25, 174, 45));
         SelectObject(hdc, green);
-        Ellipse(hdc, rc.right - 142, rc.bottom - 28, rc.right - 128, rc.bottom - 14);
+        Ellipse(hdc, rc.right - 142, rc.bottom - 36, rc.right - 128, rc.bottom - 22);
         DeleteObject(green);
         EndPaint(hwnd, &ps);
         return 0;
@@ -1802,13 +1892,13 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             edit_is_new = TRUE;
             CreateWindowExW(WS_EX_DLGMODALFRAME, EDIT_CLASS_NAME, L"GVT Cloud Client | Edit Connection",
                             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                            CW_USEDEFAULT, CW_USEDEFAULT, 880, 800,
+                            CW_USEDEFAULT, CW_USEDEFAULT, 1088, 920,
                             hwnd, NULL, app_instance, NULL);
             return 0;
         case IDC_SETTINGS:
             CreateWindowExW(WS_EX_DLGMODALFRAME, SETTINGS_CLASS_NAME, L"GVT Cloud Client | Settings",
                             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                            CW_USEDEFAULT, CW_USEDEFAULT, 900, 920,
+                            CW_USEDEFAULT, CW_USEDEFAULT, 1088, 1060,
                             hwnd, NULL, app_instance, NULL);
             return 0;
         case IDC_HELP_BUTTON:
@@ -1834,6 +1924,9 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         break;
     case WM_DRAWITEM:
         return draw_button_item(lp);
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
+        return paint_control_background(wp);
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_RECONNECT_ID);
         update_tray_icon(FALSE);
@@ -1871,7 +1964,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmdline, int show)
     wc.lpszClassName = L"GVTCloudClientWindow";
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    wc.hIcon = get_app_icon();
     RegisterClassW(&wc);
 
     card_wc.lpfnWndProc = card_proc;
@@ -1886,6 +1979,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmdline, int show)
     edit_wc.lpszClassName = EDIT_CLASS_NAME;
     edit_wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     edit_wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    edit_wc.hIcon = get_app_icon();
     RegisterClassW(&edit_wc);
 
     settings_wc.lpfnWndProc = settings_proc;
@@ -1893,11 +1987,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmdline, int show)
     settings_wc.lpszClassName = SETTINGS_CLASS_NAME;
     settings_wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     settings_wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    settings_wc.hIcon = get_app_icon();
     RegisterClassW(&settings_wc);
 
     hwnd = CreateWindowExW(0, wc.lpszClassName, L"GVT Cloud Client",
                            WS_OVERLAPPEDWINDOW,
-                           CW_USEDEFAULT, CW_USEDEFAULT, 1180, 780,
+                           CW_USEDEFAULT, CW_USEDEFAULT, 1450, 1088,
                            NULL, NULL, instance, NULL);
     if (!hwnd) return 1;
     ShowWindow(hwnd, show);
