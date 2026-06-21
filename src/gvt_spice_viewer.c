@@ -52,6 +52,7 @@
 #define STREAM_CONTROL_POLL_TIMEOUT_MS 500
 #define STREAM_CONTROL_SIZE_POLL_MS 500
 #define STREAM_CONTROL_SIZE_POLL_WINDOW_MS 10000
+#define STREAM_FRAME_META_QUEUE 256
 
 typedef void *gpointer;
 typedef int gboolean;
@@ -254,6 +255,9 @@ typedef struct StreamFrameMeta {
     char mode[16];
 } StreamFrameMeta;
 static StreamFrameMeta stream_frame_meta;
+static StreamFrameMeta stream_frame_meta_queue[STREAM_FRAME_META_QUEUE];
+static unsigned int stream_frame_meta_queue_next;
+static unsigned int stream_frame_meta_queue_len;
 static volatile LONG stream_frame_meta_valid;
 static CRITICAL_SECTION stream_frame_meta_lock;
 static volatile LONG stream_frame_meta_lock_state;
@@ -1399,12 +1403,22 @@ static void stream_frame_meta_store(const StreamFrameMeta *meta)
     ensure_stream_frame_meta_lock();
     EnterCriticalSection(&stream_frame_meta_lock);
     stream_frame_meta = *meta;
+    stream_frame_meta_queue[stream_frame_meta_queue_next] = *meta;
+    stream_frame_meta_queue_next =
+        (stream_frame_meta_queue_next + 1) % STREAM_FRAME_META_QUEUE;
+    if (stream_frame_meta_queue_len < STREAM_FRAME_META_QUEUE) {
+        stream_frame_meta_queue_len++;
+    }
     InterlockedExchange(&stream_frame_meta_valid, 1);
     LeaveCriticalSection(&stream_frame_meta_lock);
 }
 
-static bool stream_frame_meta_snapshot(StreamFrameMeta *meta)
+static bool stream_frame_meta_match_sample(StreamFrameMeta *meta,
+                                           int sample_w,
+                                           int sample_h)
 {
+    bool ok = false;
+
     if (!meta ||
         InterlockedCompareExchange(&stream_frame_meta_valid, 0, 0) == 0) {
         return false;
@@ -1413,8 +1427,22 @@ static bool stream_frame_meta_snapshot(StreamFrameMeta *meta)
     ensure_stream_frame_meta_lock();
     EnterCriticalSection(&stream_frame_meta_lock);
     *meta = stream_frame_meta;
+    ok = true;
+    for (unsigned int i = 0; i < stream_frame_meta_queue_len; i++) {
+        unsigned int pos =
+            (stream_frame_meta_queue_next + STREAM_FRAME_META_QUEUE - 1 - i) %
+            STREAM_FRAME_META_QUEUE;
+        StreamFrameMeta *candidate = &stream_frame_meta_queue[pos];
+
+        if (candidate->roi &&
+            candidate->w == sample_w &&
+            candidate->h == sample_h) {
+            *meta = *candidate;
+            break;
+        }
+    }
     LeaveCriticalSection(&stream_frame_meta_lock);
-    return true;
+    return ok;
 }
 
 static bool stream_control_read_line(char *buffer, size_t size)
@@ -1653,7 +1681,7 @@ static bool roi_compositor_copy_sample(const guint8 *data, size_t data_size,
         return false;
     }
 
-    have_meta = stream_frame_meta_snapshot(&meta);
+    have_meta = stream_frame_meta_match_sample(&meta, sample_w, sample_h);
     full_w = (have_meta && meta.width > 0) ? meta.width : source_width;
     full_h = (have_meta && meta.height > 0) ? meta.height : source_height;
     full_sample = (sample_w == full_w && sample_h == full_h);

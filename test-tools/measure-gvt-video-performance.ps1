@@ -262,6 +262,40 @@ function Get-FieldNumber {
     return $null
 }
 
+function Get-CounterDelta {
+    param(
+        $Rows,
+        [string]$Name
+    )
+
+    $values = @(
+        foreach ($row in $Rows) {
+            if ($null -eq $row) {
+                continue
+            }
+
+            $property = $row.PSObject.Properties |
+                Where-Object { $_.Name -eq $Name } |
+                Select-Object -First 1
+            if ($null -ne $property -and $null -ne $property.Value) {
+                [double]$property.Value
+            }
+        }
+    )
+
+    if ($values.Count -eq 0) {
+        return $null
+    }
+
+    $first = $values[0]
+    $last = $values[$values.Count - 1]
+    return [ordered]@{
+        first = $first
+        last = $last
+        delta = $last - $first
+    }
+}
+
 function Copy-TextLines {
     param(
         [string[]]$Lines,
@@ -488,6 +522,16 @@ foreach ($line in $serverLines) {
         bitrate = Get-FieldNumber -Line $line -Name "bitrate"
         target_bitrate = Get-FieldNumber -Line $line -Name "target_bitrate"
         capture_ms = Get-FieldNumber -Line $line -Name "capture_ms"
+        streamd_encoded = Get-FieldNumber -Line $line -Name "streamd_encoded"
+        streamd_bytes = Get-FieldNumber -Line $line -Name "streamd_bytes"
+        streamd_roi = Get-FieldNumber -Line $line -Name "streamd_roi"
+        streamd_failures = Get-FieldNumber -Line $line -Name "streamd_failures"
+        dirty_static = Get-FieldNumber -Line $line -Name "dirty_static"
+        dirty_partial = Get-FieldNumber -Line $line -Name "dirty_partial"
+        dirty_full = Get-FieldNumber -Line $line -Name "dirty_full"
+        dirty_global = Get-FieldNumber -Line $line -Name "dirty_global"
+        dirty_skipped = Get-FieldNumber -Line $line -Name "dirty_skipped"
+        dirty_roi = Get-FieldNumber -Line $line -Name "dirty_roi"
     })
 }
 
@@ -556,6 +600,16 @@ $summary = [ordered]@{
         target_bitrate = Get-NumberStats @($serverUpdateRows | ForEach-Object { $_.target_bitrate })
         encoded_last = if ($null -ne $lastServerUpdate) { $lastServerUpdate.encoded } else { $null }
         encode_failures_last = if ($null -ne $lastServerUpdate) { $lastServerUpdate.encode_failures } else { $null }
+        streamd_encoded = Get-CounterDelta -Rows $serverUpdateRows -Name "streamd_encoded"
+        streamd_bytes = Get-CounterDelta -Rows $serverUpdateRows -Name "streamd_bytes"
+        streamd_roi = Get-CounterDelta -Rows $serverUpdateRows -Name "streamd_roi"
+        streamd_failures = Get-CounterDelta -Rows $serverUpdateRows -Name "streamd_failures"
+        dirty_static = Get-CounterDelta -Rows $serverUpdateRows -Name "dirty_static"
+        dirty_partial = Get-CounterDelta -Rows $serverUpdateRows -Name "dirty_partial"
+        dirty_full = Get-CounterDelta -Rows $serverUpdateRows -Name "dirty_full"
+        dirty_global = Get-CounterDelta -Rows $serverUpdateRows -Name "dirty_global"
+        dirty_skipped = Get-CounterDelta -Rows $serverUpdateRows -Name "dirty_skipped"
+        dirty_roi = Get-CounterDelta -Rows $serverUpdateRows -Name "dirty_roi"
         stream_stopped = $streamStopped
     }
 }
@@ -580,6 +634,16 @@ $flat = [pscustomobject]@{
     server_fps_avg = $summary.server.fps.avg
     server_capture_ms_avg = $summary.server.capture_ms.avg
     server_encode_failures_last = $summary.server.encode_failures_last
+    server_streamd_bytes_delta = $summary.server.streamd_bytes.delta
+    server_streamd_encoded_delta = $summary.server.streamd_encoded.delta
+    server_streamd_roi_delta = $summary.server.streamd_roi.delta
+    server_streamd_failures_delta = $summary.server.streamd_failures.delta
+    server_dirty_static_delta = $summary.server.dirty_static.delta
+    server_dirty_partial_delta = $summary.server.dirty_partial.delta
+    server_dirty_full_delta = $summary.server.dirty_full.delta
+    server_dirty_global_delta = $summary.server.dirty_global.delta
+    server_dirty_skipped_delta = $summary.server.dirty_skipped.delta
+    server_dirty_roi_delta = $summary.server.dirty_roi.delta
 }
 $flat | Export-Csv -LiteralPath $summaryCsv -NoTypeInformation -Encoding UTF8
 
@@ -593,6 +657,8 @@ $reportLines = @(
     "- Client FPS: depay avg $($summary.client.depay_out_fps.avg), parse avg $($summary.client.parse_out_fps.avg), decode avg $($summary.client.decode_out_fps.avg)",
     "- Startup: media stack $($summary.client.media_stack_ready_ms) ms, stream control start $($summary.client.stream_control_start_sent_ms) ms, gst receiver $($summary.client.gst_receiver_ready_ms) ms",
     "- Server samples: $($summary.server.update_samples), fps avg $($summary.server.fps.avg), capture avg $($summary.server.capture_ms.avg) ms, encode failures last $($summary.server.encode_failures_last)",
+    "- Streamd delta: bytes $($summary.server.streamd_bytes.delta), encoded $($summary.server.streamd_encoded.delta), roi $($summary.server.streamd_roi.delta), failures $($summary.server.streamd_failures.delta)",
+    "- Dirty delta: static $($summary.server.dirty_static.delta), partial $($summary.server.dirty_partial.delta), full $($summary.server.dirty_full.delta), global $($summary.server.dirty_global.delta), skipped $($summary.server.dirty_skipped.delta), roi $($summary.server.dirty_roi.delta)",
     "- Viewer left open: $([bool]$LeaveWindowOpen), pid $($process.Id)",
     "- Probe viewer replaced for steady run: $probeViewerReplaced, probe pid $($probeProcess.Id)",
     "",
@@ -609,6 +675,8 @@ Write-Host "  Output: $OutDirPath"
 Write-Host "  Client FPS avg: depay=$($summary.client.depay_out_fps.avg) parse=$($summary.client.parse_out_fps.avg) decode=$($summary.client.decode_out_fps.avg)"
 Write-Host "  Startup ms: stream-control=$($summary.client.stream_control_start_sent_ms) gst-ready=$($summary.client.gst_receiver_ready_ms)"
 Write-Host "  Server: samples=$($summary.server.update_samples) fps=$($summary.server.fps.avg) encode_failures=$($summary.server.encode_failures_last)"
+Write-Host "  Streamd delta: bytes=$($summary.server.streamd_bytes.delta) encoded=$($summary.server.streamd_encoded.delta) roi=$($summary.server.streamd_roi.delta) failures=$($summary.server.streamd_failures.delta)"
+Write-Host "  Dirty delta: static=$($summary.server.dirty_static.delta) partial=$($summary.server.dirty_partial.delta) full=$($summary.server.dirty_full.delta) global=$($summary.server.dirty_global.delta) skipped=$($summary.server.dirty_skipped.delta) roi=$($summary.server.dirty_roi.delta)"
 if ($LeaveWindowOpen) {
     Write-Host "  Viewer left open, pid=$($process.Id)"
 }
