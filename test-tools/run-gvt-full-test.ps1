@@ -34,6 +34,7 @@ param(
     [int]$GuestDesktopPollSec = 3,
     [int]$SmokeDurationSec = 20,
     [int]$SmokeWarmupSec = 4,
+    [double]$SmokeMinLowBandwidthDecodeFps = 0.0,
     [int]$LatencyTrials = 3,
     [ValidateSet("win-r", "win-key", "right-click-upper")]
     [string]$LatencyTriggerProfile = "win-r",
@@ -1247,6 +1248,7 @@ if ($SkipReboot) {
         "-InputPort", $InputPort.ToString(),
         "-DurationSec", $SmokeDurationSec.ToString(),
         "-WarmupSec", $SmokeWarmupSec.ToString(),
+        "-MinLowBandwidthDecodeFps", $SmokeMinLowBandwidthDecodeFps.ToString([Globalization.CultureInfo]::InvariantCulture),
         "-OutDir", $smokeOutDirRel,
         "-LeaveWindowOpen",
         "-StopExistingViewer"
