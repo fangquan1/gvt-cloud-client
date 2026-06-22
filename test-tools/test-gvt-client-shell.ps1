@@ -8,7 +8,7 @@ param(
     [ValidateSet("h264", "h265")]
     [string]$Codec = "h265",
     [int]$Latency = 15,
-    [int]$StreamFps = 59,
+    [int]$StreamFps = 57,
     [int]$BitrateMbps = 18,
     [string]$LauncherPath = "",
     [string]$OutDir = "build\client-shell-test",
@@ -465,17 +465,27 @@ try {
             Where-Object { $_.Name -ieq $viewerProcessName })
         if ($children.Count -gt 0) {
             $child = $children | Sort-Object ProcessId -Descending | Select-Object -First 1
-            $viewerProcessId = [int]$child.ProcessId
-            $viewerCommandLine = [string]$child.CommandLine
-            break
+            $candidateCommandLine = [string]$child.CommandLine
+            if ($candidateCommandLine -notlike "*--gst-warmup*" -and
+                $candidateCommandLine -like "*--video-codec*" -and
+                $candidateCommandLine -like "*--stream-fps*") {
+                $viewerProcessId = [int]$child.ProcessId
+                $viewerCommandLine = $candidateCommandLine
+                break
+            }
         }
         $globalViewer = @(Get-CimInstance Win32_Process -Filter "Name='$viewerProcessName'" -ErrorAction SilentlyContinue |
             Where-Object { ([string]$_.CommandLine) -like "*$viewer*" })
         if ($globalViewer.Count -gt 0) {
             $child = $globalViewer | Sort-Object ProcessId -Descending | Select-Object -First 1
-            $viewerProcessId = [int]$child.ProcessId
-            $viewerCommandLine = [string]$child.CommandLine
-            break
+            $candidateCommandLine = [string]$child.CommandLine
+            if ($candidateCommandLine -notlike "*--gst-warmup*" -and
+                $candidateCommandLine -like "*--video-codec*" -and
+                $candidateCommandLine -like "*--stream-fps*") {
+                $viewerProcessId = [int]$child.ProcessId
+                $viewerCommandLine = $candidateCommandLine
+                break
+            }
         }
         $debugLog = Join-Path $launcherDir "gvt_client_debug.log"
         if (Test-Path -LiteralPath $debugLog) {

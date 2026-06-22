@@ -326,7 +326,7 @@ static void default_settings(ClientSettings *out)
 {
     wcsncpy(out->codec, L"h265", 15);
     out->codec[15] = 0;
-    out->fps = 59;
+    out->fps = 57;
     out->bitrate_mbps = 18;
     out->latency_ms = 15;
     out->use_remote_resolution = TRUE;
@@ -551,7 +551,7 @@ static void load_settings(void)
     json_get_bool(text, L"start_viewer", &settings.start_viewer);
     json_get_bool(text, L"minimize_tray_on_connect", &settings.minimize_tray_on_connect);
     json_get_bool(text, L"remember_recent", &settings.remember_recent);
-    ensure_range_int(&settings.fps, 1, 120, 59);
+    ensure_range_int(&settings.fps, 1, 120, 57);
     ensure_range_int(&settings.bitrate_mbps, 1, 100, 18);
     ensure_range_int(&settings.latency_ms, 1, 500, 15);
     settings.use_remote_resolution = TRUE;
@@ -831,6 +831,7 @@ static void append_portable_runtime_args(wchar_t *cmd, size_t cmd_count)
 
 static void set_viewer_low_latency_env(void)
 {
+    SetEnvironmentVariableW(L"GVT_SPICE_VIEWER_ROI_COMPOSITOR", L"1");
     SetEnvironmentVariableW(L"GVT_SPICE_VIEWER_DROP_COMPLETE_FRAMES", L"1");
     SetEnvironmentVariableW(L"GVT_SPICE_VIEWER_UDP_BUFFER_SIZE", L"2097152");
     SetEnvironmentVariableW(
@@ -1637,7 +1638,7 @@ static LRESULT CALLBACK edit_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 static void collect_settings_window(void)
 {
     get_combo_codec(set_codec, settings.codec, 16);
-    settings.fps = get_int_from_edit(set_fps, 59);
+    settings.fps = get_int_from_edit(set_fps, 57);
     settings.bitrate_mbps = get_int_from_edit(set_bitrate, 18);
     settings.latency_ms = get_int_from_edit(set_latency, 15);
     settings.use_remote_resolution = TRUE;
@@ -1647,7 +1648,7 @@ static void collect_settings_window(void)
     settings.start_viewer = get_check(set_start_viewer);
     settings.minimize_tray_on_connect = get_check(set_minimize_tray);
     settings.remember_recent = get_check(set_remember_recent);
-    ensure_range_int(&settings.fps, 1, 120, 59);
+    ensure_range_int(&settings.fps, 1, 120, 57);
     ensure_range_int(&settings.bitrate_mbps, 1, 100, 18);
     ensure_range_int(&settings.latency_ms, 1, 500, 15);
 }

@@ -6,7 +6,7 @@ Runs the full GVT Cloud desktop, video, audio, AV-sync, and input-latency test s
 This orchestration script installs the guest test helper, optionally reboots
 the Windows guest through QGA, waits for the test user's interactive desktop,
 starts the viewer smoke test, checks the visual ready marker, then runs audio
-quality, AV sync, and input-to-video latency tests in sequence.
+quality, ROI click-artifact, AV sync, and input-to-video latency tests in sequence.
 
 Each stage writes timestamped console output and a per-stage log under
 test_output\data\full-YYYYMMDD-HHMMSS by default.
@@ -24,6 +24,7 @@ param(
     [int]$RebootCommandTimeoutSec = 20,
     [int]$MarkerTimeoutSec = 60,
     [int]$MarkerStageTimeoutSec = 120,
+    [int]$RoiClickArtifactTimeoutSec = 180,
     [int]$ShellTimeoutSec = 60,
     [int]$SmokeTimeoutSec = 180,
     [int]$AudioTimeoutSec = 180,
@@ -61,6 +62,7 @@ $reportZhPath = Join-Path $runDir "report.md"
 $reportHtmlPath = Join-Path $runDir "report.html"
 $shellOutDirRel = Join-Path $runRelDir "client-shell"
 $smokeOutDirRel = Join-Path $runRelDir "video-performance"
+$roiClickOutDirRel = Join-Path $runRelDir "roi-click-artifact"
 $audioOutDirRel = Join-Path $runRelDir "audio-quality"
 $avOutDirRel = Join-Path $runRelDir "av-sync"
 $latencyOutDirRel = Join-Path $runRelDir "latency-captures"
@@ -71,6 +73,7 @@ $stageTimeoutPlan = [ordered]@{
     "guest-desktop" = $DesktopTimeoutSec
     client_shell = $ShellTimeoutSec
     smoke = $SmokeTimeoutSec
+    roi_click_artifact = $RoiClickArtifactTimeoutSec
     marker = $MarkerStageTimeoutSec
     audio = $AudioTimeoutSec
     av_sync = $AvSyncTimeoutSec
@@ -780,6 +783,7 @@ function Get-FullStageHtmlRows {
         @("guest-desktop", "guest 桌面和 helper"),
         @("client_shell", "客户端壳启动"),
         @("smoke", "视频 smoke"),
+        @("roi_click_artifact", "ROI 点击残影"),
         @("marker", "桌面 marker ready"),
         @("audio", "音频质量/爆音"),
         @("av_sync", "声画同步采集"),
@@ -808,6 +812,7 @@ function Write-FullReports {
     param([object]$Summary)
 
     $smoke = $Summary.artifacts.smoke_summary
+    $roiClick = $Summary.artifacts.roi_click_artifact_summary
     $audio = $Summary.artifacts.audio_summary
     $wave = Get-FullNestedMember -Object $audio -Names @("waveform_analysis")
     $pop = Get-FullNestedMember -Object $wave -Names @("pop_detection")
@@ -838,6 +843,15 @@ function Write-FullReports {
     $decodeFps = if ($smoke) { Get-FullNumber $smoke.client.decode_out_fps.avg } else { $null }
     $serverFps = if ($smoke) { Get-FullNumber $smoke.server.fps.avg } else { $null }
     $encodeFailures = if ($smoke) { Get-FullNumber $smoke.server.encode_failures_last } else { $null }
+    $smokeStreamdRoiDelta = Get-FullNumber (Get-FullNestedMember -Object $smoke -Names @("server", "streamd_roi", "delta"))
+    $smokeDirtySkippedDelta = Get-FullNumber (Get-FullNestedMember -Object $smoke -Names @("server", "dirty_skipped", "delta"))
+    $smokeLowBandwidthActive = ($null -ne $smoke) -and
+        ((($null -ne $smokeStreamdRoiDelta) -and $smokeStreamdRoiDelta -gt 0) -or
+        (($null -ne $smokeDirtySkippedDelta) -and $smokeDirtySkippedDelta -gt 0))
+    $roiClickPass = if ($roiClick) { Format-FullStageState (Get-FullMember -Object $roiClick -Name "ok" -Default $false) } else { "NA" }
+    $roiPreOutsideGreen = Get-FullNumber (Get-FullNestedMember -Object $roiClick -Names @("pre_outside_green", "Ratio"))
+    $roiPostOutsideGreen = Get-FullNumber (Get-FullNestedMember -Object $roiClick -Names @("post_outside_green", "Ratio"))
+    $roiOutsideGreenGrowth = Get-FullNumber (Get-FullMember -Object $roiClick -Name "outside_green_growth_ratio")
     $clipPct = Get-FullNumber (Get-FullNestedMember -Object $audio -Names @("recorded", "clip", "clipped_pct"))
     $dropoutPct = Get-FullNumber (Get-FullNestedMember -Object $audio -Names @("alignment", "dropout_window_pct"))
     $pulseErrorMs = Get-FullNumber (Get-FullNestedMember -Object $audio -Names @("pulse_timing", "max_abs_interval_error_ms"))
@@ -874,6 +888,10 @@ function Write-FullReports {
     $shellGrade = if ($shell -and [bool](Get-FullMember -Object $shell -Name "ok" -Default $false)) { New-FullGrade "好" "grade-good" } elseif ($shell) { New-FullGrade "差" "grade-bad" } else { New-FullGrade "NA" "grade-na" }
     $decodeGrade = Get-FullHigherBetterGrade -Value $decodeFps -Good 55 -Fair 45
     $serverFpsGrade = Get-FullHigherBetterGrade -Value $serverFps -Good 55 -Fair 45
+    if ($smokeLowBandwidthActive) {
+        $decodeGrade = New-FullGrade "低带宽" "grade-good"
+        $serverFpsGrade = New-FullGrade "低带宽" "grade-good"
+    }
     $encodeGrade = Get-FullLowerBetterGrade -Value $encodeFailures -Good 0 -Fair 3
     $clipGrade = Get-FullLowerBetterGrade -Value $clipPct -Good 0.01 -Fair 0.10
     $dropoutGrade = Get-FullLowerBetterGrade -Value $dropoutPct -Good 0.10 -Fair 2.00
@@ -905,6 +923,7 @@ function Write-FullReports {
         "- 客户端壳启动: $(Format-FullStageState $Summary.stages.client_shell.ok)",
         "- 客户端壳覆盖: $shellCoverageText",
         "- 视频 smoke: $(Format-FullStageState $Summary.stages.smoke.ok)",
+        "- ROI 点击残影: $(Format-FullStageState $Summary.stages.roi_click_artifact.ok)",
         "- 桌面 marker ready: $(Format-FullStageState $Summary.stages.marker.ok)",
         "- 音频质量/爆音: $(Format-FullStageState $Summary.stages.audio.ok)",
         "- 声画同步采集: $(Format-FullStageState $Summary.stages.av_sync.ok)",
@@ -915,6 +934,8 @@ function Write-FullReports {
         "- 视频 client decode avg: $(Format-FullNumber $decodeFps 2) fps（评级: $($decodeGrade.Text)）",
         "- 视频 server fps avg: $(Format-FullNumber $serverFps 2) fps（评级: $($serverFpsGrade.Text)）",
         "- server encode failures: $(Format-FullNumber $encodeFailures 0)（评级: $($encodeGrade.Text)）",
+        "- 低带宽静态/ROI: active=$smokeLowBandwidthActive；streamd ROI delta=$(Format-FullNumber $smokeStreamdRoiDelta 0)，dirty skipped delta=$(Format-FullNumber $smokeDirtySkippedDelta 0)",
+        "- ROI 点击残影: $roiClickPass；外部绿色 pre/post/growth = $(Format-FullNumber $roiPreOutsideGreen 6) / $(Format-FullNumber $roiPostOutsideGreen 6) / $(Format-FullNumber $roiOutsideGreenGrowth 6)",
         "- 音频 clipped: $(Format-FullNumber $clipPct 5)%（评级: $($clipGrade.Text)）",
         "- 音频 dropout windows: $(Format-FullNumber $dropoutPct 3)%（评级: $($dropoutGrade.Text)）",
         "- 音频 pulse interval max error: $(Format-FullNumber $pulseErrorMs 2) ms（评级: $($pulseGrade.Text)）",
@@ -947,6 +968,7 @@ function Write-FullReports {
         "- full summary: $summaryPath",
         "- client shell summary: $($Summary.artifacts.client_shell_summary_path)",
         "- smoke summary: $($Summary.artifacts.smoke_summary_path)",
+        "- ROI click artifact summary: $($Summary.artifacts.roi_click_artifact_summary_path)",
         "- audio summary: $($Summary.artifacts.audio_summary_path)",
         "- AV sync summary: $($Summary.artifacts.av_sync_summary_path)",
         "- latency csv: $(if ($lat) { $lat.csv } else { 'NA' })"
@@ -970,6 +992,7 @@ function Write-FullReports {
         @("完整日志", (Join-Path $runDir "full.log")),
         @("客户端壳 summary", $Summary.artifacts.client_shell_summary_path),
         @("视频 summary", $Summary.artifacts.smoke_summary_path),
+        @("ROI 点击残影 summary", $Summary.artifacts.roi_click_artifact_summary_path),
         @("音频 summary", $Summary.artifacts.audio_summary_path),
         @("音频波形分析 JSON", $(Get-FullMember -Object $audio -Name "waveform_analysis_path" -Default "")),
         @("音频频域 CSV", $(Get-FullNestedMember -Object $wave -Names @("data", "spectrum_csv") -Default "")),
@@ -1207,7 +1230,7 @@ if ($SkipReboot) {
         "-ServerHost", $ServerHost,
         "-VideoPort", $VideoPort.ToString(),
         "-Latency", "15",
-        "-StreamFps", "59",
+        "-StreamFps", "57",
         "-BitrateMbps", "18",
         "-OutDir", $shellOutDirRel,
         "-TimeoutSec", $ShellTimeoutSec.ToString()
@@ -1229,6 +1252,22 @@ if ($SkipReboot) {
         "-StopExistingViewer"
     ) `
     -TimeoutSec $SmokeTimeoutSec `
+    -CaptureOutput $false)
+
+[void](Invoke-FullScriptStage `
+    -Stage "roi_click_artifact" `
+    -ScriptPath (Join-Path $PSScriptRoot "test-gvt-roi-click-artifact.ps1") `
+    -Arguments @(
+        "-ServerHost", $ServerHost,
+        "-VideoPort", $VideoPort.ToString(),
+        "-SpicePort", $SpicePort.ToString(),
+        "-InputPort", $InputPort.ToString(),
+        "-Codec", "h265",
+        "-OutDir", $roiClickOutDirRel,
+        "-StopExistingViewer",
+        "-LeaveWindowOpen"
+    ) `
+    -TimeoutSec $RoiClickArtifactTimeoutSec `
     -CaptureOutput $false)
 
 [void](Invoke-FullScriptStage `
@@ -1318,12 +1357,23 @@ Write-FullLog ("latency trigger profile: {0}; {1}" -f $LatencyTriggerProfile, (G
 
 $shellDir = Get-FullLatestDirectory $shellOutDirRel
 $smokeDir = Get-FullLatestDirectory $smokeOutDirRel
+$roiClickDirectDir = if ([IO.Path]::IsPathRooted($roiClickOutDirRel)) {
+    $roiClickOutDirRel
+} else {
+    Join-Path $clientRoot $roiClickOutDirRel
+}
+$roiClickDir = if (Test-Path -LiteralPath (Join-Path $roiClickDirectDir "summary.json")) {
+    Get-Item -LiteralPath $roiClickDirectDir
+} else {
+    Get-FullLatestDirectory $roiClickOutDirRel
+}
 $audioDir = Get-FullLatestDirectory $audioOutDirRel
 $avDir = Get-FullLatestDirectory $avOutDirRel
 $latencyDir = Get-FullLatestDirectory $latencyOutDirRel
 
 $shellSummaryPath = if ($shellDir) { Join-Path $shellDir.FullName "summary.json" } else { $null }
 $smokeSummaryPath = if ($smokeDir) { Join-Path $smokeDir.FullName "summary.json" } else { $null }
+$roiClickSummaryPath = if ($roiClickDir) { Join-Path $roiClickDir.FullName "summary.json" } else { $null }
 $audioSummaryPath = if ($audioDir) { Join-Path $audioDir.FullName "summary.json" } else { $null }
 $avSummaryPath = if ($avDir) { Join-Path $avDir.FullName "summary.json" } else { $null }
 $latencyCsvPath = if ($latencyDir) { Join-Path $latencyDir.FullName "results.csv" } else { $null }
@@ -1335,6 +1385,9 @@ $artifacts = [ordered]@{
     smoke_dir = if ($smokeDir) { $smokeDir.FullName } else { $null }
     smoke_summary_path = $smokeSummaryPath
     smoke_summary = Read-FullJsonFile $smokeSummaryPath
+    roi_click_artifact_dir = if ($roiClickDir) { $roiClickDir.FullName } else { $null }
+    roi_click_artifact_summary_path = $roiClickSummaryPath
+    roi_click_artifact_summary = Read-FullJsonFile $roiClickSummaryPath
     audio_dir = if ($audioDir) { $audioDir.FullName } else { $null }
     audio_summary_path = $audioSummaryPath
     audio_summary = Read-FullJsonFile $audioSummaryPath

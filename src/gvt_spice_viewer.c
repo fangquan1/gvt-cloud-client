@@ -182,9 +182,9 @@ static int video_port = 5004;
 static int video_latency = 15;
 static bool video_drop_on_latency = false;
 static const char *video_codec = "h265";
-static int stream_fps = 59;
+static int stream_fps = 57;
 static int stream_bitrate_kbps = 18000;
-static int stream_keyint = 59;
+static int stream_keyint = 57;
 static const char *stream_control_host = NULL;
 static int stream_control_port = 5004;
 static bool stream_control_enabled = true;
@@ -256,7 +256,6 @@ typedef struct StreamFrameMeta {
 } StreamFrameMeta;
 static StreamFrameMeta stream_frame_meta;
 static StreamFrameMeta stream_frame_meta_queue[STREAM_FRAME_META_QUEUE];
-static unsigned int stream_frame_meta_queue_next;
 static unsigned int stream_frame_meta_queue_len;
 static volatile LONG stream_frame_meta_valid;
 static CRITICAL_SECTION stream_frame_meta_lock;
@@ -1403,14 +1402,29 @@ static void stream_frame_meta_store(const StreamFrameMeta *meta)
     ensure_stream_frame_meta_lock();
     EnterCriticalSection(&stream_frame_meta_lock);
     stream_frame_meta = *meta;
-    stream_frame_meta_queue[stream_frame_meta_queue_next] = *meta;
-    stream_frame_meta_queue_next =
-        (stream_frame_meta_queue_next + 1) % STREAM_FRAME_META_QUEUE;
-    if (stream_frame_meta_queue_len < STREAM_FRAME_META_QUEUE) {
-        stream_frame_meta_queue_len++;
+    if (stream_frame_meta_queue_len >= STREAM_FRAME_META_QUEUE) {
+        memmove(&stream_frame_meta_queue[0],
+                &stream_frame_meta_queue[1],
+                sizeof(stream_frame_meta_queue[0]) *
+                    (STREAM_FRAME_META_QUEUE - 1));
+        stream_frame_meta_queue_len = STREAM_FRAME_META_QUEUE - 1;
     }
+    stream_frame_meta_queue[stream_frame_meta_queue_len++] = *meta;
     InterlockedExchange(&stream_frame_meta_valid, 1);
     LeaveCriticalSection(&stream_frame_meta_lock);
+}
+
+static bool stream_frame_meta_matches_sample(const StreamFrameMeta *meta,
+                                             int sample_w,
+                                             int sample_h)
+{
+    if (!meta || sample_w <= 0 || sample_h <= 0) {
+        return false;
+    }
+    if (meta->roi) {
+        return meta->w == sample_w && meta->h == sample_h;
+    }
+    return meta->width == sample_w && meta->height == sample_h;
 }
 
 static bool stream_frame_meta_match_sample(StreamFrameMeta *meta,
@@ -1426,20 +1440,24 @@ static bool stream_frame_meta_match_sample(StreamFrameMeta *meta,
 
     ensure_stream_frame_meta_lock();
     EnterCriticalSection(&stream_frame_meta_lock);
-    *meta = stream_frame_meta;
-    ok = true;
     for (unsigned int i = 0; i < stream_frame_meta_queue_len; i++) {
-        unsigned int pos =
-            (stream_frame_meta_queue_next + STREAM_FRAME_META_QUEUE - 1 - i) %
-            STREAM_FRAME_META_QUEUE;
-        StreamFrameMeta *candidate = &stream_frame_meta_queue[pos];
+        StreamFrameMeta *candidate = &stream_frame_meta_queue[i];
 
-        if (candidate->roi &&
-            candidate->w == sample_w &&
-            candidate->h == sample_h) {
+        if (stream_frame_meta_matches_sample(candidate, sample_w, sample_h)) {
             *meta = *candidate;
+            if (i + 1 < stream_frame_meta_queue_len) {
+                memmove(&stream_frame_meta_queue[0],
+                        &stream_frame_meta_queue[i + 1],
+                        sizeof(stream_frame_meta_queue[0]) *
+                            (stream_frame_meta_queue_len - i - 1));
+            }
+            stream_frame_meta_queue_len -= i + 1;
             break;
         }
+    }
+    ok = stream_frame_meta_matches_sample(meta, sample_w, sample_h);
+    if (!stream_frame_meta_queue_len) {
+        InterlockedExchange(&stream_frame_meta_valid, 0);
     }
     LeaveCriticalSection(&stream_frame_meta_lock);
     return ok;
@@ -1596,12 +1614,12 @@ static bool roi_compositor_runtime_ready(void)
 
 static const char *roi_compositor_video_tail(void)
 {
-    return "queue name=post_decode_q leaky=downstream max-size-buffers=1 "
+    return "queue name=post_decode_q max-size-buffers=0 "
            "max-size-time=0 max-size-bytes=0 ! "
            "d3d11download ! videoconvert ! "
            "video/x-raw,format=BGRA ! "
            "appsink name=vsink emit-signals=true sync=false async=false "
-           "max-buffers=1 drop=true";
+           "max-buffers=8 drop=false";
 }
 
 static void roi_framebuffer_reset(void)
@@ -3417,10 +3435,11 @@ static bool start_gst_receiver(void)
     const char *decode_probe =
         vdebug ? "! identity name=probe_decode silent=true signal-handoffs=true " : "";
     const char *sink_tail;
-    const char *frame_drop_queue = video_drop_complete_frames() ?
+    bool use_roi_compositor = roi_compositor_requested();
+    const char *frame_drop_queue =
+        (!use_roi_compositor && video_drop_complete_frames()) ?
         "! queue name=frame_drop_q leaky=downstream max-size-buffers=1 "
         "max-size-time=0 max-size-bytes=0 " : "";
-    bool use_roi_compositor = roi_compositor_requested();
     int udp_buffer = video_udp_buffer_size();
     int jitter_dropout_ms = video_jitter_dropout_ms();
     int jitter_misorder_ms = video_jitter_misorder_ms();
@@ -4263,7 +4282,7 @@ static void parse_args(int argc, char **argv)
             video_codec = argv[++i];
         } else if (!strcmp(argv[i], "--stream-fps") && i + 1 < argc) {
             stream_fps = clamp_int(atoi(argv[++i]), 1, 120);
-            if (stream_keyint <= 0 || stream_keyint == 59) {
+            if (stream_keyint <= 0 || stream_keyint == 57) {
                 stream_keyint = stream_fps;
             }
         } else if (!strcmp(argv[i], "--stream-bitrate-kbps") && i + 1 < argc) {
